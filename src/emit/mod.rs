@@ -182,7 +182,12 @@ impl JsEmitter {
             | JsAst::If { .. }
             | JsAst::While { .. }
             | JsAst::For { .. }
-            | JsAst::Block(_) => self.emit_stmt_to(ast, out, 0)?,
+            | JsAst::Block(_)
+            | JsAst::Import { .. }
+            | JsAst::ExportDecl(_)
+            | JsAst::ExportNames(_)
+            | JsAst::ExportDefault(_)
+            | JsAst::Comment(_) => self.emit_stmt_to(ast, out, 0)?,
         }
         Ok(())
     }
@@ -268,6 +273,76 @@ impl JsEmitter {
                 self.write_indent(out, indent);
                 out.push('}');
             }
+            JsAst::Import {
+                spec,
+                named,
+                namespace,
+            } => {
+                self.write_indent(out, indent);
+                if let Some(ns) = namespace {
+                    out.push_str(&format!("import * as {ns} from {spec:?};\n"));
+                } else {
+                    let names = named
+                        .iter()
+                        .map(|(imported, local)| {
+                            if imported == local {
+                                imported.clone()
+                            } else {
+                                format!("{imported} as {local}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!("import {{ {names} }} from {spec:?};\n"));
+                }
+            }
+            JsAst::ExportDecl(inner) => {
+                self.write_indent(out, indent);
+                out.push_str("export ");
+                match inner.as_ref() {
+                    JsAst::ConstDecl { name, value } => {
+                        out.push_str(&format!("const {name} = "));
+                        self.emit_expr_to(value, out)?;
+                        out.push_str(";\n");
+                    }
+                    JsAst::Let { name, value } => {
+                        out.push_str(&format!("let {name} = "));
+                        self.emit_expr_to(value, out)?;
+                        out.push_str(";\n");
+                    }
+                    other => {
+                        self.emit_expr_to(other, out)?;
+                        out.push_str(";\n");
+                    }
+                }
+            }
+            JsAst::ExportNames(names) => {
+                self.write_indent(out, indent);
+                let names = names
+                    .iter()
+                    .map(|(local, exported)| {
+                        if local == exported {
+                            local.clone()
+                        } else {
+                            format!("{local} as {exported}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("export {{ {names} }};\n"));
+            }
+            JsAst::ExportDefault(expr) => {
+                self.write_indent(out, indent);
+                out.push_str("export default ");
+                self.emit_expr_to(expr, out)?;
+                out.push_str(";\n");
+            }
+            JsAst::Comment(text) => {
+                self.write_indent(out, indent);
+                out.push_str("// ");
+                out.push_str(&text.replace('\n', " "));
+                out.push('\n');
+            }
             _ => {
                 self.write_indent(out, indent);
                 self.emit_expr_to(ast, out)?;
@@ -275,6 +350,15 @@ impl JsEmitter {
             }
         }
         Ok(())
+    }
+
+    /// Emit a sequence of top-level module statements.
+    pub fn emit_module(&self, stmts: &[JsAst]) -> Result<String, CompileError> {
+        let mut out = String::new();
+        for stmt in stmts {
+            self.emit_stmt_to(stmt, &mut out, 0)?;
+        }
+        Ok(out)
     }
 
     fn emit_for_init(&self, ast: &JsAst, out: &mut String) -> Result<(), CompileError> {
@@ -358,6 +442,11 @@ impl JsEmitter {
                 | JsAst::While { .. }
                 | JsAst::For { .. }
                 | JsAst::Block(_)
+                | JsAst::Import { .. }
+                | JsAst::ExportDecl(_)
+                | JsAst::ExportNames(_)
+                | JsAst::ExportDefault(_)
+                | JsAst::Comment(_)
         )
     }
 

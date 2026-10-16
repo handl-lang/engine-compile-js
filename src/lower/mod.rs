@@ -16,22 +16,74 @@ thread_local! {
         std::cell::RefCell::new(LowerCtx::default());
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+/// How a module-scope name (import or top-level binding) resolves inside
+/// a lowered `Op { name, .. }` term.
+#[derive(Debug, Clone)]
+pub(crate) enum BoundRef {
+    /// A `const`/`export const`/ES-imported name: the binding is an async
+    /// arrow taking the `app` arg-input (lone arg or `[args]` tuple).
+    /// Value position emits the bare identifier; a call emits
+    /// `(await name(arg_input))`.
+    Arrow(String),
+    /// A plain identifier reference (e.g. a namespace import `* as m`):
+    /// value position emits the identifier; a call applies it with
+    /// spread args (host-function convention).
+    Ident(String),
+    /// A `__handl_rt` member function — spread args, synchronous call.
+    /// Used for the `js` contract-package shims (`call`, `invoke`,
+    /// `error`); promise results are settled by the separate `await` op.
+    Shim(String),
+    /// A member path on `__handl_rt` (e.g. `__handl_rt.tag.tag_of` for a
+    /// `from "tag" import { tag_of }` name): value position emits the
+    /// path; a call applies it with spread args (host-function
+    /// convention).
+    Member(String),
+    /// Route to a different native op name — `from "js" import { await
+    /// as js_await }` maps `js_await` back to the real `await` op so the
+    /// emitted code keeps the literal-`await` bridge.
+    Op(String),
+}
+
+#[derive(Debug, Default)]
 struct LowerCtx {
     no_inline_foreign: bool,
+    /// Module-scope names resolvable inside arrow bodies — imports and
+    /// top-level bindings, populated by [`crate::module`] for the
+    /// file-level emit. Empty for single-term inputs.
+    bound: std::collections::HashMap<String, BoundRef>,
 }
 
 /// Run `f` with the lowering context derived from `config`.
 pub(crate) fn with_config<T>(config: &JsConfig, f: impl FnOnce() -> T) -> T {
-    let prev = LOWER_CTX.with(|c| *c.borrow());
+    let prev = LOWER_CTX.with(|c| c.borrow().no_inline_foreign);
     LOWER_CTX.with(|c| {
-        *c.borrow_mut() = LowerCtx {
-            no_inline_foreign: config.no_inline_foreign,
-        };
+        let mut ctx = LowerCtx::default();
+        ctx.no_inline_foreign = config.no_inline_foreign;
+        *c.borrow_mut() = ctx;
     });
     let ret = f();
-    LOWER_CTX.with(|c| *c.borrow_mut() = prev);
+    LOWER_CTX.with(|c| {
+        c.borrow_mut().no_inline_foreign = prev;
+        c.borrow_mut().bound.clear();
+    });
     ret
+}
+
+/// Run `f` with `bound` visible as the module-scope name table.
+pub(crate) fn with_module_env<T>(
+    bound: std::collections::HashMap<String, BoundRef>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let prev = LOWER_CTX.with(|c| std::mem::take(&mut c.borrow_mut().bound));
+    LOWER_CTX.with(|c| c.borrow_mut().bound = bound);
+    let ret = f();
+    LOWER_CTX.with(|c| c.borrow_mut().bound = prev);
+    ret
+}
+
+/// Look up `name` in the module-scope binding table.
+pub(crate) fn module_bound(name: &str) -> Option<BoundRef> {
+    LOWER_CTX.with(|c| c.borrow().bound.get(name).cloned())
 }
 
 /// Whether foreign calls are allowed to be inlined in the current lowering run.
@@ -161,6 +213,24 @@ pub enum JsAst {
     Block(Vec<JsAst>),
     /// A raw string snippet (runtime helpers, etc.).
     Raw(String),
+    /// An ES `import` declaration (module-level emit only).
+    Import {
+        /// Module specifier string (emitted verbatim).
+        spec: String,
+        /// Named imports `(imported, local)` — `local == imported` emits
+        /// `{ a }`, otherwise `{ a as c }`.
+        named: Vec<(String, String)>,
+        /// `import * as ns` namespace alias.
+        namespace: Option<String>,
+    },
+    /// `export` of a declaration (`const`/`let`) — module-level emit.
+    ExportDecl(Box<JsAst>),
+    /// `export { a, b as c }` — re-export of bound names.
+    ExportNames(Vec<(String, String)>),
+    /// `export default <expr>`.
+    ExportDefault(Box<JsAst>),
+    /// A `//` line comment (newlines in the text are stripped).
+    Comment(String),
 }
 
 /// JavaScript binary operators.

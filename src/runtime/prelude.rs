@@ -32,6 +32,89 @@ pub fn runtime_prelude(format: &dyn JsOutputFormat) -> String {
   rewrite: (source, target, witness) => source,
   path: (from, to, witness) => from,
   equiv: (a, b, path) => a,
+  // --- arrow-lower op shims -------------------------------------------
+  // Names match the op spellings the lowerer emits verbatim.
+  truthy: (v) => !!v,
+  "true": true,
+  "false": false,
+  id: (v) => v,
+  elem: (v, i) => (Array.isArray(v) ? v[i] : (i === 0 ? __handl_rt.fst(v) : i === 1 ? __handl_rt.snd(v) : undefined)),
+  product: (a, b) => [a, b],
+  paren: (v) => v,
+  // `tag` — a *callable object*: invoking `__handl_rt.tag(v)` is the
+  // either-inject op (`cond >>> tag >>> Choice`), while its members are
+  // the `tag` host package (`handl-packages/tag`, ADR-0055) that
+  // `var tag` resolves to — tagged values are objects carrying a string
+  // `__tag__` key. `Op{{tag, []}}` is ambiguous between the two; this
+  // covers both.
+  tag: Object.assign(
+    (v) => (__handl_rt.truthy(v) ? __handl_rt.mkLeft(v) : __handl_rt.mkRight(v)),
+    {{
+      tag: (name, payload) => Object.assign(
+        {{__tag__: name}},
+        (payload && typeof payload === "object" ? payload : {{value: payload}}),
+      ),
+      untag: (v) => {{
+        if (v && typeof v === "object" && typeof v.__tag__ === "string") {{
+          const {{__tag__, ...rest}} = v;
+          return rest;
+        }}
+        return null;
+      }},
+      tag_of: (v) => ((v && typeof v === "object" && typeof v.__tag__ === "string") ? v.__tag__ : null),
+      is_tag: (v) => !!(v && typeof v === "object" && typeof v.__tag__ === "string"),
+      construct: (name, payload) => Object.assign(
+        {{__tag__: name, __registry__: "handl.canonical"}},
+        (payload && typeof payload === "object" ? payload : {{}}),
+      ),
+      match_type: (v, cases) => {{
+        const t = __handl_rt.tag.tag_of(v);
+        const c = (cases && typeof cases === "object" ? cases[t] ?? cases._ : undefined);
+        return typeof c === "function" ? c(v) : v;
+      }},
+    }},
+  ),
+  pair_tag: (p) => {{
+    const pair = Array.isArray(p) ? p : [__handl_rt.fst(p), __handl_rt.snd(p)];
+    return __handl_rt.truthy(pair[0]) ? __handl_rt.mkLeft(pair[1]) : __handl_rt.mkRight(pair[1]);
+  }},
+  loop_outcome: (v) => ((v && typeof v === "object" && "state" in v)
+    ? __handl_rt.mkRight(v.state)
+    : ((v && typeof v === "object" && "out" in v) ? __handl_rt.mkLeft(v.out) : __handl_rt.mkLeft(v))),
+  arr_len: (v) => (Array.isArray(v) ? v.length : -1),
+  arr_drop: (v, n) => {{
+    if (!Array.isArray(v)) {{ throw new Error("arr_drop: input is not an array"); }}
+    return v.slice(n);
+  }},
+  match_fail: () => {{ throw new Error("match: no arm matched"); }},
+  eq: (a, b) => __handl_rt.__eq(a, b),
+  neq: (a, b) => !__handl_rt.__eq(a, b),
+  __eq: (a, b) => {{
+    if (a === b) return true;
+    if (typeof a !== typeof b || a === null || b === null || typeof a !== "object") return false;
+    const ka = Object.keys(a), kb = Object.keys(b);
+    if (Array.isArray(a) !== Array.isArray(b) || ka.length !== kb.length) return false;
+    return ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && __handl_rt.__eq(a[k], b[k]));
+  }},
+  and: (a, b) => (__handl_rt.truthy(a) && __handl_rt.truthy(b)),
+  or: (a, b) => (__handl_rt.truthy(a) || __handl_rt.truthy(b)),
+  pow: (a, b) => Math.pow(a, b),
+  record: (...args) => {{
+    const o = {{}};
+    for (let i = 0; i + 1 < args.length; i += 2) o[args[i]] = args[i + 1];
+    return o;
+  }},
+  json: (template, args) =>
+    JSON.parse(args.reduce((s, a, i) => s.replace("$" + i, JSON.stringify(a)), template)),
+  // Dynamic-import fallback for `Op{{import}}` terms that reach the
+  // generic lowering (nested/non-module positions). File-level
+  // `from "p" import {{...}}` statements emit real ES `import` decls.
+  import: (spec) => import(spec),
+  // The `tag` host package (`handl-packages/tag`): tagged values are
+  // objects carrying a string `__tag__` key (ADR-0055). `var tag` lowers
+  // to a 0-arg `Op{{tag}}`, which emits the `__handl_rt.tag` member —
+  // this object — so `tag.tag_of`/`tag.untag` field accesses work.
+  tag_pkg: null,
   jsCall: (module, name, args, _descriptors) => {{
     const host = globalThis[module];
     if (!host || typeof host[name] !== "function") {{

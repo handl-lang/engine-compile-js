@@ -575,6 +575,96 @@ fn js_value_bounds_check() {
     assert!(js.contains(r#"__either__ === "right""#), "{js}");
 }
 
+// ---------------------------------------------------------------------------
+// File-level module emit — real `.hnl` sources over the canonical language.
+// ---------------------------------------------------------------------------
+
+/// The canonical language for module-emit tests (dev-dep cycle is allowed).
+fn canonical_lang() -> &'static Language {
+    static LANG: std::sync::OnceLock<Language> = std::sync::OnceLock::new();
+    LANG.get_or_init(|| {
+        handl_kit_data_canonical::language_from_yaml().expect("canonical language assembles")
+    })
+}
+
+fn module_input(source: &str) -> CompilerInput {
+    let mut ast = Ast::new();
+    let root = ast.push(AstNode::new("module"));
+    CompilerInput::new(
+        source.to_string(),
+        ast,
+        root,
+        canonical_lang().clone(),
+        Term::constant(Value::Null),
+        TypecheckReport::default(),
+    )
+}
+
+#[test]
+fn module_exports_and_internal_bindings() {
+    let js = compile_to_string(
+        &module_input(
+            "export plus := (a, b) ~> a + b\nhelper := (x) ~> x * 2\nexport main := (n) ~> helper(plus(n, 1))\n",
+        ),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("export const plus = async __in =>"), "{js}");
+    assert!(js.contains("const helper = async __in =>"), "{js}");
+    assert!(js.contains("export const main = async __in =>"), "{js}");
+    assert!(js.contains("__handl_rt.elem(__in, 0)"), "{js}");
+    assert!(js.contains("+"), "{js}");
+    // Cross-statement references emit the bound JS name, awaited with the
+    // `app` arg-input (the arg tuple).
+    assert!(js.contains("await helper("), "{js}");
+    assert!(js.contains("await plus(["), "{js}");
+    assert!(!js.contains("__handl_rt.export"), "{js}");
+}
+
+#[test]
+fn module_imports_emit_es_and_shims() {
+    let js = compile_to_string(
+        &module_input(
+            "from \"../pkgs/foo\" import { a, b as c }\nfrom \"js\" import { await as js_await, invoke as js_invoke }\nexport run := (x) ~> js_await(js_invoke(x, \"m\", [], [], \"js_object\", false))\n",
+        ),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(
+        js.contains("import { a, b as c } from \"../pkgs/foo\";"),
+        "{js}"
+    );
+    // The bare `js` contract package binds to `__handl_rt` shims — no ES
+    // import for it.
+    assert!(!js.contains("from \"js\""), "{js}");
+    assert!(js.contains("__handl_rt.invoke("), "{js}");
+    assert!(js.contains("(await "), "{js}");
+}
+
+#[test]
+fn module_effect_statements_and_default_export() {
+    let js = compile_to_string(
+        &module_input("x := (a) ~> a + 1\nx(2)\n"),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("const x = async __in =>"), "{js}");
+    // The trailing expression statement runs for effect at import time
+    // and its result is the default export.
+    assert!(js.contains("export default"), "{js}");
+    assert!(js.contains("await x(2)"), "{js}");
+}
+
+#[test]
+fn module_unbound_names_fall_back_to_runtime_members() {
+    let js = compile_to_string(
+        &module_input("f := (x) ~> unknown_host(x)\n"),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("__handl_rt.unknown_host"), "{js}");
+}
+
 fn random_term<R: Rng>(rng: &mut R, depth: usize) -> Term {
     if depth == 0 {
         let v = match rng.random_range(0..4) {

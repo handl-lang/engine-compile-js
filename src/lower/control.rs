@@ -283,15 +283,33 @@ pub fn lower_app(callee: &Term, args: &[Term]) -> Result<JsAst, CompileError> {
 }
 
 fn lower_app_applied(callee: &Term, args: &[Term], input: &JsAst) -> Result<JsAst, CompileError> {
-    let callee_expr = super::lower_applied(callee, input)?;
+    // A quoted-arrow callee (`Arr` whose payload is a serialized `Term` —
+    // the `Term::App` contract, ADR-0120 Phase 1) is unquoted and lowered
+    // to its JS arrow; the interpreter runs the inner term on the
+    // arg-input, we emit the arrow itself.
+    let callee_expr = match callee {
+        Term::Arr { value, .. } => match serde_json::from_value::<Term>(value.clone()) {
+            Ok(inner) => super::lower(&inner)?,
+            Err(_) => super::lower_applied(callee, input)?,
+        },
+        _ => super::lower_applied(callee, input)?,
+    };
     let arg_exprs: Vec<JsAst> = args
         .iter()
         .map(|a| super::lower_applied(a, input))
         .collect::<Result<_, _>>()?;
+    // The `app` arg-input (term_interpreter): a lone argument is fed
+    // bare, several pack into one array — the callee's `__in`.
+    let mut arg_exprs = arg_exprs;
+    let arg_input = if arg_exprs.len() == 1 {
+        arg_exprs.pop().unwrap()
+    } else {
+        JsAst::Array(arg_exprs)
+    };
     // Applying an arrow yields a Promise on this target (all emitted
     // arrows are async), so the call is awaited.
     Ok(JsAst::Await(Box::new(JsAst::Call {
         callee: Box::new(callee_expr),
-        args: arg_exprs,
+        args: vec![arg_input],
     })))
 }

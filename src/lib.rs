@@ -7,6 +7,7 @@ pub mod compiler;
 pub mod config;
 pub mod emit;
 pub mod lower;
+pub(crate) mod module;
 pub mod output;
 pub mod runtime;
 pub mod security;
