@@ -106,6 +106,8 @@ fn lower_choice_applied(l: &Term, r: &Term, input: &JsAst) -> Result<JsAst, Comp
     let right_val = rt_call("rightValue", vec![input.clone()]);
     let left = super::lower_applied(l, &left_val)?;
     let right = super::lower_applied(r, &right_val)?;
+    // The branch IIFE may contain `await` expressions (e.g. `js.await`),
+    // so it is async and its call is awaited.
     let iife = JsAst::ArrowFn {
         params: vec![],
         body: Box::new(JsAst::Block(vec![JsAst::If {
@@ -114,10 +116,10 @@ fn lower_choice_applied(l: &Term, r: &Term, input: &JsAst) -> Result<JsAst, Comp
             else_branch: Some(Box::new(JsAst::Block(vec![JsAst::Return(Box::new(right))]))),
         }])),
     };
-    Ok(JsAst::Call {
+    Ok(JsAst::Await(Box::new(JsAst::Call {
         callee: Box::new(iife),
         args: vec![],
-    })
+    })))
 }
 
 /// `Loop { body }` — bounded feedback loop.
@@ -166,10 +168,10 @@ fn lower_loop_applied(body: &Term, input: &JsAst) -> Result<JsAst, CompileError>
                 ),
                 let_decl(
                     out,
-                    JsAst::Call {
+                    JsAst::Await(Box::new(JsAst::Call {
                         callee: Box::new(body_fn),
                         args: vec![JsAst::Ident(pair.to_string())],
-                    },
+                    })),
                 ),
                 JsAst::If {
                     cond: Box::new(rt_call("isLeft", vec![JsAst::Ident(out.to_string())])),
@@ -241,10 +243,10 @@ fn lower_iter_applied(
                 JsAst::If {
                     cond: Box::new(JsAst::UnaryOp {
                         op: JsUnaryOp::Not,
-                        expr: Box::new(JsAst::Call {
+                        expr: Box::new(JsAst::Await(Box::new(JsAst::Call {
                             callee: Box::new(pred_fn),
                             args: vec![JsAst::Ident(state.to_string())],
-                        }),
+                        }))),
                     }),
                     then_branch: Box::new(JsAst::Block(vec![JsAst::Return(Box::new(
                         JsAst::Ident(state.to_string()),
@@ -253,10 +255,10 @@ fn lower_iter_applied(
                 },
                 assign(
                     state,
-                    JsAst::Call {
+                    JsAst::Await(Box::new(JsAst::Call {
                         callee: Box::new(step_fn),
                         args: vec![JsAst::Ident(state.to_string())],
-                    },
+                    })),
                 ),
                 assign(
                     cnt,
@@ -286,8 +288,10 @@ fn lower_app_applied(callee: &Term, args: &[Term], input: &JsAst) -> Result<JsAs
         .iter()
         .map(|a| super::lower_applied(a, input))
         .collect::<Result<_, _>>()?;
-    Ok(JsAst::Call {
+    // Applying an arrow yields a Promise on this target (all emitted
+    // arrows are async), so the call is awaited.
+    Ok(JsAst::Await(Box::new(JsAst::Call {
         callee: Box::new(callee_expr),
         args: arg_exprs,
-    })
+    })))
 }

@@ -47,10 +47,10 @@ pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
 pub fn lower_applied(term: &Term, _input: &JsAst) -> Result<JsAst, CompileError> {
     match term {
         Term::Arr { value, .. } | Term::Const { value } => lower_value(value),
-        Term::Op { .. } => Ok(JsAst::Call {
+        Term::Op { .. } => Ok(JsAst::Await(Box::new(JsAst::Call {
             callee: Box::new(lower(term)?),
             args: vec![_input.clone()],
-        }),
+        }))),
         Term::Seq { axis, fst, snd } => {
             check_sequential(axis, fst)?;
             lower_sub(snd, &lower_sub(fst, _input)?)
@@ -87,6 +87,15 @@ fn lower_op(
     lit: Option<&Value>,
 ) -> Result<JsAst, CompileError> {
     let param = JsAst::Ident(INPUT_NAME.to_string());
+
+    // `await` is the `js.await` promise bridge (`handl-packages/js`): it
+    // lowers to a real JS `await` inside the (async) arrow body, handing
+    // the promise to the host event loop for settlement. This holds for
+    // both `Native` and `Foreign` spellings of the op — `await` is not a
+    // host function to inject, it is the target's own boundary.
+    if name == "await" {
+        return lower_await(args, &param);
+    }
 
     if let ArrSource::Foreign(module) = &source {
         return lower_foreign_op(name, args, module, lit);
@@ -165,6 +174,22 @@ fn lower_op(
     Ok(JsAst::ArrowFn {
         params: vec![INPUT_NAME.to_string()],
         body: Box::new(body),
+    })
+}
+
+/// `await` — the `js.await` op. Takes exactly one argument (the promise)
+/// and emits `(await <arg>)` as the arrow body.
+fn lower_await(args: &[Term], param: &JsAst) -> Result<JsAst, CompileError> {
+    if args.len() != 1 {
+        return Err(CompileError::InvalidInput(format!(
+            "await requires 1 argument (the promise), got {}",
+            args.len()
+        )));
+    }
+    let promise = lower_sub(&args[0], param)?;
+    Ok(JsAst::ArrowFn {
+        params: vec![INPUT_NAME.to_string()],
+        body: Box::new(JsAst::Await(Box::new(promise))),
     })
 }
 

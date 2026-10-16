@@ -77,6 +77,13 @@ pub enum JsAst {
         /// The arguments.
         args: Vec<JsAst>,
     },
+    /// An `await` expression.
+    ///
+    /// Every emitted arrow function is `async`, so `await` may appear
+    /// anywhere an expression is legal; it is the bridge that hands a
+    /// host promise (e.g. the one `js.await` bridges) back to the JS
+    /// event loop for settlement.
+    Await(Box<JsAst>),
     /// An arrow function.
     ArrowFn {
         /// Parameter names.

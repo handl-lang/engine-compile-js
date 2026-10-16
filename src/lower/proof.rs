@@ -86,10 +86,12 @@ fn lower_rewrite_applied(
     let t = crate::lower::lower(target)?;
     let w = JsAst::Str(witness_name(witness));
     let rewrite = rt_call("rewrite", vec![s, t, w]);
-    Ok(JsAst::Call {
+    // `rewrite(..)` returns the lowered (async) source arrow; applying it
+    // yields a Promise, so the call is awaited.
+    Ok(JsAst::Await(Box::new(JsAst::Call {
         callee: Box::new(rewrite),
         args: vec![input.clone()],
-    })
+    })))
 }
 
 fn witness_name(witness: &RewriteWitness) -> String {

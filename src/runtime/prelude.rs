@@ -38,6 +38,60 @@ pub fn runtime_prelude(format: &dyn JsOutputFormat) -> String {
       throw new Error("unsafe or missing foreign call");
     }}
     return host[name](...args);
+  }},
+  // The `js` contract package (`handl-packages/js`): `call`, `invoke`,
+  // `error` and `await` are host-injected ops a JS host may provide on
+  // `globalThis.js` (marshalling, error capture). These shims supply
+  // honest defaults: `call` resolves `globalThis[obj][method]` like
+  // `jsCall`, `invoke` calls `receiver[method]`, and synchronous
+  // exceptions land in `__lastError` for `error()` to read — the same
+  // convention the sdkgen adapters use. (`await` is not a shim: the
+  // lowerer emits a real JS `await`; the host event loop owns
+  // settlement, and a rejection propagates as a rejected arrow promise.)
+  __lastError: null,
+  call: (obj, method, args, descriptors, retKind, throws) => {{
+    const host = globalThis.js;
+    if (host && typeof host.call === "function") {{
+      return host.call(obj, method, args, descriptors, retKind, throws);
+    }}
+    const target = globalThis[obj];
+    if (!target || typeof target[method] !== "function") {{
+      __handl_rt.__lastError = new Error("unsafe or missing foreign call");
+      return null;
+    }}
+    try {{
+      __handl_rt.__lastError = null;
+      return target[method](...args);
+    }} catch (e) {{
+      __handl_rt.__lastError = e;
+      if (throws) {{ throw e; }}
+      return null;
+    }}
+  }},
+  invoke: (receiver, method, args, descriptors, retKind, throws) => {{
+    const host = globalThis.js;
+    if (host && typeof host.invoke === "function") {{
+      return host.invoke(receiver, method, args, descriptors, retKind, throws);
+    }}
+    if (receiver == null || typeof receiver[method] !== "function") {{
+      __handl_rt.__lastError = new Error("unsafe or missing foreign call");
+      return null;
+    }}
+    try {{
+      __handl_rt.__lastError = null;
+      return receiver[method](...args);
+    }} catch (e) {{
+      __handl_rt.__lastError = e;
+      if (throws) {{ throw e; }}
+      return null;
+    }}
+  }},
+  error: () => {{
+    const host = globalThis.js;
+    if (host && typeof host.error === "function") {{
+      return host.error();
+    }}
+    return __handl_rt.__lastError;
   }}
 }};
 "#,

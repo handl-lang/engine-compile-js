@@ -150,6 +150,11 @@ impl JsEmitter {
                 }
                 out.push(')');
             }
+            JsAst::Await(expr) => {
+                out.push_str("(await ");
+                self.emit_expr_to(expr, out)?;
+                out.push(')');
+            }
             JsAst::ArrowFn { params, body } => self.emit_arrow_fn(params, body, out)?,
             JsAst::BinOp { op, left, right } => {
                 out.push('(');
@@ -304,12 +309,18 @@ impl JsEmitter {
         Ok(())
     }
 
+    /// Emit an arrow function. All emitted arrows are `async`: any arrow
+    /// may contain an `await` (the `js.await` promise bridge), and the
+    /// sound uniform rule is that applying a lowered arrow always yields
+    /// a `Promise` the caller awaits — the JS host's event loop then owns
+    /// settlement.
     fn emit_arrow_fn(
         &self,
         params: &[String],
         body: &JsAst,
         out: &mut String,
     ) -> Result<(), CompileError> {
+        out.push_str("async ");
         if params.len() == 1 {
             out.push_str(&params[0]);
         } else {
@@ -361,6 +372,7 @@ impl JsEmitter {
                 | JsAst::Member { .. }
                 | JsAst::Index { .. }
                 | JsAst::Call { .. }
+                | JsAst::Await(_)
                 | JsAst::Array(_)
                 | JsAst::Object(_)
         )

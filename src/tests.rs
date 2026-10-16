@@ -288,7 +288,7 @@ fn iife_wrapping() {
     )
     .unwrap();
     assert!(js.starts_with("(function"), "{js}");
-    assert!(js.contains("return __in => 42"), "{js}");
+    assert!(js.contains("return async __in => 42"), "{js}");
     assert!(js.contains("const __handl_rt"), "{js}");
 }
 
@@ -421,6 +421,88 @@ fn generated_js_has_no_dangerous_call_patterns() {
     assert!(!js.contains("eval("), "{js}");
     assert!(!js.contains("new Function("), "{js}");
     assert!(!js.contains("Function("), "{js}");
+}
+
+#[test]
+fn arrows_emit_async_and_applications_are_awaited() {
+    // Every emitted arrow is `async`; applying one yields a Promise the
+    // caller awaits — the uniform rule that makes `js.await` honest.
+    let term = Term::op_native(
+        "add",
+        vec![
+            Term::const_value(Value::Number(Number::from(1))),
+            Term::const_value(Value::Number(Number::from(2))),
+        ],
+    );
+    let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("async __in =>"), "{js}");
+
+    let app = Term::app(
+        Term::const_value(Value::String("fn".to_string())),
+        vec![Term::const_value(Value::Number(Number::from(1)))],
+    );
+    let js = compile_to_string(&input(app), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("await"), "{js}");
+    assert!(js.contains("\"fn\"(1)"), "{js}");
+}
+
+#[test]
+fn await_op_emits_real_await() {
+    // `js.await` (the promise bridge) lowers to a JS `await` inside an
+    // async arrow — both for the `Native` spelling the arrow lowerer
+    // produces and for a `Foreign("js")` host-boundary spelling.
+    let native = Term::Op {
+        dim: Term::default_dim(),
+        name: "await".to_string(),
+        args: vec![Term::op_native("id", vec![])],
+        source: ArrSource::Native,
+        lit: None,
+    };
+    let js = compile_to_string(&input(native), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("async __in => (await"), "{js}");
+    assert!(js.contains("__handl_rt.id"), "{js}");
+
+    let foreign = Term::Op {
+        dim: Term::default_dim(),
+        name: "await".to_string(),
+        args: vec![Term::op_native("id", vec![])],
+        source: ArrSource::Foreign("js".to_string()),
+        lit: None,
+    };
+    let js = compile_to_string(&input(foreign), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("async __in => (await"), "{js}");
+    assert!(!js.contains(r#"jsCall("js""#), "{js}");
+}
+
+#[test]
+fn await_op_requires_exactly_one_arg() {
+    let term = Term::Op {
+        dim: Term::default_dim(),
+        name: "await".to_string(),
+        args: vec![],
+        source: ArrSource::Native,
+        lit: None,
+    };
+    assert!(compile_to_string(&input(term), &JsConfig::esm_deno()).is_err());
+}
+
+#[test]
+fn await_op_application_is_awaited() {
+    // `js_await(p)` applied in a `Seq` chain: the op's arrow is invoked
+    // and the (async) result awaited.
+    let term = Term::seq(
+        Term::op_native("id", vec![]),
+        Term::Op {
+            dim: Term::default_dim(),
+            name: "await".to_string(),
+            args: vec![Term::op_native("id", vec![])],
+            source: ArrSource::Native,
+            lit: None,
+        },
+    );
+    let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("async __in =>"), "{js}");
+    assert!(js.contains("await"), "{js}");
 }
 
 #[test]

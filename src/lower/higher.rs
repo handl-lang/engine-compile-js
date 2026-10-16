@@ -87,8 +87,10 @@ fn lower_handle_applied(
         "handle",
         vec![body_fn, JsAst::Str(target.to_string()), impl_fn],
     );
-    Ok(JsAst::Call {
+    // `handle(..)(input)` applies `impl` — a lowered (async) arrow — so
+    // its result is a Promise and the call is awaited.
+    Ok(JsAst::Await(Box::new(JsAst::Call {
         callee: Box::new(handle),
         args: vec![input.clone()],
-    })
+    })))
 }
