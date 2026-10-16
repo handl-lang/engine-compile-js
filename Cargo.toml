@@ -7,11 +7,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-handl-plugin-compile = { path = "../plugin-compile" }
-handl-language = { path = "../handl-language" }
-plugin-engine = { path = "../plugin-engine" }
-plugin-engine-typecheck = { path = "../plugin-engine-typecheck", package = "handl-plugin-engine-typecheck" }
-serde_json = { workspace = true }
+# ADR-0128 Phase 5: platform crates are git deps; the workspace-root
+# `[patch]` resolves them from the sibling `../platform` checkout.
+handl-plugin-compile = { git = "https://github.com/handl-lang/platform", rev = "4366d00791ea6aad152c51fe235d4751ce1c58fc" }
+handl-language = { git = "https://github.com/handl-lang/platform", rev = "4366d00791ea6aad152c51fe235d4751ce1c58fc" }
+plugin-engine = { git = "https://github.com/handl-lang/platform", rev = "4366d00791ea6aad152c51fe235d4751ce1c58fc" }
+plugin-engine-typecheck = { git = "https://github.com/handl-lang/platform", rev = "4366d00791ea6aad152c51fe235d4751ce1c58fc", package = "handl-plugin-engine-typecheck" }
+serde_json = "1"
 
 [dev-dependencies]
-rand = { workspace = true }
+rand = "0.9"
