@@ -40,7 +40,10 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   "false": false,
   id: (v) => v,
   elem: (v, i) => (Array.isArray(v) ? v[i] : (i === 0 ? __handl_rt.fst(v) : i === 1 ? __handl_rt.snd(v) : undefined)),
-  product: (a, b) => [a, b],
+  // `product` is variadic (term_interpreter parity): 2 args is the
+  // dispatch pair; the dynamic-key `match` lowering emits 3 args —
+  // `[v, in, keys]` — where slot 2 carries the evaluated pattern keys.
+  product: (...xs) => xs,
   paren: (v) => v,
   // `tag` — a *callable object*: invoking `__handl_rt.tag(v)` is the
   // either-inject op (`cond >>> tag >>> Choice`), while its members are
@@ -88,6 +91,43 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     return v.slice(n);
   }},
   match_fail: () => {{ throw new Error("match: no arm matched"); }},
+  // `match` object-pattern ops — `has_field`/`is_obj` are the total
+  // discriminant guards (a non-object reports false so the arm falls
+  // through); `obj_except`/`tag_fields` run only behind those guards
+  // and throw on non-objects (term_interpreter parity). `is_obj`
+  // mirrors `TaggedValue::from`'s lenient wire decode: the marker
+  // records (`__pair__`/`__either__`/`__bytes__`/`__sym__`/`__arrow__`/
+  // `__resource__`) are tagged values, never `Obj` for patterns.
+  // `obj_key` mirrors `try_object_pattern`'s key coercion
+  // (`as_str().unwrap_or("")`) for computed pattern keys.
+  is_obj: (v) => {{
+    if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+    const sym = v.__sym__;
+    if (sym && typeof sym === "object" && Number.isInteger(sym.handle) && sym.handle !== 0
+        && typeof sym.name === "string") return false;
+    if (Array.isArray(v.__bytes__)
+        && v.__bytes__.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) return false;
+    if (Array.isArray(v.__pair__) && v.__pair__.length === 2) return false;
+    if (v.__either__ === "left" || v.__either__ === "right") return false;
+    if (v.__arrow__ === true) return false;
+    const res = v.__resource__;
+    if (res && typeof res === "object" && Number.isInteger(res.ptr)) return false;
+    return true;
+  }},
+  obj_key: (v) => (typeof v === "string" ? v : ""),
+  has_field: (v, k) => (__handl_rt.is_obj(v)
+    && Object.prototype.hasOwnProperty.call(v, typeof k === "string" ? k : "")),
+  tag_fields: (v) => {{
+    if (!__handl_rt.is_obj(v)) {{ throw new Error("tag_fields: input is not an object"); }}
+    return Object.keys(v).filter((k) => k !== "__tag__").sort().map((k) => v[k]);
+  }},
+  obj_except: (v, keys) => {{
+    if (!__handl_rt.is_obj(v)) {{ throw new Error("obj_except: input is not an object"); }}
+    const drop = new Set((keys || []).map((k) => (typeof k === "string" ? k : "")));
+    const out = {{}};
+    for (const k of Object.keys(v)) {{ if (!drop.has(k)) {{ out[k] = v[k]; }} }}
+    return out;
+  }},
   eq: (a, b) => __handl_rt.__eq(a, b),
   neq: (a, b) => !__handl_rt.__eq(a, b),
   __eq: (a, b) => {{

@@ -57,6 +57,7 @@ pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
 /// of these names still resolves as the builtin in argument position.
 const BUILTIN_OPS: &[&str] = &[
     "id", "tag", "pair_tag", "loop_outcome", "arr_len", "arr_drop", "match_fail",
+    "is_obj", "has_field", "tag_fields", "obj_except", "obj_key",
     "paren", "rest", "elem", "product", "array", "record", "field_access",
     "eq", "neq", "and", "or", "not", "neg", "pow", "mod", "lt", "lte", "gt",
     "gte", "add", "sub", "mul", "div", "concat", "json", "proj_env", "await",
@@ -249,6 +250,62 @@ fn lower_op_body(
             rt("arr_drop", vec![param.clone(), JsAst::Raw(n.to_string())])
         }
         "match_fail" => rt("match_fail", vec![]),
+        // `match` object-pattern ops (arrow-lowered `try_pattern`
+        // mirrors). `is_obj`/`tag_fields` read the incoming value;
+        // `has_field`/`obj_except` have two surfaces — a static `lit`
+        // key/list on the input itself, or the dynamic-key form
+        // `has_field(target, key)` / `obj_except(target, keys)` whose
+        // args evaluate on the input (the `[v, in, keys]` extended
+        // dispatch pair). `obj_key` coerces a computed key value to a
+        // field name (`""` for non-strings, `try_object_pattern`'s
+        // `as_str().unwrap_or("")`).
+        "is_obj" | "tag_fields" => rt(name, vec![param.clone()]),
+        "obj_key" => {
+            let v = if args.is_empty() {
+                param.clone()
+            } else {
+                lower_sub(&args[0], param)?
+            };
+            rt("obj_key", vec![v])
+        }
+        "has_field" => {
+            let key = match lit {
+                Some(Value::String(s)) => JsAst::Str(s.clone()),
+                _ if args.len() >= 2 => lower_sub(&args[1], param)?,
+                _ => {
+                    return Err(CompileError::InvalidInput(
+                        "has_field: missing key literal".to_string(),
+                    ));
+                }
+            };
+            let target = if args.is_empty() {
+                param.clone()
+            } else {
+                lower_sub(&args[0], param)?
+            };
+            rt("has_field", vec![target, key])
+        }
+        "obj_except" => {
+            let keys = match lit {
+                Some(Value::Array(ks)) => JsAst::Array(
+                    ks.iter()
+                        .map(|k| JsAst::Str(k.as_str().unwrap_or("").to_string()))
+                        .collect(),
+                ),
+                _ if args.len() >= 2 => lower_sub(&args[1], param)?,
+                _ => {
+                    return Err(CompileError::InvalidInput(
+                        "obj_except: missing keys literal".to_string(),
+                    ));
+                }
+            };
+            let target = if args.is_empty() {
+                param.clone()
+            } else {
+                lower_sub(&args[0], param)?
+            };
+            rt("obj_except", vec![target, keys])
+        }
         // Data constructors over applied arg terms.
         "product" => rt("product", applied_args(args)?),
         "array" => JsAst::Array(applied_args(args)?),
