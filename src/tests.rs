@@ -120,7 +120,7 @@ fn esm_wrapping() {
     )
     .unwrap();
     assert!(js.contains("export default"), "{js}");
-    assert!(js.contains("const __handl_rt"), "{js}");
+    assert!(js.contains("var __handl_rt"), "{js}");
 }
 
 #[test]
@@ -289,7 +289,7 @@ fn iife_wrapping() {
     .unwrap();
     assert!(js.starts_with("(function"), "{js}");
     assert!(js.contains("return async __in => 42"), "{js}");
-    assert!(js.contains("const __handl_rt"), "{js}");
+    assert!(js.contains("var __handl_rt"), "{js}");
 }
 
 #[test]

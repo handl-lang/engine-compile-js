@@ -156,6 +156,36 @@ fn is_bare_module_name(spec: &str) -> bool {
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
 }
 
+/// Whether `s` is a valid JS identifier (so `.s` member access is legal).
+fn is_js_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// A `__handl_rt` member path for package spec/member segments —
+/// identifier segments use `.name`, anything else bracket access
+/// (`fetch-js` under `.` would parse as subtraction).
+fn rt_member_path(segments: &[&str]) -> String {
+    let mut path = "__handl_rt".to_string();
+    for seg in segments {
+        if is_js_ident(seg) {
+            path.push('.');
+            path.push_str(seg);
+        } else {
+            let quoted = serde_json::to_string(&Value::String(seg.to_string()))
+                .unwrap_or_else(|_| "\"_\"".to_string());
+            path.push('[');
+            path.push_str(&quoted);
+            path.push(']');
+        }
+    }
+    path
+}
+
 /// A valid-JS-identifier spelling for a Handl binding name.
 fn js_ident(name: &str) -> String {
     let out: String = name
@@ -430,12 +460,12 @@ impl ModuleCtx {
                 for (imported, local) in &names {
                     self.bound.insert(
                         local.clone(),
-                        BoundRef::Member(format!("__handl_rt.{spec}.{imported}")),
+                        BoundRef::Member(rt_member_path(&[&spec, imported])),
                     );
                 }
                 if let Some(m) = &alias {
                     self.bound
-                        .insert(m.clone(), BoundRef::Member(format!("__handl_rt.{spec}")));
+                        .insert(m.clone(), BoundRef::Member(rt_member_path(&[&spec])));
                 }
             }
             return Ok(());

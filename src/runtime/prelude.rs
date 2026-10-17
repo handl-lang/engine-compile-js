@@ -3,14 +3,15 @@
 use crate::config::JsOutputFormat;
 
 /// Return the runtime prelude source for the requested output format.
-pub fn runtime_prelude(format: &dyn JsOutputFormat) -> String {
-    let decl = if format.name() == "esm" || format.name() == "iife" {
-        "const"
-    } else {
-        "var"
-    };
+///
+/// The runtime object binds through `globalThis` (`||=`) rather than a
+/// bare `const`/`let` redeclaration: several compiled module units
+/// concatenated into one file — a consumer plus its `__handl_rt.<pkg>`
+/// imports — then share a single `__handl_rt` instead of failing on a
+/// duplicate declaration.
+pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     format!(
-        r#"{} __handl_rt = {{
+        r#"var __handl_rt = globalThis.__handl_rt ||= {{
   mkPair: (a, b) => ({{__pair__: [a, b]}}),
   mkLeft: (v) => ({{__either__: "left", value: v}}),
   mkRight: (v) => ({{__either__: "right", value: v}}),
@@ -175,8 +176,47 @@ pub fn runtime_prelude(format: &dyn JsOutputFormat) -> String {
       return host.error();
     }}
     return __handl_rt.__lastError;
-  }}
-}},
+  }},
+  // The `fetch-js` package (`handl-packages/fetch-js`): host `fetch`
+  // over `globalThis.fetch`, settled through the same `{{ok}}/{{err}}`
+  // bridge as `js.await` — the .hnl contract is host-provided here.
+  "fetch-js": {{
+    fetch: async (input, init) => {{
+      try {{
+        return {{ ok: await globalThis.fetch(input, init) }};
+      }} catch (e) {{
+        return {{ err: e instanceof Error ? e : new Error(String(e)) }};
+      }}
+    }},
+    fetch_text: async (input, init) => {{
+      const r = await __handl_rt["fetch-js"].fetch(input, init);
+      if (!r || typeof r !== "object" || !("ok" in r)) return r;
+      try {{
+        return {{ ok: await r.ok.text() }};
+      }} catch (e) {{
+        return {{ err: e instanceof Error ? e : new Error(String(e)) }};
+      }}
+    }},
+    fetch_json: async (input, init) => {{
+      const r = await __handl_rt["fetch-js"].fetch(input, init);
+      if (!r || typeof r !== "object" || !("ok" in r)) return r;
+      try {{
+        return {{ ok: await r.ok.json() }};
+      }} catch (e) {{
+        return {{ err: e instanceof Error ? e : new Error(String(e)) }};
+      }}
+    }},
+    fetch_bytes: async (input, init) => {{
+      const r = await __handl_rt["fetch-js"].fetch(input, init);
+      if (!r || typeof r !== "object" || !("ok" in r)) return r;
+      try {{
+        return {{ ok: await r.ok.bytes() }};
+      }} catch (e) {{
+        return {{ err: e instanceof Error ? e : new Error(String(e)) }};
+      }}
+    }},
+  }},
+}};
 // `await` — the Promise bridge every Promise-returning contract op
 // (`js.await`) funnels through. Never rejects: resolution yields
 // `{{ok: v}}`, rejection yields `{{err: <JsError record>}}` — the
@@ -187,7 +227,6 @@ __handl_rt.await = (p) =>
     (v) => ({{ ok: v }}),
     (e) => ({{ err: e instanceof Error ? e : new Error(String(e)) }})
   );
-"#,
-        decl
+"#
     )
 }

@@ -34,6 +34,16 @@ fn json_string(value: &Value) -> Result<String, CompileError> {
     serde_json::to_string(value).map_err(|e| CompileError::Emit(e.to_string()))
 }
 
+/// Whether `s` is a valid JS identifier (so `.s` member access is legal).
+fn is_js_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 /// Pretty-printer for [`JsAst`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JsEmitter;
@@ -118,8 +128,14 @@ impl JsEmitter {
                 } else {
                     self.emit_expr_to(obj, out)?;
                 }
-                out.push('.');
-                out.push_str(prop);
+                if is_js_ident(prop) {
+                    out.push('.');
+                    out.push_str(prop);
+                } else {
+                    out.push('[');
+                    out.push_str(&json_string(&Value::String(prop.clone()))?);
+                    out.push(']');
+                }
             }
             JsAst::Index { obj, key } => {
                 if self.needs_parens(obj) {
