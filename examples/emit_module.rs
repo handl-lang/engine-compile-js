@@ -28,6 +28,8 @@ fn main() {
         debug: false,
         no_inline_foreign: false,
         source_map: false,
+        modules: Vec::new(),
+        entry_imports: Vec::new(),
     };
     match compile_to_string(&input, &config) {
         Ok(js) => print!("{js}"),

@@ -281,6 +281,8 @@ fn iife_wrapping() {
         debug: false,
         no_inline_foreign: false,
         source_map: false,
+        modules: Vec::new(),
+        entry_imports: Vec::new(),
     };
     let js = compile_to_string(
         &input(Term::const_value(Value::Number(Number::from(42)))),
@@ -300,6 +302,8 @@ fn inline_format() {
         debug: false,
         no_inline_foreign: false,
         source_map: false,
+        modules: Vec::new(),
+        entry_imports: Vec::new(),
     };
     let js = compile_to_string(
         &input(Term::const_value(Value::Number(Number::from(42)))),
@@ -653,6 +657,91 @@ fn module_effect_statements_and_default_export() {
     // and its result is the default export.
     assert!(js.contains("export default"), "{js}");
     assert!(js.contains("await x(2)"), "{js}");
+}
+
+#[test]
+fn module_resolved_deps_inline_into_handl_rt_namespaces() {
+    // The driver resolved `from "dep-pkg" import { f }` to a file: the
+    // dep compiles once into a `const __mod_*` bound under
+    // `__handl_rt["dep-pkg"]`, and `f` resolves to its member path with
+    // arrow-call semantics (`await`ed, packed arg input).
+    let mut config = JsConfig::esm_deno();
+    config.modules = vec![crate::JsModule {
+        path: "/pkgs/dep/dep.hnl".to_string(),
+        source: "export f := (x) ~> x + 1\nexport g := (x) ~> f(x)\n".to_string(),
+        imports: Vec::new(),
+    }];
+    config.entry_imports = vec![("dep-pkg".to_string(), "/pkgs/dep/dep.hnl".to_string())];
+    let js = compile_to_string(
+        &module_input("from \"dep-pkg\" import { f }\nexport main := (x) ~> f(x)\n"),
+        &config,
+    )
+    .unwrap();
+    assert!(js.contains("const __mod_dep_0 = (await (async () => {"), "{js}");
+    assert!(js.contains(r#"return {"f": f, "g": g};"#), "{js}");
+    assert!(js.contains(r#"__handl_rt["dep-pkg"] = __mod_dep_0;"#), "{js}");
+    assert!(
+        js.contains(r#"await __handl_rt["dep-pkg"].f("#),
+        "{js}"
+    );
+    // No dead ES import or stub-member reference is emitted for it.
+    assert!(!js.contains("import { f } from"), "{js}");
+}
+
+#[test]
+fn module_dep_transitive_imports_and_no_export_fallback() {
+    // `dep` imports `./inner` (resolved against the dep's own dir) and
+    // `inner` declares no exports — the record projects every bound
+    // name (`module_prep` parity).
+    let mut config = JsConfig::esm_deno();
+    config.modules = vec![
+        crate::JsModule {
+            path: "/pkgs/dep/dep.hnl".to_string(),
+            source: "from \"./inner\" import { base }\nexport f := (x) ~> base(x)\n".to_string(),
+            imports: vec![("./inner".to_string(), "/pkgs/dep/inner.hnl".to_string())],
+        },
+        crate::JsModule {
+            path: "/pkgs/dep/inner.hnl".to_string(),
+            source: "base := (x) ~> x * 2\n".to_string(),
+            imports: Vec::new(),
+        },
+    ];
+    config.entry_imports = vec![("dep".to_string(), "/pkgs/dep/dep.hnl".to_string())];
+    let js = compile_to_string(
+        &module_input("from \"dep\" import { f }\nexport main := (x) ~> f(x)\n"),
+        &config,
+    )
+    .unwrap();
+    // `inner` is emitted before `dep` (DFS post-order) and its record
+    // projects the bound `base`.
+    let inner = js.find("const __mod_inner").expect("{js}");
+    let dep = js.find("const __mod_dep").expect("{js}");
+    assert!(inner < dep, "{js}");
+    assert!(js.contains(r#"return {"base": base};"#), "{js}");
+    assert!(js.contains(r#"__handl_rt["./inner"] = __mod_inner_0;"#), "{js}");
+    assert!(
+        js.contains(r#"await __handl_rt["./inner"].base("#),
+        "{js}"
+    );
+}
+
+#[test]
+fn module_circular_dep_errors_like_the_loader() {
+    // A dep importing itself by a second spec is a circular import —
+    // the same error `ModuleLoader` reports at eval time.
+    let mut config = JsConfig::esm_deno();
+    config.modules = vec![crate::JsModule {
+        path: "/pkgs/a/a.hnl".to_string(),
+        source: "from \"./self\" import { f }\nexport g := (x) ~> f(x)\n".to_string(),
+        imports: vec![("./self".to_string(), "/pkgs/a/a.hnl".to_string())],
+    }];
+    config.entry_imports = vec![("a".to_string(), "/pkgs/a/a.hnl".to_string())];
+    let err = compile_to_string(
+        &module_input("from \"a\" import { g }\nexport main := (x) ~> g(x)\n"),
+        &config,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("circular"), "{err}");
 }
 
 #[test]

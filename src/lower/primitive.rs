@@ -356,10 +356,17 @@ fn lower_bound_op_body(
         .map(|a| lower_sub(a, param))
         .collect::<Result<Vec<_>, _>>()?;
     let body = match bound {
-        BoundRef::Arrow(js_name) => {
+        // `Arrow` is a top-level `const` name, `DepArrow` a member path
+        // into an inlined dep module (`__handl_rt[spec].name`) — both are
+        // `async __in => …` arrows applied with the packed arg input.
+        BoundRef::Arrow(js_name) | BoundRef::DepArrow(js_name) => {
+            let callee = match bound {
+                BoundRef::DepArrow(_) => JsAst::Raw(js_name.clone()),
+                _ => JsAst::Ident(js_name.clone()),
+            };
             if applied.is_empty() {
                 // Value position: the arrow yields the binding itself.
-                JsAst::Ident(js_name.clone())
+                callee
             } else {
                 // `app` arg-input: one argument stays bare, several pack
                 // into the tuple array the callee's `__in` expects.
@@ -370,7 +377,7 @@ fn lower_bound_op_body(
                     JsAst::Array(applied)
                 };
                 JsAst::Await(Box::new(JsAst::Call {
-                    callee: Box::new(JsAst::Ident(js_name.clone())),
+                    callee: Box::new(callee),
                     args: vec![arg_input],
                 }))
             }
@@ -392,7 +399,10 @@ fn lower_bound_op_body(
             }),
             args: applied,
         },
-        BoundRef::Member(path) => {
+        // `Member` is a host member path (comma/spread args), `Ns` a dep
+        // module's namespace record — both are plain values; a direct
+        // `Op`-spelled call applies the member spread convention.
+        BoundRef::Member(path) | BoundRef::Ns(path) => {
             if applied.is_empty() {
                 JsAst::Raw(path.clone())
             } else {
@@ -408,9 +418,11 @@ fn lower_bound_op_body(
 }
 
 /// `await` — the `js.await` op. Takes exactly one argument (the promise)
-/// and emits `(await __handl_rt.await(<arg>))`: the helper resolves to
-/// `{ok: v}` or `{err: <JsError>}` — never rejects — so a rejection is a
-/// data record, not an exception unwinding out of the Handl program.
+/// and emits `(await __handl_rt.await(<arg>))`: the helper resolves to a
+/// `Result` — `tag.tag("ok", {value: v})` or `tag.tag("err", {value: e})`
+/// — never rejects — so a rejection is data, not an exception unwinding
+/// out of the Handl program, and callers read it with `tag.tag_of` /
+/// `tag.untag` exactly as they do at eval time.
 fn lower_await_body(args: &[Term], param: &JsAst) -> Result<JsAst, CompileError> {
     if args.len() != 1 {
         return Err(CompileError::InvalidInput(format!(

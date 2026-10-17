@@ -2,7 +2,7 @@
 
 use handl_plugin_compile::CompileError;
 use plugin_engine::Term;
-use serde_json::Number;
+use serde_json::{Number, Value};
 
 use crate::lower::{JsAst, JsBinOp, JsUnaryOp};
 
@@ -199,7 +199,16 @@ fn lower_loop_applied(body: &Term, input: &JsAst) -> Result<JsAst, CompileError>
         JsAst::Return(Box::new(JsAst::Null)),
     ]);
 
-    Ok(block)
+    // The block holds `let`/`while` statements — legal only as a
+    // function body. Applied in expression position it must run inside
+    // an async IIFE (the loop body's `await`s stay legal).
+    Ok(JsAst::Await(Box::new(JsAst::Call {
+        callee: Box::new(JsAst::ArrowFn {
+            params: Vec::new(),
+            body: Box::new(block),
+        }),
+        args: Vec::new(),
+    })))
 }
 
 /// `Iter { fuel, predicate, step, initial }` — bounded iteration.
@@ -273,7 +282,15 @@ fn lower_iter_applied(
         JsAst::Return(Box::new(JsAst::Ident(state.to_string()))),
     ]);
 
-    Ok(block)
+    // Same as `lower_loop_applied`: the statement block runs inside an
+    // async IIFE so it is a valid expression-position value.
+    Ok(JsAst::Await(Box::new(JsAst::Call {
+        callee: Box::new(JsAst::ArrowFn {
+            params: Vec::new(),
+            body: Box::new(block),
+        }),
+        args: Vec::new(),
+    })))
 }
 
 /// `App { callee, args }` — higher-order arrow application.
@@ -282,7 +299,70 @@ pub fn lower_app(callee: &Term, args: &[Term]) -> Result<JsAst, CompileError> {
     Ok(arrow_fn(lower_app_applied(callee, args, &param)?))
 }
 
+/// The full member path of a `field_access` callee chain rooted at a
+/// host-namespace binding (`BoundRef::Member`), or `None` when the
+/// callee isn't a host member path. `ns.f(a, b)` on a host package
+/// applies the whole argument tuple — the eval `call` convention — so
+/// the nested `App` chain flattens into one `ns["f"](a, b)`; the curried
+/// `f(a)(b)` emit is reserved for arrow values (dep `Ns` namespaces
+/// included).
+fn host_member_callee(callee: &Term) -> Option<String> {
+    let Term::Op {
+        name, args, lit, ..
+    } = callee
+    else {
+        return None;
+    };
+    if name != "field_access" {
+        return None;
+    }
+    let field = lit.as_ref().and_then(Value::as_str)?;
+    let recv = args.first().and_then(|r| host_member_receiver(r))?;
+    let quoted = serde_json::to_string(&Value::String(field.to_string()))
+        .unwrap_or_else(|_| "\"_\"".to_string());
+    Some(format!("{recv}[{quoted}]"))
+}
+
+/// The `__handl_rt` path a `field_access` receiver term resolves to —
+/// an `Op{name}` bound to a host `Member` path, or a deeper
+/// `field_access` chain over one. `Ns` (dep) receivers return `None`:
+/// their members are compiled arrows, not host functions.
+fn host_member_receiver(recv: &Term) -> Option<String> {
+    let Term::Op {
+        name, args, lit, ..
+    } = recv
+    else {
+        return None;
+    };
+    if name == "field_access" {
+        let field = lit.as_ref().and_then(Value::as_str)?;
+        let base = args.first().and_then(|r| host_member_receiver(r))?;
+        let quoted = serde_json::to_string(&Value::String(field.to_string()))
+            .unwrap_or_else(|_| "\"_\"".to_string());
+        return Some(format!("{base}[{quoted}]"));
+    }
+    match super::module_bound(name) {
+        Some(super::BoundRef::Member(path)) => Some(path),
+        _ => None,
+    }
+}
+
 fn lower_app_applied(callee: &Term, args: &[Term], input: &JsAst) -> Result<JsAst, CompileError> {
+    // Flatten `App(App(f, a), b)` chains whose innermost callee is a
+    // `field_access` over a host `Member` namespace: eval applies a
+    // host function to the whole argument tuple, so `math.bit_or(a, b)`
+    // emits `__handl_rt.math["bit_or"](a, b)` — not `…(a)(b)`, which is
+    // the curried convention for arrow values.
+    if let Some((path, first_args)) = flatten_host_member_app(callee, args) {
+        let arg_exprs: Vec<JsAst> = first_args
+            .iter()
+            .map(|a| super::lower_applied(a, input))
+            .collect::<Result<_, _>>()?;
+        return Ok(JsAst::Call {
+            callee: Box::new(JsAst::Raw(path)),
+            args: arg_exprs,
+        });
+    }
     // A quoted-arrow callee (`Arr` whose payload is a serialized `Term` —
     // the `Term::App` contract, ADR-0120 Phase 1) is unquoted and lowered
     // to its JS arrow; the interpreter runs the inner term on the
@@ -312,4 +392,26 @@ fn lower_app_applied(callee: &Term, args: &[Term], input: &JsAst) -> Result<JsAs
         callee: Box::new(callee_expr),
         args: vec![arg_input],
     })))
+}
+
+/// Peel a left-nested `App` chain — `App(App(base, inner), outer)` —
+/// into the innermost callee and the concatenated argument list
+/// (innermost args first, matching eval's left-to-right application
+/// order). `Some` only when the base resolves to a host member path.
+fn flatten_host_member_app<'t>(
+    callee: &'t Term,
+    args: &'t [Term],
+) -> Option<(String, Vec<&'t Term>)> {
+    match callee {
+        Term::App {
+            callee: inner,
+            args: inner_args,
+        } => {
+            let (path, mut all) = flatten_host_member_app(inner, inner_args)?;
+            all.extend(args.iter());
+            Some((path, all))
+        }
+        _ => host_member_callee(callee)
+            .map(|path| (path, args.iter().collect())),
+    }
 }

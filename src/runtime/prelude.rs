@@ -118,10 +118,13 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   tag_pkg: null,
   jsCall: (module, name, args, _descriptors) => {{
     const host = globalThis[module];
-    if (!host || typeof host[name] !== "function") {{
+    const fn = (host && typeof host[name] === "function")
+      ? host[name].bind(host)
+      : globalThis[name];
+    if (typeof fn !== "function") {{
       throw new Error("unsafe or missing foreign call");
     }}
-    return host[name](...args);
+    return __handl_rt.__promiseBox(fn(...args));
   }},
   // The `js` contract package (`handl-packages/js`): `call`, `invoke`,
   // `error` and `await` are host-injected ops a JS host may provide on
@@ -133,19 +136,47 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   // lowerer emits a real JS `await`; the host event loop owns
   // settlement, and a rejection propagates as a rejected arrow promise.)
   __lastError: null,
+  // A JS promise carried through Handl data: `call`/`invoke`/`jsCall`
+  // box thenables so the emitted `(await x)` wrappers — which settle any
+  // raw thenable they meet — never resolve a foreign promise early or
+  // turn its rejection into a thrown exception. `js.await`
+  // (`__handl_rt.await`) is the only settle point; it unwraps the box.
+  // The sink `catch` marks the promise observed — a boxed promise the
+  // program never `js.await`s (e.g. a bound expression the lowering
+  // re-emits and discards) is unread data, not a host-level fatal
+  // "unhandled rejection".
+  __promiseBox: (v) => {{
+    if (v && typeof v.then === "function") {{
+      v.catch(() => {{}});
+      return {{__handl_promise__: v}};
+    }}
+    return v;
+  }},
+  __promiseUnbox: (v) =>
+    ((v && typeof v === "object" && v.__handl_promise__) ? v.__handl_promise__ : v),
   call: (obj, method, args, descriptors, retKind, throws) => {{
     const host = globalThis.js;
     if (host && typeof host.call === "function") {{
-      return host.call(obj, method, args, descriptors, retKind, throws);
+      return __handl_rt.__promiseBox(host.call(obj, method, args, descriptors, retKind, throws));
     }}
     const target = globalThis[obj];
-    if (!target || typeof target[method] !== "function") {{
+    // `globalThis[obj][method]` for namespaced APIs (`console.log`);
+    // falling back to `globalThis[method]` covers bare global functions —
+    // WebIDL `WindowOrWorkerGlobalScope` members surface as globals, so
+    // the sdkgen adapter's `call("fetch", "fetch", ...)` reaches
+    // `globalThis.fetch` itself.
+    const fn = (target && typeof target[method] === "function")
+      ? () => target[method](...args)
+      : (typeof globalThis[method] === "function"
+        ? () => globalThis[method](...args)
+        : null);
+    if (fn === null) {{
       __handl_rt.__lastError = new Error("unsafe or missing foreign call");
       return null;
     }}
     try {{
       __handl_rt.__lastError = null;
-      return target[method](...args);
+      return __handl_rt.__promiseBox(fn());
     }} catch (e) {{
       __handl_rt.__lastError = e;
       if (throws) {{ throw e; }}
@@ -155,7 +186,7 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   invoke: (receiver, method, args, descriptors, retKind, throws) => {{
     const host = globalThis.js;
     if (host && typeof host.invoke === "function") {{
-      return host.invoke(receiver, method, args, descriptors, retKind, throws);
+      return __handl_rt.__promiseBox(host.invoke(receiver, method, args, descriptors, retKind, throws));
     }}
     if (receiver == null || typeof receiver[method] !== "function") {{
       __handl_rt.__lastError = new Error("unsafe or missing foreign call");
@@ -163,7 +194,7 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     }}
     try {{
       __handl_rt.__lastError = null;
-      return receiver[method](...args);
+      return __handl_rt.__promiseBox(receiver[method](...args));
     }} catch (e) {{
       __handl_rt.__lastError = e;
       if (throws) {{ throw e; }}
@@ -176,6 +207,85 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
       return host.error();
     }}
     return __handl_rt.__lastError;
+  }},
+  // The `result` stdlib package (`stdlib/handl-packages/result`): `ok`
+  // /`err` are `tag.tag` constructors over the host tag system — the
+  // same shape the native TagModule impl produces at eval time.
+  result: {{
+    ok: (v) => __handl_rt.tag.tag("ok", {{ value: v }}),
+    err: (e) => __handl_rt.tag.tag("err", {{ value: e }}),
+  }},
+  // The `bytes` host contract (`stdlib/handl-packages/bytes` — 8 FFI
+  // atoms, no pure-handl implementation exists). On the JS boundary a
+  // `Bytes` buffer is `{{__bytes__: [u8, ...]}}` — the ADR-0083 scalar
+  // encoding — so the atoms are honest array/codec ops here. `Bytes` is
+  // the type-descriptor record imported by name (`from "bytes" import
+  // {{ Bytes }}`); at eval the native module supplies the same value.
+  bytes: {{
+    Bytes: {{__tag__: "bytes", __registry__: "type", kind: "primitive"}},
+    from_list: (xs) => ({{__bytes__: Array.from(xs || [], (n) => n & 255)}}),
+    to_list: (b) => Array.from((b && b.__bytes__) || []),
+    concat: (a, b) => ({{__bytes__: ((a && a.__bytes__) || []).concat((b && b.__bytes__) || [])}}),
+    slice: (b, off, len) => ({{__bytes__: ((b && b.__bytes__) || []).slice(off, off + len)}}),
+    len: (b) => (((b && b.__bytes__) || []).length),
+    at: (b, i) => {{
+      const a = (b && b.__bytes__) || [];
+      if (!Number.isInteger(i) || i < 0 || i >= a.length) {{
+        throw new Error("bytes.at: index out of bounds");
+      }}
+      return a[i];
+    }},
+    utf8_encode: (s) => ({{__bytes__: Array.from(new TextEncoder().encode(s))}}),
+    utf8_decode: (b) => new TextDecoder().decode(Uint8Array.from((b && b.__bytes__) || [])),
+  }},
+  // The `math` host contract (`stdlib/handl-packages/utils/math.hnl` —
+  // FFI atoms over f64/u64). The integer/bitwise surface goes through
+  // BigInt so `shr`/`shl`/`bit_*` keep 64-bit semantics past JS's
+  // 32-bit bitwise limit; the rest are `Math` pass-throughs.
+  math: {{
+    bit_and: (a, b) => Number(BigInt(a) & BigInt(b)),
+    bit_or: (a, b) => Number(BigInt(a) | BigInt(b)),
+    bit_xor: (a, b) => Number(BigInt(a) ^ BigInt(b)),
+    bit_not: (a) => Number(~BigInt(a)),
+    shl: (a, n) => Number(BigInt(a) << BigInt(n)),
+    shr: (a, n) => Number(BigInt(a) >> BigInt(n)),
+    u32: (a) => Number(BigInt.asUintN(32, BigInt(a))),
+    rotl32: (a, n) => {{
+      const x = a >>> 0;
+      const r = n % 32;
+      return (((x << r) | (x >>> (32 - r))) >>> 0);
+    }},
+    mod: (a, b) => (a % b),
+    abs: (a) => Math.abs(a),
+    min: (a, b) => Math.min(a, b),
+    max: (a, b) => Math.max(a, b),
+    floor: (a) => Math.floor(a),
+    ceil: (a) => Math.ceil(a),
+    round: (a) => Math.round(a),
+    trunc: (a) => Math.trunc(a),
+    pow: (a, b) => Math.pow(a, b),
+    sqrt: (a) => Math.sqrt(a),
+  }},
+  // The `type` host contract's type-descriptor records — the same
+  // `{{__tag__, __registry__: "type", kind: "primitive"}}` shapes
+  // `kit-canonical/handl-packages/type` binds at eval — plus `of`, the
+  // kind-tag introspection op (the eval `type_tag` vocabulary).
+  type: {{
+    Int: {{__tag__: "int", __registry__: "type", kind: "primitive"}},
+    Nat: {{__tag__: "nat", __registry__: "type", kind: "primitive"}},
+    Str: {{__tag__: "str", __registry__: "type", kind: "primitive"}},
+    Bool: {{__tag__: "bool", __registry__: "type", kind: "primitive"}},
+    Null: {{__tag__: "null", __registry__: "type", kind: "primitive"}},
+    Float: {{__tag__: "float", __registry__: "type", kind: "primitive"}},
+    Number: {{__tag__: "number", __registry__: "type", kind: "primitive"}},
+    Bytes: {{__tag__: "bytes", __registry__: "type", kind: "primitive"}},
+    of: (v) => (v === null || v === undefined ? "null"
+      : Array.isArray(v) ? "array"
+      : (typeof v === "object" && v.__bytes__ ? "bytes"
+      : (typeof v === "function" ? "arrow"
+      : (typeof v === "boolean" ? "bool"
+      : (typeof v === "number" ? "number"
+      : (typeof v === "string" ? "string" : "object")))))),
   }},
   // The `fetch-js` package (`handl-packages/fetch-js`): host `fetch`
   // over `globalThis.fetch`, settled through the same `{{ok}}/{{err}}`
@@ -219,13 +329,14 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
 }};
 // `await` — the Promise bridge every Promise-returning contract op
 // (`js.await`) funnels through. Never rejects: resolution yields
-// `{{ok: v}}`, rejection yields `{{err: <JsError record>}}` — the
-// Handl error channel stays data, matching the `js.call`/`invoke`
-// `throws?` + `error()` convention.
+// `tag.tag("ok", {{value: v}})`, rejection yields
+// `tag.tag("err", {{value: <JsError record>}})` — the same `Result`
+// shape `result.ok`/`result.err` build, so compiled callers can read
+// the channel with `tag.tag_of`/`tag.untag` exactly as at eval time.
 __handl_rt.await = (p) =>
-  Promise.resolve(p).then(
-    (v) => ({{ ok: v }}),
-    (e) => ({{ err: e instanceof Error ? e : new Error(String(e)) }})
+  Promise.resolve(__handl_rt.__promiseUnbox(p)).then(
+    (v) => __handl_rt.result.ok(v),
+    (e) => __handl_rt.result.err(e instanceof Error ? e : new Error(String(e)))
   );
 "#
     )

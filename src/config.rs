@@ -123,6 +123,25 @@ impl JsOutputFormat for Inline {
     }
 }
 
+/// A `.hnl` module the driver resolved for inlining into the JS bundle —
+/// the ADR-0128 Phase-5 dep-table seam applied to `hnl compile js`.
+///
+/// `path` is the resolved canonical file path — the emit-once key.
+/// `imports` are this module's own resolved import edges —
+/// spec-as-written → resolved path — so a `from "./x"` inside the module
+/// resolves against *its* directory, not the entry file's. Specs absent
+/// from `imports` are host modules (`js`, `tag`, `str`, …): their names
+/// keep binding `__handl_rt` member paths / shims.
+#[derive(Debug)]
+pub struct JsModule {
+    /// Canonical path of the module file (emit-once key).
+    pub path: String,
+    /// The module's source text.
+    pub source: String,
+    /// Resolved import edges: spec-as-written → canonical path.
+    pub imports: Vec<(String, String)>,
+}
+
 /// Configuration for the JavaScript compiler.
 #[derive(Debug)]
 pub struct JsConfig {
@@ -139,6 +158,17 @@ pub struct JsConfig {
     pub no_inline_foreign: bool,
     /// Whether a Source Map V3 should be emitted.
     pub source_map: bool,
+    /// `.hnl` modules the driver resolved for bundling into the output:
+    /// each is emitted once as `const __mod_<n> = <module>` and bound
+    /// into `__handl_rt[<spec>]` namespaces, so package imports resolve
+    /// to real values instead of dead member stubs. Empty for callers
+    /// that do not perform import resolution (the compiler crate itself
+    /// never touches the filesystem — resolution is the driver's job).
+    pub modules: Vec<JsModule>,
+    /// The entry file's resolved import edges — spec-as-written →
+    /// canonical path — for `CompilerInput::source` (which carries no
+    /// path of its own).
+    pub entry_imports: Vec<(String, String)>,
 }
 
 impl JsConfig {
@@ -150,6 +180,8 @@ impl JsConfig {
             debug: false,
             no_inline_foreign: false,
             source_map: false,
+            modules: Vec::new(),
+            entry_imports: Vec::new(),
         }
     }
 
@@ -161,6 +193,8 @@ impl JsConfig {
             debug: false,
             no_inline_foreign: false,
             source_map: false,
+            modules: Vec::new(),
+            entry_imports: Vec::new(),
         }
     }
 }

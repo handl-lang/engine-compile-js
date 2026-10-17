@@ -29,7 +29,7 @@ impl Compiler for JsCompiler {
         // declarations. Inputs without a real `Language` (tests' synthetic
         // `CompilerInput`s) fall through to the single-term path.
         if js_config.format.name() == "esm" {
-            if let Some(stmts) = crate::module::try_compile_module(input)? {
+            if let Some(stmts) = crate::module::try_compile_module(input, js_config)? {
                 let emitter = JsEmitter;
                 let body = emitter.emit_module(&stmts)?;
                 SecurityScanner::new().scan(&body)?;

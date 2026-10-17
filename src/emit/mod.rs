@@ -435,7 +435,12 @@ impl JsEmitter {
         }
         out.push_str(" => ");
 
-        if self.is_expression(body) {
+        if matches!(body, JsAst::Object(_)) {
+            // `=> {k: v}` parses as a block — wrap object bodies.
+            out.push('(');
+            self.emit_expr_to(body, out)?;
+            out.push(')');
+        } else if self.is_expression(body) {
             self.emit_expr_to(body, out)?;
         } else if matches!(body, JsAst::Block(_)) {
             self.emit_stmt_to(body, out, 0)?;

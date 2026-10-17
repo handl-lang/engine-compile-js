@@ -36,8 +36,26 @@ pub(crate) enum BoundRef {
     /// A member path on `__handl_rt` (e.g. `__handl_rt.tag.tag_of` for a
     /// `from "tag" import { tag_of }` name): value position emits the
     /// path; a call applies it with spread args (host-function
-    /// convention).
+    /// convention). A `field_access` chain rooted at a `Member`
+    /// namespace (`math.bit_or`, `bytes.at`, `__handl_rt` itself)
+    /// flattens its `App` chain into one `path(a0, …, aN)` call —
+    /// eval's `call` applies the whole argument tuple to a host
+    /// function; the per-arg `sequential_app` currying is for arrow
+    /// values only.
     Member(String),
+    /// A `__handl_rt[<spec>].<name>` path to an *inlined* dep module
+    /// binding — the member holds a `const`/`async` arrow just like a
+    /// local `BoundRef::Arrow`, so value position emits the path and a
+    /// call emits `(await path(arg_input))` with the same lone-arg /
+    /// `[args]` tuple packing.
+    DepArrow(String),
+    /// A `__handl_rt[<spec>]` path to an *inlined* dep module's
+    /// namespace record (a resolved `* as ns` alias): value position
+    /// emits the path like `Member`, but `ns.f` members are compiled
+    /// arrows — `ns.f(a)(b)` keeps the curried `app` convention — so
+    /// `lower_app` never flattens a `field_access` chain rooted here
+    /// the way it does for host `Member` namespaces.
+    Ns(String),
     /// Route to a different native op name — `from "js" import { await
     /// as js_await }` maps `js_await` back to the real `await` op so the
     /// emitted code keeps the literal-`await` bridge.
