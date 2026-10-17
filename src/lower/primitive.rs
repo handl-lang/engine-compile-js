@@ -408,7 +408,9 @@ fn lower_bound_op_body(
 }
 
 /// `await` — the `js.await` op. Takes exactly one argument (the promise)
-/// and emits `(await <arg>)` as the arrow body.
+/// and emits `(await __handl_rt.await(<arg>))`: the helper resolves to
+/// `{ok: v}` or `{err: <JsError>}` — never rejects — so a rejection is a
+/// data record, not an exception unwinding out of the Handl program.
 fn lower_await_body(args: &[Term], param: &JsAst) -> Result<JsAst, CompileError> {
     if args.len() != 1 {
         return Err(CompileError::InvalidInput(format!(
@@ -417,7 +419,13 @@ fn lower_await_body(args: &[Term], param: &JsAst) -> Result<JsAst, CompileError>
         )));
     }
     let promise = lower_sub(&args[0], param)?;
-    Ok(JsAst::Await(Box::new(promise)))
+    Ok(JsAst::Await(Box::new(JsAst::Call {
+        callee: Box::new(JsAst::Member {
+            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+            prop: "await".to_string(),
+        }),
+        args: vec![promise],
+    })))
 }
 
 fn lower_foreign_op_body(

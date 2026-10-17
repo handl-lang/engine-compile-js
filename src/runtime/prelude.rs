@@ -176,7 +176,17 @@ pub fn runtime_prelude(format: &dyn JsOutputFormat) -> String {
     }}
     return __handl_rt.__lastError;
   }}
-}};
+}},
+// `await` — the Promise bridge every Promise-returning contract op
+// (`js.await`) funnels through. Never rejects: resolution yields
+// `{{ok: v}}`, rejection yields `{{err: <JsError record>}}` — the
+// Handl error channel stays data, matching the `js.call`/`invoke`
+// `throws?` + `error()` convention.
+__handl_rt.await = (p) =>
+  Promise.resolve(p).then(
+    (v) => ({{ ok: v }}),
+    (e) => ({{ err: e instanceof Error ? e : new Error(String(e)) }})
+  );
 "#,
         decl
     )
