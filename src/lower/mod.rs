@@ -65,6 +65,8 @@ pub(crate) enum BoundRef {
 #[derive(Debug, Default)]
 struct LowerCtx {
     no_inline_foreign: bool,
+    /// `__sq<N>` uniquifier for `Seq`-stage const bindings.
+    tmp: usize,
     /// Module-scope names resolvable inside arrow bodies — imports and
     /// top-level bindings, populated by [`crate::module`] for the
     /// file-level emit. Empty for single-term inputs.
@@ -97,6 +99,15 @@ pub(crate) fn with_module_env<T>(
     let ret = f();
     LOWER_CTX.with(|c| c.borrow_mut().bound = prev);
     ret
+}
+
+/// A fresh `__sq<N>` name for a `Seq`-stage `const` binding.
+pub(crate) fn next_tmp() -> String {
+    LOWER_CTX.with(|c| {
+        let mut c = c.borrow_mut();
+        c.tmp += 1;
+        format!("__sq{}", c.tmp)
+    })
 }
 
 /// Look up `name` in the module-scope binding table.

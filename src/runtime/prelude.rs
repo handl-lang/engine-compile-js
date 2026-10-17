@@ -208,6 +208,13 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     }}
     return __handl_rt.__lastError;
   }},
+  // Bound-arrow record application input (`{{__term__, __bound__}}`,
+  // ADR-0120 Phase 1): `bound ++ call-args` — a lone call arg stays a
+  // singleton, a tuple spreads; a non-array `bound` packs as one element
+  // (the tree-walk `apply_app` convention).
+  __appInput: (bound, args) =>
+    [...(Array.isArray(bound) ? bound : [bound]),
+     ...(Array.isArray(args) ? args : [args])],
   // The `result` stdlib package (`stdlib/handl-packages/result`): `ok`
   // /`err` are `tag.tag` constructors over the host tag system — the
   // same shape the native TagModule impl produces at eval time.
@@ -286,6 +293,96 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
       : (typeof v === "boolean" ? "bool"
       : (typeof v === "number" ? "number"
       : (typeof v === "string" ? "string" : "object")))))),
+    // `type.to_string` — the value→string rendering the serializers
+    // use (`type.to_string(bytes.len(bs))` → "8").
+    to_string: (v) => (v === null || v === undefined ? "null"
+      : (typeof v === "object" && v.__bytes__ ? String.fromCharCode(...v.__bytes__)
+      : String(v))),
+  }},
+  // The `option` stdlib package (`lib-option`): `Some`/`None` are
+  // `tag.tag` constructors — the same shapes `option.some`/`option.none`
+  // produce at eval; `Option` is a type-descriptor constructor.
+  option: {{
+    Option: (of) => ({{__tag__: "option", __registry__: "type", kind: "generic", of}}),
+    some: (v) => __handl_rt.tag.tag("Some", {{value: v}}),
+    none: () => __handl_rt.tag.tag("None", null),
+    is_some: (o) => (__handl_rt.tag.tag_of(o) === "Some"),
+    is_none: (o) => (__handl_rt.tag.tag_of(o) === "None"),
+    unwrap: (o) => {{
+      if (__handl_rt.tag.tag_of(o) === "Some") return __handl_rt.tag.untag(o).value;
+      throw new Error("option.unwrap: called on None");
+    }},
+    unwrap_or: (o, d) => (__handl_rt.tag.tag_of(o) === "Some"
+      ? __handl_rt.tag.untag(o).value : d),
+  }},
+  // The `str` host contract (`stdlib/handl-packages/utils/str.hnl` —
+  // FFI atoms). PARTIAL: only the members .hnl sources actually call
+  // are mirrored. Indices are character (code-point) positions, matching
+  // the Rust `chars()` semantics — JS UTF-16 units would miscount
+  // astral characters. `find` returns the char index or -1.
+  str: {{
+    length: (s) => [...String(s)].length,
+    is_empty: (s) => (String(s).length === 0),
+    equals: (a, b) => (String(a) === String(b)),
+    concat: (a, b) => (String(a) + String(b)),
+    slice: (s, start, end) => [...String(s)].slice(start, end).join(""),
+    char_at: (s, i) => ([...String(s)][i] ?? null),
+    find: (s, sub) => {{
+      const i = String(s).indexOf(String(sub));
+      return i < 0 ? -1 : [...String(s).slice(0, i)].length;
+    }},
+    contains: (s, sub) => (String(s).indexOf(String(sub)) >= 0),
+    starts_with: (s, p) => String(s).startsWith(String(p)),
+    ends_with: (s, p) => String(s).endsWith(String(p)),
+    split: (s, sep) => String(s).split(String(sep)),
+    join: (xs, sep) => (xs || []).join(String(sep)),
+    trim: (s) => String(s).trim(),
+    trim_start: (s) => String(s).trimStart(),
+    trim_end: (s) => String(s).trimEnd(),
+    lower: (s) => String(s).toLowerCase(),
+    upper: (s) => String(s).toUpperCase(),
+    replace: (s, from, to) => String(s).split(String(from)).join(String(to)),
+    repeat: (s, n) => String(s).repeat(n),
+  }},
+  // The `char` host contract (`stdlib/handl-packages/char/char.hnl`) —
+  // PARTIAL: `code_point_at`/`code_point`/`from_code_point` only (the
+  // surface `http_rfc` uses). `code_point_at` indexes by character
+  // position (Handl `Char` semantics), like `str.char_at`.
+  char: {{
+    code_point_at: (s, i) => {{
+      const c = [...String(s)][i];
+      if (c === undefined) {{ throw new Error("char.code_point_at: index out of bounds"); }}
+      return c.codePointAt(0);
+    }},
+    code_point: (s) => {{
+      const c = [...String(s)][0];
+      if (c === undefined) {{ throw new Error("char.code_point: empty string"); }}
+      return c.codePointAt(0);
+    }},
+    from_code_point: (n) => String.fromCodePoint(n),
+  }},
+  // The `hash_map` wire name (`stdlib/crates/plugin-lib-stdlib` —
+  // `collections.hash_map` atoms): a plain JS object as the map;
+  // `set`/`get_or`/`has` are the ops .hnl sources actually call.
+  hash_map: {{
+    new: () => ({{}}),
+    from: (o) => Object.assign({{}}, o),
+    to_object: (m) => Object.assign({{}}, m),
+    size: (m) => Object.keys(m || {{}}).length,
+    get: (m, k, d) => ((m && typeof m === "object" && k in m) ? m[k] : (d ?? null)),
+    get_or: (m, k, d) => ((m && typeof m === "object" && k in m) ? m[k] : d),
+    set: (m, k, v) => Object.assign({{}}, m, {{[k]: v}}),
+    has: (m, k) => !!(m && typeof m === "object" && Object.prototype.hasOwnProperty.call(m, k)),
+    remove: (m, k) => {{ const o = Object.assign({{}}, m); delete o[k]; return o; }},
+    keys: (m) => Object.keys(m || {{}}),
+    values: (m) => Object.values(m || {{}}),
+  }},
+  // The `obj` package — plain-record helpers. PARTIAL: only
+  // `keys`/`get`/`set` (the surface `http_rfc` uses) are mirrored.
+  obj: {{
+    keys: (m) => Object.keys(m || {{}}),
+    get: (m, k, d) => ((m && typeof m === "object" && k in m) ? m[k] : d),
+    set: (m, k, v) => Object.assign({{}}, m, {{[k]: v}}),
   }},
   // The `fetch-js` package (`handl-packages/fetch-js`): host `fetch`
   // over `globalThis.fetch`, settled through the same `{{ok}}/{{err}}`

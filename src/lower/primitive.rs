@@ -13,6 +13,17 @@ const INPUT_NAME: &str = "__in";
 pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
     match term {
         Term::Arr { value, .. } => {
+            // A quoted arrow (`Arr` holding a serialized `Term` — the
+            // ADR-0120 Phase 1 quoting form) is a *function value* on this
+            // target: all arrow values are JS async arrows, so `arr(q)`
+            // is the constant arrow returning that function.
+            if let Ok(inner) = serde_json::from_value::<Term>(value.clone()) {
+                let arrow = super::lower(&inner)?;
+                return Ok(JsAst::ArrowFn {
+                    params: vec![INPUT_NAME.to_string()],
+                    body: Box::new(arrow),
+                });
+            }
             let body = lower_value(value)?;
             Ok(JsAst::ArrowFn {
                 params: vec![INPUT_NAME.to_string()],
@@ -23,7 +34,7 @@ pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
         Term::Seq { axis, fst, snd } => {
             check_sequential(axis, fst)?;
             let param = JsAst::Ident(INPUT_NAME.to_string());
-            let body = lower_sub(snd, &lower_sub(fst, &param)?)?;
+            let body = lower_seq_body(fst, snd, &param)?;
             Ok(JsAst::ArrowFn {
                 params: vec![INPUT_NAME.to_string()],
                 body: Box::new(body),
@@ -58,7 +69,16 @@ const BUILTIN_OPS: &[&str] = &[
 /// Lower the application of a primitive term to an input value.
 pub fn lower_applied(term: &Term, _input: &JsAst) -> Result<JsAst, CompileError> {
     match term {
-        Term::Arr { value, .. } | Term::Const { value } => lower_value(value),
+        Term::Arr { value, .. } => {
+            // `arr(q)` applied to any input yields `q`; a `q` that is a
+            // serialized `Term` is a quoted arrow — its JS value is the
+            // async arrow itself (the `Term::App` unquote convention).
+            if let Ok(inner) = serde_json::from_value::<Term>(value.clone()) {
+                return super::lower(&inner);
+            }
+            lower_value(value)
+        }
+        Term::Const { value } => lower_value(value),
         // Applying an `Op` arrow to `input` evaluates the op body with
         // `input` as the incoming value — emit the body against `input`
         // directly (awaited: op bodies may themselves contain `await`).
@@ -77,7 +97,7 @@ pub fn lower_applied(term: &Term, _input: &JsAst) -> Result<JsAst, CompileError>
         )?))),
         Term::Seq { axis, fst, snd } => {
             check_sequential(axis, fst)?;
-            lower_sub(snd, &lower_sub(fst, _input)?)
+            lower_seq_body(fst, snd, _input)
         }
         _ => Err(CompileError::Lower(format!(
             "primitive lowerer received non-primitive term: {term:?}"
@@ -102,6 +122,40 @@ fn check_sequential(axis: &Term, fst: &Term) -> Result<(), CompileError> {
             "Seq: globular cell composition is not supported by the JS backend".to_string(),
         )),
     }
+}
+
+/// `fst >>> snd`: evaluate `fst`'s result once into a `const` when it
+/// is not a trivially-reusable expression, then run `snd` on the name.
+///
+/// Without the binding, `snd`'s lowering clones the *expression* into
+/// every input position it touches (branch `cond` + both arms, `product`
+/// args, …), so a stage like `fetch(...)` or `pair_tag(product(...))`
+/// would re-evaluate per use. The IIFE keeps statement context legal and
+/// preserves the source's eager evaluation order — the `const` runs at
+/// exactly the point the `Seq` stage runs.
+fn lower_seq_body(fst: &Term, snd: &Term, input: &JsAst) -> Result<JsAst, CompileError> {
+    let fst_js = lower_sub(fst, input)?;
+    if matches!(
+        fst_js,
+        JsAst::Ident(_) | JsAst::Null | JsAst::Bool(_) | JsAst::Num(_) | JsAst::Str(_)
+    ) {
+        return lower_sub(snd, &fst_js);
+    }
+    let name = super::next_tmp();
+    let body = lower_sub(snd, &JsAst::Ident(name.clone()))?;
+    Ok(JsAst::Await(Box::new(JsAst::Call {
+        callee: Box::new(JsAst::ArrowFn {
+            params: Vec::new(),
+            body: Box::new(JsAst::Block(vec![
+                JsAst::ConstDecl {
+                    name,
+                    value: Box::new(fst_js),
+                },
+                JsAst::Return(Box::new(body)),
+            ])),
+        }),
+        args: Vec::new(),
+    })))
 }
 
 fn lower_op(
@@ -199,7 +253,17 @@ fn lower_op_body(
         "product" => rt("product", applied_args(args)?),
         "array" => JsAst::Array(applied_args(args)?),
         "record" => {
-            if let Some(keys) = lit.and_then(Value::as_array) {
+            // `{__term__, __bound__}` — a bound-arrow record (ADR-0120
+            // Phase 1): a frozen partial application that, applied to
+            // `args`, runs `__term__` on `__bound__ ++ args`. On this
+            // target arrow values are JS async arrows, so the record
+            // lowers to one: `__bound__` is evaluated eagerly at
+            // construction (enclosing `param`), the call packs
+            // `bound ++ call-args` into the inner arrow's `__in` —
+            // exactly the term_interpreter's application rule.
+            if let Some(bound_arrow) = lower_bound_arrow_record(args, lit, param)? {
+                bound_arrow
+            } else if let Some(keys) = lit.and_then(Value::as_array) {
                 let vals = applied_args(args)?;
                 let mut props = Vec::with_capacity(vals.len());
                 for (i, v) in vals.into_iter().enumerate() {
@@ -219,9 +283,21 @@ fn lower_op_body(
             }
         }
         "field_access" => {
-            let field = lit.and_then(Value::as_str).ok_or_else(|| {
-                CompileError::InvalidInput("field_access: missing field literal".to_string())
-            })?;
+            // `lit` is a string for `r.field` and a number for `a[i]`
+            // indexing. A computed index (`a[expr]`) arrives as a second
+            // arg with no lit — lower it as the key expression.
+            let key = match lit {
+                Some(Value::String(s)) => JsAst::Str(s.clone()),
+                Some(v @ (Value::Number(_) | Value::Bool(_))) => {
+                    JsAst::Raw(v.to_string())
+                }
+                _ if args.len() >= 2 => lower_sub(&args[1], param)?,
+                _ => {
+                    return Err(CompileError::InvalidInput(
+                        "field_access: missing field literal".to_string(),
+                    ));
+                }
+            };
             let target = if args.is_empty() {
                 param.clone()
             } else {
@@ -229,7 +305,7 @@ fn lower_op_body(
             };
             JsAst::Index {
                 obj: Box::new(target),
-                key: Box::new(JsAst::Str(field.to_string())),
+                key: Box::new(key),
             }
         }
         // Comparisons / logic / math.
@@ -415,6 +491,71 @@ fn lower_bound_op_body(
         BoundRef::Op(_) => unreachable!("handled above"),
     };
     Ok(body)
+}
+
+/// Emit a `{__term__, __bound__}` bound-arrow record (`Op{record}` with
+/// that literal key pair) as a JS arrow value:
+///
+/// ```js
+/// (await (async () => {
+///   const __b = <bound>;
+///   return async __args => (await (<term>)(__handl_rt.__appInput(__b, __args)));
+/// })())
+/// ```
+///
+/// `__b` is evaluated once at construction against the enclosing input —
+/// the record-freeze point — and the call packs `bound ++ call-args` into
+/// the inner arrow's `__in` (the `term_interpreter` application rule: a
+/// lone arg stays bare, a tuple spreads). `__term__` lowers through the
+/// ordinary value path: a quoted `Arr` is already a JS arrow, and a
+/// nested bound-arrow record is its own wrapper — both are callable.
+/// Returns `None` (fall back to the plain-record emit) for any other
+/// shape.
+fn lower_bound_arrow_record(
+    args: &[Term],
+    lit: Option<&Value>,
+    param: &JsAst,
+) -> Result<Option<JsAst>, CompileError> {
+    let is_bound_record = lit
+        .and_then(Value::as_array)
+        .is_some_and(|keys| {
+            keys.len() == 2
+                && keys[0].as_str() == Some("__term__")
+                && keys[1].as_str() == Some("__bound__")
+        });
+    if !is_bound_record || args.len() != 2 {
+        return Ok(None);
+    }
+    let term_expr = lower_sub(&args[0], param)?;
+    let bound_expr = lower_sub(&args[1], param)?;
+    Ok(Some(JsAst::Await(Box::new(JsAst::Call {
+        callee: Box::new(JsAst::ArrowFn {
+            params: Vec::new(),
+            body: Box::new(JsAst::Block(vec![
+                JsAst::ConstDecl {
+                    name: "__b".to_string(),
+                    value: Box::new(bound_expr),
+                },
+                JsAst::Return(Box::new(JsAst::ArrowFn {
+                    params: vec!["__args".to_string()],
+                    body: Box::new(JsAst::Await(Box::new(JsAst::Call {
+                        callee: Box::new(term_expr),
+                        args: vec![JsAst::Call {
+                            callee: Box::new(JsAst::Member {
+                                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                                prop: "__appInput".to_string(),
+                            }),
+                            args: vec![
+                                JsAst::Ident("__b".to_string()),
+                                JsAst::Ident("__args".to_string()),
+                            ],
+                        }],
+                    }))),
+                })),
+            ])),
+        }),
+        args: Vec::new(),
+    }))))
 }
 
 /// `await` — the `js.await` op. Takes exactly one argument (the promise)

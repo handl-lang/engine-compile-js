@@ -327,12 +327,16 @@ impl<'e> ModuleCtx<'e> {
     fn new(edges: &'e HashMap<String, String>, dep: bool) -> Self {
         let mut bound = HashMap::new();
         // Ambient host packages visible without an import (the canonical
-        // module chain): `var tag` resolves to the `__handl_rt.tag`
-        // package object, not a call.
-        bound.insert(
-            "tag".to_string(),
-            BoundRef::Member("__handl_rt.tag".to_string()),
-        );
+        // module chain — wire names resolve in every eval context): `var
+        // tag`/`var hash_map` resolve to the `__handl_rt.<pkg>` package
+        // object, not a call, and their `pkg.f(a, b)` calls take the
+        // host spread-args convention (`BoundRef::Member`).
+        for name in ["tag", "hash_map"] {
+            bound.insert(
+                name.to_string(),
+                BoundRef::Member(rt_member_path(&[name])),
+            );
+        }
         ModuleCtx {
             bound,
             bound_order: Vec::new(),
