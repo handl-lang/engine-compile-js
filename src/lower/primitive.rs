@@ -1,7 +1,7 @@
 //! Lower the primitive `Term` combinators (`Arr`, `Const`, `Op`, `Seq`) to JS.
 
 use handl_plugin_compile::CompileError;
-use plugin_engine::{ArrSource, Term};
+use hnl_engine::{ArrSource, Term};
 use serde_json::Value;
 
 use super::lower_applied as lower_sub;

@@ -1,8 +1,8 @@
 use handl_language::{Ast, AstNode, Language};
 use handl_plugin_compile::{ArtifactContent, Compiler, CompilerInput, CompilerOutput};
-use plugin_engine::term::RewriteWitness;
-use plugin_engine::{ArrSource, Term};
-use plugin_engine_typecheck::TypecheckReport;
+use hnl_engine::term::RewriteWitness;
+use hnl_engine::{ArrSource, Term};
+use hnl_engine_typecheck::TypecheckReport;
 use rand::Rng;
 use serde_json::{Number, Value, json};
 

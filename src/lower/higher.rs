@@ -1,7 +1,7 @@
 //! Lower the higher-order `Term` combinators (`Child`, `Handle`) to JS.
 
 use handl_plugin_compile::CompileError;
-use plugin_engine::Term;
+use hnl_engine::Term;
 
 use crate::JsAst;
 

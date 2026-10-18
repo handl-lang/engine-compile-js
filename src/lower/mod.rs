@@ -1,4 +1,4 @@
-//! Lower `plugin_engine::Term` into a target JavaScript AST.
+//! Lower `hnl_engine::Term` into a target JavaScript AST.
 
 mod control;
 mod higher;
@@ -6,7 +6,7 @@ mod primitive;
 mod proof;
 
 use handl_plugin_compile::{CompileError, ValueAbi};
-use plugin_engine::Term;
+use hnl_engine::Term;
 use serde_json::{Number, Value};
 
 use crate::config::JsConfig;

@@ -1,7 +1,7 @@
 //! Lower the control-flow `Term` combinators (`First`, `Choice`, `Loop`, `Iter`, `App`) to JS.
 
 use handl_plugin_compile::CompileError;
-use plugin_engine::Term;
+use hnl_engine::Term;
 use serde_json::{Number, Value};
 
 use crate::lower::{JsAst, JsBinOp, JsUnaryOp};

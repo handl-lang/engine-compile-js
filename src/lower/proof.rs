@@ -8,7 +8,7 @@
 //! Dispatched from `lower::lower` / `lower::lower_applied`.
 
 use handl_plugin_compile::CompileError;
-use plugin_engine::{Term, term::RewriteWitness};
+use hnl_engine::{Term, term::RewriteWitness};
 
 use crate::JsAst;
 

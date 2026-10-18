@@ -20,12 +20,12 @@ use std::path::Path;
 use handl_kit_arrow_lower::lower_ast;
 use handl_language::{Ast, AstNode, AstRef, Language};
 use handl_plugin_compile::{CompileError, CompilerInput};
-use handl_plugin_engine_lex_pattern::lex;
-use handl_plugin_engine_parse::{ParserEngine, ParserRequest};
-use handl_plugin_engine_parse_pratt::PrattEngine;
-use handl_plugin_engine_transform_rewrite::RewriteEngine;
+use hnl_engine_lex_pattern::lex;
+use hnl_engine_parse::{ParserEngine, ParserRequest};
+use hnl_engine_parse_pratt::PrattEngine;
+use hnl_engine_transform_rewrite::RewriteEngine;
 use handl_plugin_ext_diag::split_statements;
-use plugin_engine::Term;
+use hnl_engine::Term;
 use serde_json::Value;
 
 use crate::config::JsConfig;

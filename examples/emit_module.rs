@@ -4,8 +4,8 @@
 use handl_language::{Ast, AstNode};
 use handl_plugin_compile::CompilerInput;
 use handl_plugin_compile_js::{Esm, JsConfig, compile_to_string};
-use plugin_engine_typecheck::TypecheckReport;
-use plugin_engine::Term;
+use hnl_engine_typecheck::TypecheckReport;
+use hnl_engine::Term;
 use serde_json::Value;
 
 fn main() {
