@@ -11,7 +11,7 @@ use serde_json::Value;
 fn main() {
     let path = std::env::args().nth(1).expect("usage: emit_module <file.hnl>");
     let src = std::fs::read_to_string(&path).expect("read source");
-    let lang = handl_kit_data_canonical::language_from_yaml().expect("canonical language");
+    let lang = handl_kit_data_prelude::language_from_yaml().expect("canonical language");
     let mut ast = Ast::new();
     let root = ast.push(AstNode::new("module"));
     let input = CompilerInput::new(
