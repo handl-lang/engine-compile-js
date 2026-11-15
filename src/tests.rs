@@ -373,6 +373,7 @@ fn safe_foreign_descriptor_validates_and_inlines() {
         ],
         source: ArrSource::Foreign("math".to_string()),
         lit: Some(desc),
+        attrs: None,
     };
     let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
     assert!(js.contains(r#"globalThis["math"]"#), "{js}");
@@ -410,6 +411,7 @@ fn no_inline_foreign_emits_runtime_js_call() {
         ],
         source: ArrSource::Foreign("math".to_string()),
         lit: Some(desc),
+        attrs: None,
     };
     let js = compile_to_string(&input(term), &config).unwrap();
     assert!(js.contains("__handl_rt.jsCall"), "{js}");
@@ -461,6 +463,7 @@ fn await_op_emits_real_await() {
         args: vec![Term::op_native("id", vec![])],
         source: ArrSource::Native,
         lit: None,
+        attrs: None,
     };
     let js = compile_to_string(&input(native), &JsConfig::esm_deno()).unwrap();
     assert!(js.contains("async __in => (await"), "{js}");
@@ -472,6 +475,7 @@ fn await_op_emits_real_await() {
         args: vec![Term::op_native("id", vec![])],
         source: ArrSource::Foreign("js".to_string()),
         lit: None,
+        attrs: None,
     };
     let js = compile_to_string(&input(foreign), &JsConfig::esm_deno()).unwrap();
     assert!(js.contains("async __in => (await"), "{js}");
@@ -486,6 +490,7 @@ fn await_op_requires_exactly_one_arg() {
         args: vec![],
         source: ArrSource::Native,
         lit: None,
+        attrs: None,
     };
     assert!(compile_to_string(&input(term), &JsConfig::esm_deno()).is_err());
 }
@@ -502,6 +507,7 @@ fn await_op_application_is_awaited() {
             args: vec![Term::op_native("id", vec![])],
             source: ArrSource::Native,
             lit: None,
+            attrs: None,
         },
     );
     let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
@@ -523,6 +529,7 @@ fn dangerous_foreign_op_rejected_at_compile_time() {
         args: vec![],
         source: ArrSource::Foreign("x".to_string()),
         lit: Some(desc),
+        attrs: None,
     };
     assert!(compile_to_string(&input(term), &JsConfig::esm_deno()).is_err());
 }
