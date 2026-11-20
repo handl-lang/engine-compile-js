@@ -5,6 +5,9 @@ edition = "2024"
 description = "JavaScript compiler for the Handl arrow calculus (ADR-0114 Phase 3)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/handl-lang/compile-js"
+readme = "README.md"
+keywords = ["handl", "javascript", "compiler"]
+categories = ["compilers", "development-tools"]
 
 [dependencies]
 # ADR-0128 Phase 5: platform crates are git deps; the workspace-root
