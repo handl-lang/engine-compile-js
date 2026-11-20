@@ -1,7 +1,7 @@
-# compile-js
+# engine-compile-js
 
 `handl-plugin-compile-js` — JavaScript compiler for the Handl arrow
-calculus. Part of the `compile-*` compiler-backend family: lowers Handl
+calculus. Part of the `engine-compile-*` compiler-backend family: lowers Handl
 `Term` arrow terms to JavaScript source.
 
 ## Development
