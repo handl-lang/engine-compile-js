@@ -653,6 +653,27 @@ fn module_imports_emit_es_and_shims() {
 }
 
 #[test]
+fn module_js_construct_on_off_bind_to_shims() {
+    // `construct`/`on`/`off` are `js` contract ops: any name imported
+    // `from "js"` binds `__handl_rt.<name>` — the prelude supplies the
+    // shims (new-expression, event trampoline, removeEventListener).
+    let js = compile_to_string(
+        &module_input(
+            "from \"js\" import { construct as js_construct, on as js_on, off as js_off }\nexport run := (w, h) ~> do {\n  c := js_construct(\"\", \"Worker\", [\"w.js\"], [], \"js_object\", false)\n  l := js_on(w, \"message\", h)\n  js_off(w, \"message\", l)\n}\n",
+        ),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("__handl_rt.construct("), "{js}");
+    assert!(js.contains("__handl_rt.on("), "{js}");
+    assert!(js.contains("__handl_rt.off("), "{js}");
+    // The prelude shims themselves ship in the output.
+    assert!(js.contains("Reflect.construct"), "{js}");
+    assert!(js.contains("addEventListener"), "{js}");
+    assert!(js.contains("removeEventListener"), "{js}");
+}
+
+#[test]
 fn module_effect_statements_and_default_export() {
     let js = compile_to_string(
         &module_input("x := (a) ~> a + 1\nx(2)\n"),

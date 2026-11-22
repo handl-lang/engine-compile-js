@@ -248,6 +248,125 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     }}
     return __handl_rt.__lastError;
   }},
+  // `construct` — the `new`-expression counterpart of `call` (the `js`
+  // contract package, `handl-packages/js`). Constructor resolution
+  // mirrors `call`: `globalThis[obj][<path>]` for namespaced
+  // constructors, `globalThis[<path>]` for bare globals — `method` may
+  // be a dotted path walked from the resolved base, so
+  // `construct("", "Worker", …)` reaches `globalThis.Worker` and
+  // `construct("navigator", "gpu.requestAdapter", …)`-style deep paths
+  // work too. `Reflect.construct` is the emitted `new Ctor(...args)`;
+  // synchronous exceptions land in `__lastError` exactly like `call`.
+  construct: (obj, method, args, descriptors, retKind, throws) => {{
+    const host = globalThis.js;
+    if (host && typeof host.construct === "function") {{
+      return __handl_rt.__promiseBox(host.construct(obj, method, args, descriptors, retKind, throws));
+    }}
+    const path = String(method).split(".");
+    let ctor = null;
+    for (const base of [globalThis[obj], globalThis]) {{
+      if (base == null) continue;
+      let node = base;
+      for (const seg of path) {{ node = (node == null) ? undefined : node[seg]; }}
+      if (typeof node === "function") {{ ctor = node; break; }}
+    }}
+    if (ctor === null) {{
+      __handl_rt.__lastError = new Error("unsafe or missing constructor");
+      return null;
+    }}
+    try {{
+      __handl_rt.__lastError = null;
+      return __handl_rt.__promiseBox(Reflect.construct(ctor, Array.from(args || [])));
+    }} catch (e) {{
+      __handl_rt.__lastError = e;
+      if (throws) {{ throw e; }}
+      return null;
+    }}
+  }},
+  // `on`/`off` — the JS→handl event trampoline (the `js` contract
+  // package). `on(target, event, arrow)` wraps a compiled handl arrow —
+  // an async `__in => …` JS function — in a listener and registers it
+  // via `target.addEventListener`; it returns the JS listener so `off`
+  // (or `invoke(target, "removeEventListener", …)`) can unregister it.
+  // `target` is the EventTarget object itself or a string naming a
+  // global (`"self"`, `"window"`, `"document"`, …).
+  //
+  // Payload convention: for `"message"` events the arrow receives
+  // `event.data` — the structured-cloned handl value (`__pair__` /
+  // `__either__` / `__bytes__` / `__tag__` records all survive the
+  // clone); every other event receives the Event object itself. The
+  // arrow is invoked as `arrow(payload)` — the single app arg-input —
+  // and awaited. A rejection lands in `__lastError` (the `error` op's
+  // convention) instead of escaping as an unhandled rejection.
+  //
+  // Reply convention (`"message"` events only): a resolved value that
+  // is neither `undefined` nor `null` is posted back — to
+  // `event.source` when the event carries one (MessagePort / window
+  // replies), else to the target itself when it is a message peer
+  // (a `Worker` — `terminate`, a worker global — `importScripts`, a
+  // `MessagePort`/`BroadcastChannel` — `start`/`close`). `self` inside
+  // a worker therefore replies to the parent and `worker.onmessage`
+  // replies reach the worker; plain `window`/`document` targets never
+  // auto-reply (a self-post would re-fire the same listener). The reply
+  // must be structured-cloneable — arrows, promises and `__resource__`
+  // handles cannot cross `postMessage`.
+  on: (target, event, arrow) => {{
+    const host = globalThis.js;
+    if (host && typeof host.on === "function") {{
+      return host.on(target, event, arrow);
+    }}
+    const t = (typeof target === "string") ? globalThis[target] : target;
+    if (t == null || typeof t.addEventListener !== "function" || typeof arrow !== "function") {{
+      __handl_rt.__lastError = new Error("unsafe or missing event target");
+      return null;
+    }}
+    const name = String(event);
+    const isMessage = name === "message";
+    const isPeer = (v) => (v && typeof v.postMessage === "function" && (
+      typeof v.terminate === "function" || typeof v.importScripts === "function"
+      || typeof v.start === "function" || typeof v.close === "function"));
+    const reply = (e, out) => {{
+      if (!isMessage || out === undefined || out === null) return;
+      const src = (e && typeof e === "object") ? e.source : null;
+      const sink = (src && typeof src.postMessage === "function") ? src
+        : (isPeer(t) ? t : null);
+      if (sink === null) return;
+      try {{
+        sink.postMessage(out);
+      }} catch (e1) {{
+        // `window.postMessage`-shaped sinks want a targetOrigin/options
+        // second argument; retry once with the same-origin "/" before
+        // recording the failure.
+        try {{
+          sink.postMessage(out, "/");
+        }} catch (e2) {{
+          __handl_rt.__lastError = e2;
+        }}
+      }}
+    }};
+    const listener = (e) => {{
+      const payload = (isMessage && e && typeof e === "object" && "data" in e) ? e.data : e;
+      Promise.resolve()
+        .then(() => arrow(payload))
+        .then((out) => reply(e, out))
+        .catch((err) => {{ __handl_rt.__lastError = err; }});
+    }};
+    t.addEventListener(name, listener);
+    return listener;
+  }},
+  off: (target, event, listener) => {{
+    const host = globalThis.js;
+    if (host && typeof host.off === "function") {{
+      return host.off(target, event, listener);
+    }}
+    const t = (typeof target === "string") ? globalThis[target] : target;
+    if (t == null || typeof t.removeEventListener !== "function") {{
+      __handl_rt.__lastError = new Error("unsafe or missing event target");
+      return null;
+    }}
+    t.removeEventListener(String(event), listener);
+    return null;
+  }},
   // Bound-arrow record application input (`{{__term__, __bound__}}`,
   // ADR-0120 Phase 1): `bound ++ call-args` — a lone call arg stays a
   // singleton, a tuple spreads; a non-array `bound` packs as one element
