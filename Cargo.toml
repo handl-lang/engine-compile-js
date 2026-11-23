@@ -8,6 +8,8 @@ repository = "https://github.com/handl-lang/engine-compile-js"
 readme = "README.md"
 keywords = ["handl", "javascript", "compiler"]
 categories = ["compilers", "development-tools"]
+# Git-install only: https://github.com/handl-lang/engine-compile-js (no crates.io).
+publish = false
 
 [dependencies]
 # ADR-0128 Phase 5: platform crates are git deps; the workspace-root
@@ -27,47 +29,4 @@ serde_json = "1"
 [dev-dependencies]
 rand = "0.9"
 handl-kit-data-prelude = { git = "https://github.com/handl-lang/kit-data-prelude", branch = "main" }
-
-[patch."https://github.com/handl-lang/engine"]
-hnl-engine = { path = "../engine" }
-
-[patch."https://github.com/handl-lang/engine-exec"]
-hnl-engine-exec = { path = "../engine-exec" }
-
-[patch."https://github.com/handl-lang/engine-lex"]
-hnl-engine-lex = { path = "../engine-lex" }
-
-[patch."https://github.com/handl-lang/engine-lex-pattern"]
-hnl-engine-lex-pattern = { path = "../engine-lex-pattern" }
-
-[patch."https://github.com/handl-lang/engine-parse"]
-hnl-engine-parse = { path = "../engine-parse" }
-
-[patch."https://github.com/handl-lang/engine-parse-pratt"]
-hnl-engine-parse-pratt = { path = "../engine-parse-pratt" }
-
-[patch."https://github.com/handl-lang/engine-transform"]
-hnl-engine-transform = { path = "../engine-transform" }
-
-[patch."https://github.com/handl-lang/engine-transform-rewrite"]
-hnl-engine-transform-rewrite = { path = "../engine-transform-rewrite" }
-
-[patch."https://github.com/handl-lang/engine-typecheck"]
-hnl-engine-typecheck = { path = "../engine-typecheck" }
-
-[patch."https://github.com/handl-lang/kernel"]
-handl-calculus = { path = "../kernel/crates/handl-calculus" }
-handl-language = { path = "../kernel/crates/handl-language" }
-handl-value = { path = "../kernel/crates/handl-value" }
-
-[patch."https://github.com/handl-lang/kit-data-prelude"]
-handl-kit-data-prelude = { path = "../kit-data-prelude/crates/handl-kit-data-prelude" }
-
-[patch."https://github.com/handl-lang/host"]
-handl-kit-arrow-lower = { path = "../host/crates/handl-kit-arrow-lower" }
-handl-kit-data = { path = "../host/crates/handl-kit-data" }
-handl-platform = { path = "../host/crates/platform" }
-handl-plugin-compile = { path = "../host/crates/plugin-compile" }
-handl-plugin-ext-diag = { path = "../host/crates/plugin-ext-diag" }
-handl-runtime = { path = "../host/crates/handl-runtime" }
 
