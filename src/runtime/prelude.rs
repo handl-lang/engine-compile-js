@@ -644,7 +644,7 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   // honest defaults: `call` resolves `globalThis[obj][method]` like
   // `jsCall`, `invoke` calls `receiver[method]`, and synchronous
   // exceptions land in `__lastError` for `error()` to read — the same
-  // convention the sdkgen adapters use. (`await` is not a shim: the
+  // convention the codegen adapters use. (`await` is not a shim: the
   // lowerer emits a real JS `await`; the host event loop owns
   // settlement, and a rejection propagates as a rejected arrow promise.)
   __lastError: null,
@@ -675,7 +675,7 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     // `globalThis[obj][method]` for namespaced APIs (`console.log`);
     // falling back to `globalThis[method]` covers bare global functions —
     // WebIDL `WindowOrWorkerGlobalScope` members surface as globals, so
-    // the sdkgen adapter's `call("fetch", "fetch", ...)` reaches
+    // the codegen adapter's `call("fetch", "fetch", ...)` reaches
     // `globalThis.fetch` itself.
     const fn = (target && typeof target[method] === "function")
       ? () => target[method](...args)
