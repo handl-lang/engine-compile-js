@@ -1043,6 +1043,108 @@ console.log("self-ok");
     assert_eq!(run.stdout.trim(), "self-ok");
 }
 
+#[test]
+fn e2e_js_on_off_node_worker_eventemitter() {
+    require_node!();
+    // `js.on`/`js.off` over a Node `worker_threads` `Worker` — an
+    // EventEmitter, NOT an EventTarget (no `addEventListener`). The
+    // prelude feature-detects `on`/`off` and delivers the emit argument
+    // verbatim (no `MessageEvent.data` unwrap — the `{data: {x:1}}`
+    // field must survive untouched). The handler's non-null result is
+    // auto-posted back through the `isPeer` reply path, and `js.off`
+    // unregisters via `Worker.off`. This is the `lib-js` `js/worker`
+    // `on_message`/`off` contract on Node.
+    let prog_js = compile_to_string(
+        &module_input(
+            r#"
+from "js" import {
+  import_module as js_import_module,
+  await as js_await,
+  get as js_get,
+  set as js_set,
+  construct as js_construct,
+  on as js_on,
+  off as js_off,
+  invoke as js_invoke,
+}
+
+--- Same install `lib-js` `js/worker` `ensure_worker_global` performs:
+--- reach `worker_threads` through `js.import_module` + `js.await`,
+--- then `js.set` `Worker` on `globalThis` for `js.construct`.
+p := js_import_module("node:worker_threads")
+r := js_await(p)
+ns := js_get(r, "value")
+wt := js_get(ns, "Worker")
+_ := js_set("globalThis", "Worker", wt)
+u := js_get("globalThis", "WORKER_URL")
+w := js_construct("", "Worker", [u], [], "js_object", false)
+g := js_get("globalThis", "gots")
+h := js_on(w, "message", (msg) ~> do {
+  _ := js_invoke(g, "push", [msg], [], "js_number", false)
+  n := js_get(msg, "n")
+  if n == 21 { { ack: n } } else { null }
+})
+off_it := (l) ~> js_off(w, "message", l)
+{ worker: w, listener: h, off_it: off_it }
+"#,
+        ),
+        &esm_node(),
+    )
+    .expect("compile fixture");
+    // Plain-JS echo worker: every `message` is posted straight back, so
+    // the parent's auto-reply (`{ack: 21}`) comes back around once —
+    // the handler returns `null` for it (`n != 21`), ending the loop.
+    let worker_js = r#"
+import { parentPort } from "node:worker_threads";
+parentPort.on("message", (m) => parentPort.postMessage(m));
+"#;
+    let driver = r#"
+globalThis.gots = [];
+globalThis.WORKER_URL = new URL("./worker.mjs", import.meta.url);
+const m = await import("./prog.mjs");
+const v = await m.default;
+const w = v.worker;
+if (typeof v.listener !== "function") throw new Error("js.on returned no listener");
+w.postMessage({ n: 21, data: { x: 1 } });
+const deadline = Date.now() + 8000;
+while (globalThis.gots.length < 2 && Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, 25));
+}
+if (globalThis.gots.length !== 2) {
+  throw new Error("expected 2 messages, got " + JSON.stringify(globalThis.gots));
+}
+const [first, second] = globalThis.gots;
+// Emitter path: the emit arg IS the payload — `data` stays a nested
+// field, never unwrapped like `MessageEvent.data`.
+if (first.n !== 21 || !first.data || first.data.x !== 1) {
+  throw new Error("payload not verbatim: " + JSON.stringify(first));
+}
+// Non-null handler result auto-replied to the worker, which echoed it.
+if (second.ack !== 21) {
+  throw new Error("auto-reply missing: " + JSON.stringify(second));
+}
+await v.off_it(v.listener);
+w.postMessage({ n: 99 });
+await new Promise((r) => setTimeout(r, 300));
+if (globalThis.gots.length !== 2) {
+  throw new Error("off failed — extra message: " + JSON.stringify(globalThis.gots));
+}
+w.terminate();
+console.log("emitter-worker-ok");
+"#;
+    let run = run_node(
+        "js-on-emitter-worker",
+        &[
+            ("prog.mjs", prog_js.as_str()),
+            ("worker.mjs", worker_js),
+            ("driver.mjs", driver),
+        ],
+        "driver.mjs",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(run.stdout.trim(), "emitter-worker-ok");
+}
+
 // ---------------------------------------------------------------------------
 // T-005: non-ESM module formats — `commonjs`/`iife`/`inline` module emit,
 // exercised under real `node`.

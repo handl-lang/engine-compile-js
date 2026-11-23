@@ -831,38 +831,55 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   }},
   // `on`/`off` — the JS→handl event trampoline (the `js` contract
   // package). `on(target, event, arrow)` wraps a compiled handl arrow —
-  // an async `__in => …` JS function — in a listener and registers it
-  // via `target.addEventListener`; it returns the JS listener so `off`
-  // (or `invoke(target, "removeEventListener", …)`) can unregister it.
-  // `target` is the EventTarget object itself or a string naming a
+  // an async `__in => …` JS function — in a listener and registers it;
+  // it returns the JS listener so `off` (or
+  // `invoke(target, "removeEventListener", …)`) can unregister it.
+  // `target` is the event source object itself or a string naming a
   // global (`"self"`, `"window"`, `"document"`, …).
   //
-  // Payload convention: for `"message"` events the arrow receives
-  // `event.data` — the structured-cloned handl value (`__pair__` /
-  // `__either__` / `__bytes__` / `__tag__` records all survive the
-  // clone); every other event receives the Event object itself. The
-  // arrow is invoked as `arrow(payload)` — the single app arg-input —
-  // and awaited. A rejection lands in `__lastError` (the `error` op's
-  // convention) instead of escaping as an unhandled rejection.
+  // Two registration shapes are feature-detected, DOM first:
+  //  * EventTarget (`addEventListener`/`removeEventListener`) —
+  //    `window`/`document`/`self`/`MessagePort`. For `"message"` events
+  //    the arrow receives `event.data` — the structured-cloned handl
+  //    value (`__pair__` / `__either__` / `__bytes__` / `__tag__`
+  //    records all survive the clone); every other event receives the
+  //    Event object itself.
+  //  * EventEmitter (`on`/`off`, falling back to the
+  //    `addListener`/`removeListener` aliases) — Node
+  //    `worker_threads` `Worker`, `events.EventEmitter`, `process`.
+  //    There is no `MessageEvent` wrapper: the emitter's first
+  //    argument IS the payload — a `"message"` event's
+  //    structured-cloned value, an `"error"` event's `Error`. (The
+  //    `.data` unwrap is deliberately NOT applied: a user message
+  //    carrying a `data` field must arrive verbatim.)
+  //
+  // The arrow is invoked as `arrow(payload)` — the single app
+  // arg-input — and awaited. A rejection lands in `__lastError` (the
+  // `error` op's convention) instead of escaping as an unhandled
+  // rejection.
   //
   // Reply convention (`"message"` events only): a resolved value that
   // is neither `undefined` nor `null` is posted back — to
-  // `event.source` when the event carries one (MessagePort / window
-  // replies), else to the target itself when it is a message peer
-  // (a `Worker` — `terminate`, a worker global — `importScripts`, a
-  // `MessagePort`/`BroadcastChannel` — `start`/`close`). `self` inside
-  // a worker therefore replies to the parent and `worker.onmessage`
-  // replies reach the worker; plain `window`/`document` targets never
-  // auto-reply (a self-post would re-fire the same listener). The reply
-  // must be structured-cloneable — arrows, promises and `__resource__`
-  // handles cannot cross `postMessage`.
+  // `event.source` when the DOM event carries one (MessagePort /
+  // window replies), else to the target itself when it is a message
+  // peer (a `Worker` — `terminate`, a worker global —
+  // `importScripts`, a `MessagePort`/`BroadcastChannel` —
+  // `start`/`close`). `self` inside a worker therefore replies to the
+  // parent and `worker.onmessage` replies reach the worker; plain
+  // `window`/`document` targets never auto-reply (a self-post would
+  // re-fire the same listener). Emitter targets have no `event.source`
+  // — replies go straight to the target's own `postMessage` under the
+  // same `isPeer` test, so a `worker_threads` `Worker` handler's
+  // non-null result reaches the worker. The reply must be
+  // structured-cloneable — arrows, promises and `__resource__` handles
+  // cannot cross `postMessage`.
   on: (target, event, arrow) => {{
     const host = globalThis.js;
     if (host && typeof host.on === "function") {{
       return host.on(target, event, arrow);
     }}
     const t = (typeof target === "string") ? globalThis[target] : target;
-    if (t == null || typeof t.addEventListener !== "function" || typeof arrow !== "function") {{
+    if (t == null || typeof arrow !== "function") {{
       __handl_rt.__lastError = new Error("unsafe or missing event target");
       return null;
     }}
@@ -890,14 +907,27 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
         }}
       }}
     }};
-    const listener = (e) => {{
-      const payload = (isMessage && e && typeof e === "object" && "data" in e) ? e.data : e;
+    const deliver = (e, payload) => {{
       Promise.resolve()
         .then(() => arrow(payload))
         .then((out) => reply(e, out))
         .catch((err) => {{ __handl_rt.__lastError = err; }});
     }};
-    t.addEventListener(name, listener);
+    if (typeof t.addEventListener === "function") {{
+      const listener = (e) => deliver(e,
+        (isMessage && e && typeof e === "object" && "data" in e) ? e.data : e);
+      t.addEventListener(name, listener);
+      return listener;
+    }}
+    const emit = (typeof t.on === "function") ? t.on.bind(t)
+      : (typeof t.addListener === "function") ? t.addListener.bind(t)
+      : null;
+    if (emit === null) {{
+      __handl_rt.__lastError = new Error("unsafe or missing event target");
+      return null;
+    }}
+    const listener = (...args) => deliver(null, args[0]);
+    emit(name, listener);
     return listener;
   }},
   off: (target, event, listener) => {{
@@ -906,11 +936,26 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
       return host.off(target, event, listener);
     }}
     const t = (typeof target === "string") ? globalThis[target] : target;
-    if (t == null || typeof t.removeEventListener !== "function") {{
+    if (t == null) {{
       __handl_rt.__lastError = new Error("unsafe or missing event target");
       return null;
     }}
-    t.removeEventListener(String(event), listener);
+    // Same DOM-first detection as `on`: a target carrying both shapes
+    // registered through `addEventListener`, so `removeEventListener`
+    // is the matching unregister; EventEmitter-only targets fall to
+    // `off`/`removeListener`.
+    if (typeof t.removeEventListener === "function") {{
+      t.removeEventListener(String(event), listener);
+      return null;
+    }}
+    const drop = (typeof t.off === "function") ? t.off.bind(t)
+      : (typeof t.removeListener === "function") ? t.removeListener.bind(t)
+      : null;
+    if (drop === null) {{
+      __handl_rt.__lastError = new Error("unsafe or missing event target");
+      return null;
+    }}
+    drop(String(event), listener);
     return null;
   }},
   // `import_module` — the `js` contract's dynamic `import(spec)` (the

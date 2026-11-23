@@ -60,9 +60,12 @@ self-contained bundle: runtime prelude + inlined `.hnl` dep graph, no
 filesystem resolution at run time. The worker's message wiring lives in
 the `.hnl` source — the `js/worker` convention: register
 `js.on("self", "message", arrow)` (browser workers) or
-`js.on(port, "message", arrow)` over a concrete `EventTarget` (Node's
-`parentPort`). `js.on` unwraps `MessageEvent.data`, awaits the arrow,
-and posts a non-null result back automatically.
+`js.on(port, "message", arrow)` over a concrete event source (Node's
+`parentPort`, or the parent-side `worker_threads` `Worker` — an
+EventEmitter). `js.on` feature-detects `addEventListener` vs
+`on`/`off`: EventTargets unwrap `MessageEvent.data`, emitters take the
+emit argument verbatim; it then awaits the arrow and posts a non-null
+result back automatically.
 
 Constraints (compile-time): format must be `esm` (module worker —
 `new Worker(url, { type: "module" })`), `iife`, or `inline` (classic
