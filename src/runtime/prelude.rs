@@ -142,23 +142,110 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     }}
     return await __handl_rt.__apply(impl, input);
   }},
-  handle: async (body, target, implThunk, input) => {{
+  // --- ADR-0158 `acc` (handle accumulator) -----------------------------
+  // `handle <body> with h acc s0` seeds a `__acc__` slot on the pushed
+  // frame — eval's `handler_with_acc` clones the handler record and
+  // inserts `__acc__`; the JS frame is `Object.assign({{}}, impl,
+  // {{__acc__: s0}})`. Covered-op dispatch then runs impls as
+  // `(payload, s) ~> (result, s')` and writes `s'` back. JS objects are
+  // mutable where eval's `TaggedValue` maps are not, so `__setFrameAcc`
+  // *replaces* the stack entry with a fresh record rather than mutating
+  // in place — the `__carried__` seed must keep `s0` so each later
+  // application of a handled arrow restarts the accumulator (eval's
+  // immutable update gives the same restart-per-application semantics).
+  //
+  // `__frameAcc(op)` is `covering_frame_acc`: the innermost stack frame
+  // *covering* `op` (no `grades`/dim constraint — eval's scan is
+  // dimension-blind), returning its `__acc__` value or `undefined` when
+  // that frame carries no slot (or no frame covers `op`). A seed of
+  // JS `undefined` is indistinguishable from no slot — Handl `null`
+  // lowers to `null`, so this only affects host-supplied JS seeds.
+  __frameAcc: (op) => {{
+    const hs = __handl_rt.__handlers;
+    for (let i = hs.length - 1; i >= 0; i--) {{
+      const h = hs[i];
+      if (__handl_rt.handlerImpl(h, op) !== undefined) {{
+        return (h !== null && typeof h === "object"
+            && Object.prototype.hasOwnProperty.call(h, "__acc__"))
+          ? h.__acc__ : undefined;
+      }}
+    }}
+    return undefined;
+  }},
+  // `covering_frame_set_acc`: write `s'` into the innermost covering
+  // frame — only when that frame carries the slot (an acc-less covering
+  // frame is left alone, and outer acc frames are never reached).
+  __setFrameAcc: (op, s) => {{
+    const hs = __handl_rt.__handlers;
+    for (let i = hs.length - 1; i >= 0; i--) {{
+      const h = hs[i];
+      if (__handl_rt.handlerImpl(h, op) !== undefined) {{
+        if (h !== null && typeof h === "object"
+            && Object.prototype.hasOwnProperty.call(h, "__acc__")) {{
+          hs[i] = Object.assign({{}}, h, {{__acc__: s}});
+        }}
+        return;
+      }}
+    }}
+  }},
+  // `acc_result_split`: an `acc` impl must return `(result, s')` — the
+  // `mkPair` record (`__pair__`, the `***`/`product` wire) or a
+  // two-element array (the `[r, s']` surface spelling). Anything else
+  // is a contract violation.
+  acc_result_split: (out, op) => {{
+    let pair = null;
+    if (out !== null && typeof out === "object" && !Array.isArray(out)
+        && Array.isArray(out.__pair__) && out.__pair__.length === 2) {{
+      pair = out.__pair__;
+    }} else if (Array.isArray(out) && out.length === 2) {{
+      pair = out;
+    }}
+    if (pair === null) {{
+      throw new Error("perform: acc impl for op '" + op + "' must return " +
+        "(result, state') — a pair or 2-element array, got " +
+        (out === null ? "null" : Array.isArray(out) ? "array" : typeof out));
+    }}
+    return pair;
+  }},
+  // `dispatch_covered_op` (native_ops): apply a covering `impl` to
+  // `payload`, threading the covering frame's `__acc__` slot when it
+  // carries one — `h[op](payload, s) ~> (result, s')` with `s'` written
+  // back; acc-less coverage applies `h[op](payload)` exactly as before.
+  // The acc path applies through `__apply`, not `__applyHandler`: under
+  // `acc` a 2-ary impl *is* the `(payload, s)` convention (eval excludes
+  // acc frames from multi-shot `resume`), and the impl receives the
+  // `[payload, s]` pair as the `app` arg-input tuple — a lowered
+  // `(u, s) ~> …` arrow projects `elem(0)`/`elem(1)` off it.
+  __dispatchCovered: async (op, impl, payload) => {{
+    const acc = __handl_rt.__frameAcc(op);
+    if (acc !== undefined) {{
+      const out = await __handl_rt.__apply(impl, [payload, acc]);
+      const split = __handl_rt.acc_result_split(out, op);
+      __handl_rt.__setFrameAcc(op, split[1]);
+      return split[0];
+    }}
+    return await __handl_rt.__applyHandler(impl, payload);
+  }},
+  handle: async (body, target, implThunk, input, accThunk) => {{
     // `target` is retained for diagnostics, like eval — dispatch keys on
     // the op name, not the handled capability.
     void target;
     const impl = await implThunk();
-    // ADR-0158 `acc`: eval seeds a `__acc__` slot on the pushed frame
-    // from the `handle` node's optional `acc` child. `Term::Handle`
-    // carries only body/target/impl — and the arrow lowerer drops the
-    // AST `acc` role before the `Term` exists — so the clause cannot
-    // arrive here; a handler *value* carrying the reserved `__acc__`
-    // key would silently lose the accumulator, so fail loudly instead.
-    if ((typeof impl === "object" || typeof impl === "function")
-        && impl !== null
-        && Object.prototype.hasOwnProperty.call(impl, "__acc__")) {{
-      throw new Error("handle: `acc` clause is not supported by the JS backend");
+    // ADR-0158 `acc`: eval evaluates the `acc` child on the incoming
+    // (after `impl`, before the push) and `handler_with_acc` seeds a
+    // `__acc__` slot on a *copy* of record handlers — non-`Obj`
+    // handlers (arrow values, primitives, marker records, arrays)
+    // pass through unseeded so `acc` on them is inert, matching eval.
+    // (`is_obj` is the JS-side `Obj` test — marker records like
+    // `__pair__`/`__sym__`/`__bytes__` are not plain records.)
+    let frame = impl;
+    if (accThunk !== undefined && accThunk !== null) {{
+      const s0 = await accThunk();
+      if (__handl_rt.is_obj(impl)) {{
+        frame = Object.assign({{}}, impl, {{__acc__: s0}});
+      }}
     }}
-    __handl_rt.__handlers.push(impl);
+    __handl_rt.__handlers.push(frame);
     try {{
       // `body` is the lowered body scheme — an async arrow, or a bare
       // value for constant bodies (eval evaluates the scheme on the
@@ -168,21 +255,34 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
       // covered sig fields dispatch through the still-installed handler;
       // uncovered ops stay data.
       v = await __handl_rt.__interpretIO(v);
-      // `return` clause postlude: `h["return"](r)`; without it the
-      // result passes through. (`acc` is unreachable — `Term::Handle`
-      // carries only body/target/impl_.)
+      // `return` clause + `acc` final state (native_ops
+      // `run_delimited_default` / the tree-walk `Handle` arm): read the
+      // *top* frame's `__acc__` — `__setFrameAcc` replaces stack
+      // entries, so the local `frame` binding is stale by now.
+      // `h["return"](r, s_final)` under `acc` (2-ary, the same
+      // `(value, s)` arg-input convention); without `return`, an acc
+      // handle yields the `(result, s_final)` pair; a plain `handle`
+      // passes the result through.
+      const top = __handl_rt.__handlers[__handl_rt.__handlers.length - 1];
+      const hasAcc = (top !== null && typeof top === "object"
+        && Object.prototype.hasOwnProperty.call(top, "__acc__"));
       const ret = __handl_rt.handlerImpl(impl, "return");
       if (ret !== undefined) {{
         if (typeof ret !== "function") {{
           throw new Error("handle: `return` clause impl is not an arrow value");
         }}
-        v = await __handl_rt.__applyHandler(ret, v);
+        v = hasAcc
+          ? await __handl_rt.__apply(ret, [v, top.__acc__])
+          : await __handl_rt.__applyHandler(ret, v);
+      }} else if (hasAcc) {{
+        v = __handl_rt.mkPair(v, top.__acc__);
       }}
       // Deep handler: arrow results collect the frame so later
-      // applications reinstall it via `__apply`.
+      // applications reinstall it via `__apply` — the acc-seeded
+      // record, so each application restarts `__acc__` at `s0`.
       if (typeof v === "function") {{
-        if (Array.isArray(v.__carried__)) v.__carried__.push(impl);
-        else v.__carried__ = [impl];
+        if (Array.isArray(v.__carried__)) v.__carried__.push(frame);
+        else v.__carried__ = [frame];
       }}
       return v;
     }} finally {{
@@ -217,7 +317,7 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
       if (typeof impl !== "function") {{
         throw new Error("handler impl for op '" + k + "' is not an arrow value");
       }}
-      outSig[k] = await __handl_rt.__applyHandler(impl, sig[k]);
+      outSig[k] = await __handl_rt.__dispatchCovered(k, impl, sig[k]);
     }}
     indices[0] = outSig;
     return Object.assign({{}}, v, {{ indices: indices }});
@@ -232,7 +332,9 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   // divergence: eval applies impls to `incoming`, not the op args;
   // serialized-`Term` impls and multi-shot `resume` journals are not
   // portable to JS async arrows and stay honest throws — see
-  // `__applyHandler`). Uncovered ops fall back to the
+  // `__applyHandler`). Under a covering frame's `__acc__` slot the
+  // impl runs the `(payload, s) ~> (result, s')` convention via
+  // `__dispatchCovered` (ADR-0158). Uncovered ops fall back to the
   // `__handl_rt.<name>` member (host ops/packages) and finally to the
   // eval-faithful "unsupported op" error.
   dispatch: async (name, args, dim, incoming) => {{
@@ -242,7 +344,7 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
         throw new Error("handler impl for op '" + name + "' is not an arrow value");
       }}
       const argInput = (args.length === 1) ? args[0] : args;
-      return await __handl_rt.__applyHandler(impl, argInput);
+      return await __handl_rt.__dispatchCovered(name, impl, argInput);
     }}
     const member = __handl_rt[name];
     if (typeof member === "function") return await member(...args);
@@ -264,7 +366,7 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
         throw new Error("handler impl for op '" + name + "' is not an arrow value");
       }}
       const argInput = (args.length === 1) ? args[0] : args;
-      return await __handl_rt.__applyHandler(impl, argInput);
+      return await __handl_rt.__dispatchCovered(name, impl, argInput);
     }}
     if (inline) {{
       return await globalThis[module][name](...args);
@@ -293,7 +395,7 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
       if (typeof impl !== "function") {{
         throw new Error("handler impl for op '" + name + "' is not an arrow value");
       }}
-      return await __handl_rt.__applyHandler(impl, (arg === undefined ? null : arg));
+      return await __handl_rt.__dispatchCovered(name, impl, (arg === undefined ? null : arg));
     }}
     return {{
       __former__: {{ __sym__: {{ name: "type.io", handle: 0 }} }},

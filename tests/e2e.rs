@@ -16,10 +16,11 @@
 use std::process::Command;
 use std::sync::OnceLock;
 
-use handl_language::{Ast, AstNode, Language};
+use handl_language::{Ast, AstNode, AstRef, Language};
 use handl_plugin_compile::CompilerInput;
 use handl_plugin_compile_js::{Iife, Inline, JsConfig, JsModule, Node, compile_to_string};
 use hnl_engine::{ArrSource, Term};
+use hnl_engine_parse::ParserEngine;
 use hnl_engine_typecheck::TypecheckReport;
 use serde_json::Value;
 
@@ -57,6 +58,40 @@ fn module_input(source: &str) -> CompilerInput {
         Term::constant(Value::Null),
         TypecheckReport::default(),
     )
+}
+
+/// A `CompilerInput` for a bare `Term` — the empty `Language` keeps
+/// `try_compile_module` on its `None` branch so the single-term emit
+/// path lowers `input.term` directly (same shape as `src/tests.rs`).
+fn term_input(term: Term) -> CompilerInput {
+    let mut ast = Ast::new();
+    let root = ast.push(AstNode::new("module"));
+    CompilerInput::new(
+        "test".to_string(),
+        ast,
+        root,
+        Language::new(),
+        term,
+        TypecheckReport::default(),
+    )
+}
+
+/// Parse + desugar + arrow-lower a single `.hnl` *expression* to a
+/// `Term` — the same lex/parse/`apply_desugar`/`lower_ast` pipeline
+/// `module.rs`'s `parse_statement` + `ModuleCtx::lower_term` run per
+/// statement. Used to reach `Term::Handle` shapes the surface parser
+/// produces but arrow-lower declines (the `acc` clause).
+fn lower_expr_term(source: &str) -> Term {
+    let lang = canonical_lang();
+    let tokens = hnl_engine_lex_pattern::lex(lang, source).expect("lex");
+    let parsed = hnl_engine_parse_pratt::PrattEngine::new()
+        .parse(lang, &hnl_engine_parse::ParserRequest::new(tokens))
+        .expect("parse");
+    let ast = handl_runtime::desugar_pass::apply_desugar(lang, &parsed).expect("desugar");
+    // A single expression's root is the last-pushed node (the same
+    // convention `desugar_pass` uses for its rewrite root).
+    let root = AstRef::new(ast.len() - 1);
+    handl_kit_arrow_lower::lower_ast(&ast, lang, root).expect("arrow-lower")
 }
 
 /// The result of one `node` invocation.
@@ -1083,12 +1118,14 @@ const dispatched = await rt.handle(async () => rt.perform("Foo", 5), "T", impl, 
 console.log("perform:" + dispatched);
 const residual = await rt.perform("Baz", 9);
 console.log("residual:" + JSON.stringify(residual.indices[0]));
-// Negative: an `acc`-carrying handler value and a ≥2-ary impl (the
-// multi-shot `resume` shape) fail loudly, not silently.
-try {
-  await rt.handle(async () => 1, "T", async () => ({__acc__: 0}), null);
-  console.log("acc:no-throw");
-} catch (e) { console.log("acc:" + e.message); }
+// ADR-0158 `acc`: a handler *value* carrying a literal `__acc__` key is
+// an acc frame even without the `acc` clause (eval's
+// `covering_frame_acc`/`run_delimited_default` read the slot off the
+// pushed record) — `handle 1 with {__acc__: 0}` yields the
+// `(result, s_final)` pair. A ≥2-ary impl (the multi-shot `resume`
+// shape) still fails loudly.
+const accVal = await rt.handle(async () => 1, "T", async () => ({__acc__: 0}), null);
+console.log("acc:" + JSON.stringify(accVal));
 try {
   await rt.handle(async () => rt.perform("Foo", 1), "T",
     async () => ({Foo: async (a, b) => a}), null);
@@ -1099,15 +1136,139 @@ try {
     assert!(run.succeeded(), "node failed:\n{}", run.stderr);
     // `Foo` covered → 3+1 = 4; `Bar` uncovered → stays 7. In-flight
     // `perform("Foo", 5)` dispatches → 6. Uncovered `perform` mints
-    // the residual former. `__acc__` and ≥2-ary impls throw the
-    // documented subset errors.
+    // the residual former. A literal `__acc__` frame key yields the
+    // `(result, s_final)` pair; ≥2-ary impls throw the documented
+    // multi-shot `resume` error.
     assert_eq!(
         run.stdout.trim(),
         r#"io:{"Bar":7,"Foo":4}
 perform:6
 residual:{"Baz":9}
-acc:handle: `acc` clause is not supported by the JS backend
+acc:{"__pair__":[1,0]}
 resume:handler impl is ≥2-ary: multi-shot `resume` is not supported by the JS backend"#
+    );
+}
+
+#[test]
+fn e2e_handle_acc_state_threading() {
+    require_node!();
+    // ADR-0158 `acc`: `handle <body> with h acc s0` threads
+    // `(payload, s) ~> (result, s')` across covered-op dispatches and
+    // yields the `(result, s_final)` pair — the
+    // `perform_acc_state_threading` parity shape from host's
+    // `engine_parity.rs`, spelled with `arr <op>` dispatch because the
+    // `perform`/`io.perform` op spellings are compile-denied (P5a).
+    //
+    // Surface `handle … with … acc s0` parses to a 3-child `handle`
+    // node, but `handl-kit-arrow-lower` still declines it (the shared
+    // `Term` interpreter lacks the `(payload, s)` convention), so the
+    // seed is injected into the lowered `Term::Handle` directly — the
+    // same `Term::handle_acc` construction the upstream chain produces.
+    let term = lower_expr_term(
+        r#"handle do {
+            s := (arr Get)(0)
+            (arr Put)(s + 1)
+            s + 1
+        } with { Get: (u, s) ~> [s, s], Put: (v, s) ~> [0, v] }"#,
+    );
+    let Term::Handle {
+        body,
+        target,
+        impl_,
+        ..
+    } = term
+    else {
+        panic!("expected Term::Handle, got {term:?}")
+    };
+    let term = Term::Handle {
+        body,
+        target,
+        impl_,
+        acc: Some(Box::new(Term::constant(Value::from(0)))),
+    };
+    let js = compile_to_string(&term_input(term), &esm_node()).expect("compile acc handle");
+    let run = run_node(
+        "handle-acc",
+        &[
+            ("prog.mjs", js.as_str()),
+            (
+                "driver.mjs",
+                "import f from \"./prog.mjs\";\nconsole.log(JSON.stringify(await f(null)));\n",
+            ),
+        ],
+        "driver.mjs",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // (result, final_state) = (1, 1) on the `__pair__` wire — matching
+    // host's `perform_acc_state_threading` expectation. The 2-ary impls
+    // only produce this under the `(payload, s)` convention: applied
+    // 1-ary they would read `s` as `undefined` and the split would
+    // fail or corrupt the state.
+    assert_eq!(run.stdout.trim(), r#"{"__pair__":[1,1]}"#);
+}
+
+#[test]
+fn e2e_handle_acc_return_clause_and_carried_restart() {
+    require_node!();
+    // Driver-level acc coverage the compiled path cannot spell yet
+    // (surface `acc` is declined upstream): the `return` clause runs
+    // as `h["return"](r, s_final)` under acc, and a carried acc frame
+    // restarts `__acc__` at `s0` on each application (the
+    // copy-on-write `__setFrameAcc` preserving the carried seed).
+    let run = run_program(
+        "handle-acc-rt",
+        "x := 1\n",
+        r#"
+await import("./prog.mjs");
+const rt = globalThis.__handl_rt;
+// acc + `return` clause: `get` threads (5, 10) -> (15, 11); the body
+// result 15 meets `return` as (15, 11) -> 15*100 + 11 = 1511.
+const withRet = await rt.handle(
+  async () => rt.perform("get", 5),
+  "T",
+  async () => ({
+    get: async ([u, s]) => [u + s, s + 1],
+    "return": async ([r, s]) => r * 100 + s,
+  }),
+  null,
+  async () => 10);
+console.log("ret:" + withRet);
+// Carried acc frame: an acc handle's bare result is the
+// `(result, s_final)` pair — `attach_carried_handler` skips pairs —
+// so the handled arrow only collects the s0-seeded frame when the
+// `return` clause hands it back. Each `__apply` then reinstalls
+// `__acc__ = 0` (a leaked `s'` would make the second call read 1).
+const h = await rt.handle(
+  async () => async (x) => rt.perform("get", x),
+  "T",
+  async () => ({
+    get: async ([u, s]) => [s, s + 1],
+    "return": async ([r, s]) => r,
+  }),
+  null,
+  async () => 0);
+console.log("carried:" + (await rt.__apply(h, 1)) + "," + (await rt.__apply(h, 2)));
+// Inert acc: a non-record handler value cannot carry the slot — the
+// clause is ignored exactly like eval's `handler_with_acc` pass-
+// through, and the result is *not* paired.
+const inert = await rt.handle(async () => 7, "T", async () => 42, null, async () => 0);
+console.log("inert:" + inert);
+// Contract violation: an acc impl returning a non-pair throws the
+// eval-faithful diagnostic.
+try {
+  await rt.handle(async () => rt.perform("get", 1), "T",
+    async () => ({ get: async ([u, s]) => u + s }), null, async () => 0);
+  console.log("split:no-throw");
+} catch (e) { console.log("split:" + e.message); }
+"#,
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(
+        run.stdout.trim(),
+        r#"ret:1511
+carried:0,0
+inert:7
+split:perform: acc impl for op 'get' must return (result, state') — a pair or 2-element array, got number"#
     );
 }
 

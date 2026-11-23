@@ -109,6 +109,24 @@ fn handle_scheme(term: &Term) -> Result<JsAst, CompileError> {
     crate::lower::lower(term)
 }
 
+/// A scheme term evaluated under `input`, wrapped in the `() => value`
+/// thunk `__handl_rt.handle` invokes — the shared shape of the `impl`
+/// and `acc` child emissions (both evaluate on the body's incoming).
+fn scheme_thunk(term: &Term, input: &JsAst) -> Result<JsAst, CompileError> {
+    let f = handle_scheme(term)?;
+    let value = match &f {
+        JsAst::ArrowFn { .. } => JsAst::Call {
+            callee: Box::new(f.clone()),
+            args: vec![input.clone()],
+        },
+        _ => f.clone(),
+    };
+    Ok(JsAst::ArrowFn {
+        params: Vec::new(),
+        body: Box::new(value),
+    })
+}
+
 fn lower_handle_applied(
     body: &Term,
     target: &str,
@@ -116,46 +134,34 @@ fn lower_handle_applied(
     acc: Option<&Term>,
     input: &JsAst,
 ) -> Result<JsAst, CompileError> {
-    // The `acc` accumulator child has no runtime slot in the JS
-    // `__handl_rt.handle` — decline rather than silently drop it
-    // (mirrors `handl-kit-arrow-lower`'s `lower_handle`; surface `acc`
-    // syntax is unreachable today, so this only guards hand-built
-    // `Term`s).
-    if acc.is_some() {
-        return Err(CompileError::Lower(
-            "handle `acc` accumulator is not supported by the JS backend".to_string(),
-        ));
-    }
     let body_fn = handle_scheme(body)?;
-    let impl_fn = handle_scheme(impl_)?;
     // `impl_` is a *scheme* evaluated under the same incoming as the
     // body (eval order: impl value first, then push, then body). The
     // lowered impl is an async arrow for scheme terms; a constant term
     // lowers to its value directly — the thunk yields either as the
     // handler value `handle` pushes.
-    let impl_value = match &impl_fn {
-        JsAst::ArrowFn { .. } => JsAst::Call {
-            callee: Box::new(impl_fn.clone()),
-            args: vec![input.clone()],
-        },
-        _ => impl_fn.clone(),
-    };
-    let impl_thunk = JsAst::ArrowFn {
-        params: Vec::new(),
-        body: Box::new(impl_value),
-    };
-    // `await __handl_rt.handle(bodyFn, "target", implThunk, input)` —
-    // the runtime pushes the handler, runs `body` under it (ops route
-    // through `__handl_rt.dispatch`), runs the `IO`-former post-pass and
-    // `return` clause, pops in `finally`, and attaches the carried
-    // handler to arrow results.
-    Ok(JsAst::Await(Box::new(rt_call(
-        "handle",
-        vec![
-            body_fn,
-            JsAst::Str(target.to_string()),
-            impl_thunk,
-            input.clone(),
-        ],
-    ))))
+    let impl_thunk = scheme_thunk(impl_, input)?;
+    // ADR-0158 `acc`: the optional accumulator seed is evaluated on the
+    // same incoming (eval order: impl, then `acc`, then push) and
+    // passed as a thunk — `__handl_rt.handle` seeds the frame's
+    // `__acc__` slot from it. `Term::Handle` only carries `acc` when
+    // the `handle … with h acc s0` clause parsed; hand-built terms may
+    // set it too.
+    let acc_thunk = acc.map(|t| scheme_thunk(t, input)).transpose()?;
+    // `await __handl_rt.handle(bodyFn, "target", implThunk, input,
+    // accThunk?)` — the runtime pushes the handler (with the `__acc__`
+    // slot when `acc` is present), runs `body` under it (ops route
+    // through `__handl_rt.dispatch` as `(payload, s) ~> (result, s')`),
+    // runs the `IO`-former post-pass and `return`/`acc` postlude, pops
+    // in `finally`, and attaches the carried handler to arrow results.
+    let mut args = vec![
+        body_fn,
+        JsAst::Str(target.to_string()),
+        impl_thunk,
+        input.clone(),
+    ];
+    if let Some(thunk) = acc_thunk {
+        args.push(thunk);
+    }
+    Ok(JsAst::Await(Box::new(rt_call("handle", args))))
 }

@@ -1388,6 +1388,32 @@ fn handle_lowering_emits_runtime_handle_call() {
 }
 
 #[test]
+fn handle_acc_lowering_emits_seed_thunk() {
+    // ADR-0158 `acc`: `Term::Handle{acc: Some(s0)}` lowers to a fifth
+    // `__handl_rt.handle` argument — a `() => s0` thunk the runtime
+    // evaluates on the body's incoming to seed the frame's `__acc__`
+    // slot. `Term::handle` (no `acc`) keeps the 4-argument call.
+    let term = Term::handle_acc(
+        Term::const_value(Value::Number(Number::from(1))),
+        "cap",
+        Term::const_value(Value::Number(Number::from(2))),
+        Term::const_value(Value::Number(Number::from(0))),
+    );
+    let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("__handl_rt.handle("), "{js}");
+    // The acc thunk is the trailing (5th) argument: `…, __in,
+    // async () => <seed>(__in))`.
+    assert!(js.contains(", __in, async () =>"), "{js}");
+    let plain = Term::handle(
+        Term::const_value(Value::Number(Number::from(1))),
+        "cap",
+        Term::const_value(Value::Number(Number::from(2))),
+    );
+    let js_plain = compile_to_string(&input(plain), &JsConfig::esm_deno()).unwrap();
+    assert!(!js_plain.contains(", __in, async () =>"), "{js_plain}");
+}
+
+#[test]
 fn unknown_op_with_args_lowers_to_dispatch() {
     // Ops outside the builtin match route through
     // `__handl_rt.dispatch("name", [args])` so a covering `handle` frame
@@ -1403,8 +1429,11 @@ fn unknown_op_with_args_lowers_to_dispatch() {
 #[test]
 fn perform_lowers_to_compile_error() {
     // `perform`/`io.perform` are denylisted op spellings (P5a): eval's
-    // `perform_dispatch` needs the resume-journal/`acc` machinery the
-    // JS subset does not carry, so both the flat and qualified
+    // `perform_dispatch` intercepts them for the resume-journal
+    // machinery the JS subset does not carry (the `acc` accumulator
+    // itself *is* supported — see `handle_acc_lowering_emits_seed_thunk`
+    // — but `perform` also drives multi-shot `resume`), so both the
+    // flat and qualified
     // spellings — native *and* foreign — fail at compile time. The
     // runtime `__handl_rt.perform` member remains for host/driver JS.
     for term in [
