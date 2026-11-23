@@ -1,0 +1,145 @@
+# workflows/gate.yaml — per-push gate for handl-lang/engine-compile-js.
+#
+# Replaces ci.sh as the bupha/peregrin gate (ci.sh stays in the tree
+# for reference until the runner flips). Invoke:
+#
+#   GATE_REPO="$PWD" GATE_RESULTS="$PWD/.gate-results.jsonl" \
+#     peregrin campaign run workflows/gate.yaml --result .ci-result.json
+#
+# Verbatim port of ci.sh's `all` stage: fmt → clippy → test → doc,
+# with ci.sh's exact semantics —
+#   * private git deps: HANDL_TOKEN/BUPHA_TOKEN wins, else the
+#     url.git@github.com:handl-lang/.insteadOf → https rewrite via
+#     GIT_CONFIG_* (never touches ~/.gitconfig);
+#   * CARGO_NET_GIT_FETCH_WITH_CLI=true so cargo shells out to git;
+#   * tests/e2e.rs executes emitted JS under node — a missing node
+#     FAILS the test stage (never silently skips);
+#   * all four stages run even when an earlier one fails (ci.sh
+#     accumulates `fail`, exits 1 at the end).
+#
+# Deps resolve from git (no [patch] tables), so no ensure-siblings
+# node is needed — this runs in a bare clone or a detached worktree.
+#
+# Verdict: .ci-result.json `.conclusion` == "success".
+name: gate-engine-compile-js
+
+result:
+  - event: gate.pass
+    conclusion: success
+  - event: gate.fail
+    conclusion: failure
+  - event: gate.failed
+    conclusion: failure
+  - event: gate.init.failed
+    conclusion: failure
+  - event: gate.run.failed
+    conclusion: failure
+
+capabilities:
+  env:
+    - GATE_REPO
+    - GATE_RESULTS
+    - HANDL_TOKEN
+    - BUPHA_TOKEN
+
+nodes:
+  # --- init: validate inputs, fresh results file --------------------
+  - id: gate.init
+    driver: shell
+    on: [start]
+    emits: [gate.due, gate.init.failed]
+    params:
+      cmd: >-
+        set -u;
+        REPO="${config.gate.repo:-${env("GATE_REPO","")}}";
+        [ -n "$REPO" ] || { echo "gate.repo is required — set GATE_REPO or config.gate.repo to an absolute checkout path"; exit 1; };
+        [ -d "$REPO" ] || { echo "no such directory: $REPO"; exit 1; };
+        RES="${config.gate.results:-${env("GATE_RESULTS","$HOME/.local/share/handl-gates/engine-compile-js.results.jsonl")}}";
+        mkdir -p "$(dirname "$RES")";
+        : > "$RES";
+        echo "gate-engine-compile-js: repo=$REPO results=$RES"
+      timeout: 60
+      emit:
+        "0": gate.due
+        default: gate.init.failed
+
+  # --- gate: ci.sh `all` — fmt, clippy, test (node-gated), doc ------
+  - id: gate.run
+    driver: shell
+    on: [gate.due]
+    emits: [gate.done, gate.failed]
+    params:
+      repo: '${config.gate.repo:-${env("GATE_REPO","")}}'
+      results: '${config.gate.results:-${env("GATE_RESULTS","$HOME/.local/share/handl-gates/engine-compile-js.results.jsonl")}}'
+      timeout: 3600
+      cmd: |-
+        set -uo pipefail
+        REPO="${params.repo}"
+        RESULTS="${params.results}"
+        START=$(date +%s)
+        cd "$REPO" && REPO="$(pwd)" || { echo "no such directory: ${params.repo}"; exit 1; }
+        export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+
+        # Private git deps: insteadOf rewrite scoped to this process
+        # tree via GIT_CONFIG_* env — never touches ~/.gitconfig.
+        tok="${HANDL_TOKEN:-${BUPHA_TOKEN:-}}"
+        if [ -n "$tok" ]; then
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${tok}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
+        elif [ -z "${GIT_CONFIG_COUNT:-}" ]; then
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.git@github.com:handl-lang/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/handl-lang/"
+        fi
+        # Cargo must shell out to git so the insteadOf rewrite and
+        # credential helpers apply to git deps.
+        export CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+        fail=0
+        note() { printf '\n== %s\n' "$*"; }
+        failed() { echo "   FAILED: $*" >&2; fail=1; }
+
+        note fmt
+        cargo fmt --check || failed 'cargo fmt --check'
+        note clippy
+        cargo clippy --all-targets -- -D warnings || failed 'cargo clippy'
+        note test
+        # tests/e2e.rs executes emitted JS under node; without it the
+        # suite would silently skip, so a missing runtime fails.
+        if ! command -v node >/dev/null 2>&1; then
+          failed 'node not on PATH — tests/e2e.rs needs it to run emitted JS'
+        else
+          cargo test || failed 'cargo test'
+        fi
+        note doc
+        RUSTDOCFLAGS='-D warnings' cargo doc --no-deps || failed 'cargo doc'
+
+        if [ "$fail" -ne 0 ]; then echo -e '\nci: FAILED' >&2; rc=1; else echo -e '\nci: ok'; rc=0; fi
+        if [ -n "$RESULTS" ]; then
+          esc=$(printf '%s' "$REPO" | sed 's/\\/\\\\/g; s/"/\\"/g')
+          printf '{"family":"rust","repo":"%s","rc":%s,"secs":%s}\n' "$esc" "$rc" "$(( $(date +%s) - START ))" >> "$RESULTS" 2>/dev/null || true
+        fi
+        exit $rc
+      emit:
+        "0": gate.done
+        default: gate.failed
+
+  # --- report: terminal verdict from the results record -------------
+  - id: gate.report
+    driver: shell
+    on: [gate.done, gate.failed]
+    emits: [gate.pass, gate.fail]
+    params:
+      cmd: >-
+        set -u;
+        F="${config.gate.results:-${env("GATE_RESULTS","$HOME/.local/share/handl-gates/engine-compile-js.results.jsonl")}}";
+        [ -s "$F" ] || { echo "no results record — gate produced nothing"; exit 1; };
+        line=$(tail -n 1 "$F");
+        rc=$(printf '%s' "$line" | sed -n 's/.*"rc":\([0-9][0-9]*\).*/\1/p');
+        echo "gate-engine-compile-js verdict: $line";
+        [ "${rc:-1}" = "0" ]
+      timeout: 60
+      emit:
+        "0": gate.pass
+        default: gate.fail
