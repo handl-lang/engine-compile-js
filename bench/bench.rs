@@ -26,7 +26,7 @@ use handl_language::{Ast, AstNode, Language};
 use handl_plugin_compile::CompilerInput;
 use handl_plugin_compile_js::{JsConfig, Node, OpLowering, compile_to_string};
 use hnl_engine::Term;
-use hnl_engine_typecheck::TypecheckReport;
+use hnl_tool_typecheck::TypecheckReport;
 use serde_json::{Value, json};
 
 /// Default timed iterations per workload call (spec: N ≥ 30 after warmup).

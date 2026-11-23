@@ -2,7 +2,7 @@ use handl_language::{Ast, AstNode, Language};
 use handl_plugin_compile::{ArtifactContent, Compiler, CompilerInput, CompilerOutput};
 use hnl_engine::term::RewriteWitness;
 use hnl_engine::{ArrSource, Term};
-use hnl_engine_typecheck::TypecheckReport;
+use hnl_tool_typecheck::TypecheckReport;
 use rand::Rng;
 use serde_json::{Number, Value, json};
 

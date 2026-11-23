@@ -20,8 +20,8 @@ use handl_language::{Ast, AstNode, AstRef, Language};
 use handl_plugin_compile::CompilerInput;
 use handl_plugin_compile_js::{Iife, Inline, JsConfig, JsModule, Node, compile_to_string};
 use hnl_engine::{ArrSource, Term};
-use hnl_engine_parse::ParserEngine;
-use hnl_engine_typecheck::TypecheckReport;
+use hnl_tool_parse::ParserEngine;
+use hnl_tool_typecheck::TypecheckReport;
 use serde_json::Value;
 
 /// `node --version` output when the binary is on `PATH`, else `None`.
@@ -83,9 +83,9 @@ fn term_input(term: Term) -> CompilerInput {
 /// produces but arrow-lower declines (the `acc` clause).
 fn lower_expr_term(source: &str) -> Term {
     let lang = canonical_lang();
-    let tokens = hnl_engine_lex_pattern::lex(lang, source).expect("lex");
-    let parsed = hnl_engine_parse_pratt::PrattEngine::new()
-        .parse(lang, &hnl_engine_parse::ParserRequest::new(tokens))
+    let tokens = hnl_tool_lex_pattern::lex(lang, source).expect("lex");
+    let parsed = hnl_tool_parse_pratt::PrattEngine::new()
+        .parse(lang, &hnl_tool_parse::ParserRequest::new(tokens))
         .expect("parse");
     let ast = handl_runtime::desugar_pass::apply_desugar(lang, &parsed).expect("desugar");
     // A single expression's root is the last-pushed node (the same
@@ -1812,7 +1812,7 @@ checks := { smaller: lt(3, 4), bigger: gt(5, 4) }
 // group into the *enclosing* block's statement list, so the constructors
 // bind in that block's scope: usable by later statements of the same
 // block, popped with it — eval's `eval_block` pushes a scope and
-// `env_assign` defines block-locally (`engine-exec` `native_ops.rs`).
+// `env_assign` defines block-locally (`exec` `native_ops.rs`).
 // These fixtures execute the emitted JS under node.
 // ---------------------------------------------------------------------------
 

@@ -1,4 +1,4 @@
-# workflows/gate.yaml — per-push gate for handl-lang/engine-compile-js.
+# workflows/gate.yaml — per-push gate for handl-lang/tool-compile-js.
 #
 # Replaces ci.sh as the bupha/peregrin gate (ci.sh stays in the tree
 # for reference until the runner flips). Invoke:
@@ -21,7 +21,7 @@
 # node is needed — this runs in a bare clone or a detached worktree.
 #
 # Verdict: .ci-result.json `.conclusion` == "success".
-name: gate-engine-compile-js
+name: gate-tool-compile-js
 
 result:
   - event: gate.pass
@@ -54,10 +54,10 @@ nodes:
         REPO="${config.gate.repo:-${env("GATE_REPO","")}}";
         [ -n "$REPO" ] || { echo "gate.repo is required — set GATE_REPO or config.gate.repo to an absolute checkout path"; exit 1; };
         [ -d "$REPO" ] || { echo "no such directory: $REPO"; exit 1; };
-        RES="${config.gate.results:-${env("GATE_RESULTS","$HOME/.local/share/handl-gates/engine-compile-js.results.jsonl")}}";
+        RES="${config.gate.results:-${env("GATE_RESULTS","$HOME/.local/share/handl-gates/tool-compile-js.results.jsonl")}}";
         mkdir -p "$(dirname "$RES")";
         : > "$RES";
-        echo "gate-engine-compile-js: repo=$REPO results=$RES"
+        echo "gate-tool-compile-js: repo=$REPO results=$RES"
       timeout: 60
       emit:
         "0": gate.due
@@ -70,7 +70,7 @@ nodes:
     emits: [gate.done, gate.failed]
     params:
       repo: '${config.gate.repo:-${env("GATE_REPO","")}}'
-      results: '${config.gate.results:-${env("GATE_RESULTS","$HOME/.local/share/handl-gates/engine-compile-js.results.jsonl")}}'
+      results: '${config.gate.results:-${env("GATE_RESULTS","$HOME/.local/share/handl-gates/tool-compile-js.results.jsonl")}}'
       timeout: 3600
       cmd: |-
         set -uo pipefail
@@ -133,11 +133,11 @@ nodes:
     params:
       cmd: >-
         set -u;
-        F="${config.gate.results:-${env("GATE_RESULTS","$HOME/.local/share/handl-gates/engine-compile-js.results.jsonl")}}";
+        F="${config.gate.results:-${env("GATE_RESULTS","$HOME/.local/share/handl-gates/tool-compile-js.results.jsonl")}}";
         [ -s "$F" ] || { echo "no results record — gate produced nothing"; exit 1; };
         line=$(tail -n 1 "$F");
         rc=$(printf '%s' "$line" | sed -n 's/.*"rc":\([0-9][0-9]*\).*/\1/p');
-        echo "gate-engine-compile-js verdict: $line";
+        echo "gate-tool-compile-js verdict: $line";
         [ "${rc:-1}" = "0" ]
       timeout: 60
       emit:

@@ -4,9 +4,9 @@
 //! `cargo run --offline --example dump_ast -- file.hnl`.
 use handl_language::{AstRef, Language};
 use handl_plugin_ext_diag::split_statements;
-use hnl_engine_lex_pattern::lex;
-use hnl_engine_parse::{ParserEngine, ParserRequest};
-use hnl_engine_parse_pratt::PrattEngine;
+use hnl_tool_lex_pattern::lex;
+use hnl_tool_parse::{ParserEngine, ParserRequest};
+use hnl_tool_parse_pratt::PrattEngine;
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: dump_ast <file.hnl>");

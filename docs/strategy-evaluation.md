@@ -160,7 +160,7 @@ No `src/` changes were made — the data does not justify touching
 - **Eval baseline**: unavailable — no `hnl` eval extension is built
   (`hnl ext list` shows only typecheck/test/lint; `ext-eval` has no
   compiled `.so`), and an in-process eval would need
-  `hnl-engine-exec-tree-walk`/`handl-kit-prelude`, neither of which is
+  `hnl-exec-tree-walk`/`handl-kit-prelude`, neither of which is
   in this crate's dependency graph (adding deps was out of scope).
   JS-vs-JS variant comparison only, as scoped.
 - **`security_scan` on/off**: deliberately not measured — it is a

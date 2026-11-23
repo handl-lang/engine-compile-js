@@ -6,7 +6,7 @@ use handl_language::{Ast, AstNode};
 use handl_plugin_compile::CompilerInput;
 use handl_plugin_compile_js::{Esm, JsConfig, compile_to_string};
 use hnl_engine::Term;
-use hnl_engine_typecheck::TypecheckReport;
+use hnl_tool_typecheck::TypecheckReport;
 use serde_json::Value;
 
 fn main() {

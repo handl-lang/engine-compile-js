@@ -22,9 +22,9 @@ use handl_language::{Ast, AstNode, AstRef, Language, Span};
 use handl_plugin_compile::{CompileError, CompilerInput};
 use handl_plugin_ext_diag::split_statements;
 use hnl_engine::Term;
-use hnl_engine_lex_pattern::lex;
-use hnl_engine_parse::{ParserEngine, ParserRequest};
-use hnl_engine_parse_pratt::PrattEngine;
+use hnl_tool_lex_pattern::lex;
+use hnl_tool_parse::{ParserEngine, ParserRequest};
+use hnl_tool_parse_pratt::PrattEngine;
 use serde_json::Value;
 
 use crate::config::JsConfig;

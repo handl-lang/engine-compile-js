@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "JavaScript compiler for the Handl arrow calculus (ADR-0114 Phase 3)."
 license = "MIT"
-repository = "https://github.com/handl-lang/engine-compile-js"
+repository = "https://github.com/handl-lang/tool-compile-js"
 readme = "README.md"
 keywords = ["handl", "javascript", "compiler"]
 categories = ["compilers", "development-tools"]
-# Git-install only: https://github.com/handl-lang/engine-compile-js (no crates.io).
+# Git-install only: https://github.com/handl-lang/tool-compile-js (no crates.io).
 publish = false
 
 [dependencies]
@@ -21,16 +21,16 @@ handl-kit-arrow-lower = { git = "https://github.com/handl-lang/host", branch = "
 # (`normalize_family_records` + the `desugar` pass + `splice_decl_blocks`),
 # so `data` decls reach the module emit in the same shape eval sees.
 handl-runtime = { git = "https://github.com/handl-lang/host", branch = "main" }
-hnl-engine-lex-pattern = { git = "https://github.com/handl-lang/engine-lex-pattern", branch = "main" }
-hnl-engine-parse = { git = "https://github.com/handl-lang/engine-parse", branch = "main" }
-hnl-engine-parse-pratt = { git = "https://github.com/handl-lang/engine-parse-pratt", branch = "main" }
+hnl-tool-lex-pattern = { git = "https://github.com/handl-lang/tool-lex-pattern", branch = "main" }
+hnl-tool-parse = { git = "https://github.com/handl-lang/tool-parse", branch = "main" }
+hnl-tool-parse-pratt = { git = "https://github.com/handl-lang/tool-parse-pratt", branch = "main" }
 handl-plugin-ext-diag = { git = "https://github.com/handl-lang/host", branch = "main" }
 hnl-engine = { git = "https://github.com/handl-lang/engine", branch = "main" }
-hnl-engine-typecheck = { git = "https://github.com/handl-lang/engine-typecheck", branch = "main" }
+hnl-tool-typecheck = { git = "https://github.com/handl-lang/tool-typecheck", branch = "main" }
 serde_json = "1"
 # PL-004 T-092: desired-state codegen kernel — git dep; the sibling
 # checkout wins via `[patch]`.
-hnl-engine-codegen = { git = "https://github.com/handl-lang/engine-codegen", branch = "main" }
+hnl-tool-codegen = { git = "https://github.com/handl-lang/tool-codegen", branch = "main" }
 
 [dev-dependencies]
 rand = "0.9"
@@ -45,5 +45,5 @@ path = "bench/bench.rs"
 
 # ADR-0128 §Resolution: the sibling checkout wins locally; CI resolves
 # the `branch = "main"` git deps.
-[patch."https://github.com/handl-lang/engine-codegen"]
-hnl-engine-codegen = { path = "../engine-codegen" }
+[patch."https://github.com/handl-lang/tool-codegen"]
+hnl-tool-codegen = { path = "../tool-codegen" }

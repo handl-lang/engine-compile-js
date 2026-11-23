@@ -4,7 +4,7 @@ use handl_plugin_compile::{
     Artifact, ArtifactContent, CompileError, Compiler, CompilerConfig, CompilerInput,
     CompilerOutput,
 };
-use hnl_engine_codegen::{
+use hnl_tool_codegen::{
     Change, CodegenError, EmitContext, Emitter as CodegenEmitter, IrKind, IrModule,
 };
 
@@ -249,7 +249,7 @@ mod tests {
     use super::*;
     use handl_language::{Ast, AstNode, Language};
     use hnl_engine::Term;
-    use hnl_engine_typecheck::TypecheckReport;
+    use hnl_tool_typecheck::TypecheckReport;
     use serde_json::Value;
 
     fn input(term: Term) -> CompilerInput {

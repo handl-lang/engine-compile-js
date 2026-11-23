@@ -106,7 +106,7 @@ or a documented subset.
   (`Mixed`, safe inlining) are unchanged per the T-017 data.
 - **Cross-backend parity is unverified.** This crate's tests cover
   eval-parity shapes and node/Chromium execution only; the sibling
-  `engine-compile-*` backends (e.g. the inkwell-gated LLVM arm) are
+  `tool-compile-*` backends (e.g. the inkwell-gated LLVM arm) are
   outside this test surface.
 
 ## Upstream divergences
