@@ -350,6 +350,160 @@ fn e2e_term_level_arithmetic_through_public_api() {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime-op fixtures (T-002): `record_merge`, `flow`, `ctor_name`/
+// `ctor_fields` (via ctor-object match patterns), `assert`/
+// `runtime_assert`, and the `{x}` object-pattern shorthand.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_record_merge_object_spread() {
+    require_node!();
+    let run = run_program(
+        "record-merge",
+        r#"
+base := { a: 1, b: 2 }
+ext := { b: 9, c: 3 }
+merged := { x: 0, ...base, ...ext, y: 5 }
+merged
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // Later keys win (`b: 9` from `ext`), non-overlapping keys union,
+    // and literal runs merge in source order — the
+    // `record_merge(record_merge(…), …)` fold.
+    assert_eq!(run.stdout.trim(), r#"{"x":0,"a":1,"b":9,"c":3,"y":5}"#);
+}
+
+#[test]
+fn e2e_flow_composes_and_applies_arrow_values() {
+    require_node!();
+    // `mk(1) >>> mk(2)` — call results are held arrow *values*, so the
+    // `eval.flow` dispatch composes them (`second(first(x))`);
+    // `21 >>> f` applies the right operand to the left value.
+    let run = run_program(
+        "flow",
+        r#"
+mk := (x) ~> (y) ~> x + y
+comp := mk(1) >>> mk(2)
+dbl := (x) ~> x * 2
+run3 := (f) ~> 21 >>> f
+{ comp: comp(5), applied: run3(dbl) }
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // comp(5) = mk2(mk1(5)) = (5 + 1) + 2 = 8; run3(dbl) = dbl(21) = 42.
+    assert_eq!(run.stdout.trim(), r#"{"comp":8,"applied":42}"#);
+}
+
+#[test]
+fn e2e_ctor_object_pattern_uses_ctor_name_and_fields() {
+    require_node!();
+    // `Pair(a, b)` is a tag/call pattern: the discriminant tries
+    // `__tag__` first, then `ctor_name(v)` against the ctor sym's name;
+    // ctor binders fall back to `ctor_fields` (sorted non-`__ctor__`/
+    // `type` values). The driver supplies the `__ctor__` wire record —
+    // ctor objects are not expressible as `.hnl` literals.
+    let run = run_program(
+        "ctor-pat",
+        r#"
+f := (v) ~> match v {
+  Pair(a, b): a + b,
+  _: 0
+}
+f
+"#,
+        "import f from \"./prog.mjs\";\n\
+         const ctor = {__ctor__: {__sym__: {name: \"Pair\", handle: 1}}, a: 4, b: 5};\n\
+         console.log(JSON.stringify([await f(ctor), await f({a: 1, b: 2}), await f(7)]));\n",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // ctor object: ctor_name → "Pair", ctor_fields → [4, 5] → 4 + 5;
+    // plain object and non-object scrutinees fall through to `_` → 0.
+    assert_eq!(run.stdout.trim(), "[9,0,0]");
+}
+
+#[test]
+fn e2e_assert_and_runtime_assert_fail_like_eval() {
+    require_node!();
+    // `Op{assert, []}`/`Op{runtime_assert, []}` carry no payload (the
+    // expr/predicate children are AST-level), so the JS backend throws
+    // the eval-faithful "unsupported" diagnostic — a real `Error`, not
+    // a `TypeError: … is not a function`.
+    for (name, op) in [("assert", "assert"), ("runtime-assert", "runtime_assert")] {
+        let term = Term::op_native(op, vec![]);
+        let mut ast = Ast::new();
+        let root = ast.push(AstNode::new("module"));
+        let input = CompilerInput::new(
+            "test".to_string(),
+            ast,
+            root,
+            Language::new(),
+            term,
+            TypecheckReport::default(),
+        );
+        let js = compile_to_string(&input, &esm_node()).expect("compile fixture");
+        let run = run_node(
+            name,
+            &[
+                ("prog.mjs", js.as_str()),
+                (
+                    "driver.mjs",
+                    "import f from \"./prog.mjs\";\ntry { await f(null); console.log(\"no-throw\"); } catch (e) { console.log(\"threw:\" + e.message); }\n",
+                ),
+            ],
+            "driver.mjs",
+        );
+        assert!(run.succeeded(), "{name}: node failed:\n{}", run.stderr);
+        assert!(
+            run.stdout.contains(&format!("threw:{op}:")),
+            "{name}: {}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains("is not a function"),
+            "{name}: {}",
+            run.stdout
+        );
+    }
+}
+
+#[test]
+fn e2e_object_pattern_shorthand_binds_nothing() {
+    require_node!();
+    // `{x}` parses as an `object` node with a bare `var` child — eval
+    // (`try_object_pattern`) ignores non-entry children, so the pattern
+    // is an *empty* object pattern and `x` stays unbound. The compiled
+    // `x` is a bare `Op{x, []}` reference: `__opRef` throws
+    // "unsupported op: x" exactly like `term_interpreter`, instead of
+    // the old silent `undefined`. The `{x: y}` entry form binds `y`
+    // from the scrutinee field and is unaffected.
+    let run = run_program(
+        "objpat",
+        r#"
+getx := (r) ~> match r { {x}: x, _: -1 }
+gety := (r) ~> match r { {x: y}: y, _: -1 }
+{ shorthand: getx, entry: gety }
+"#,
+        "import v from \"./prog.mjs\";\n\
+         const out = {};\n\
+         for (const [k, f] of Object.entries(v)) {\n\
+           for (const inp of [{x: 42}, {y: 1}]) {\n\
+             try { out[k + \":\" + JSON.stringify(inp)] = await f(inp); }\n\
+             catch (e) { out[k + \":\" + JSON.stringify(inp)] = \"ERR:\" + e.message; }\n\
+           }\n\
+         }\n\
+         console.log(JSON.stringify(out));\n",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(
+        run.stdout.trim(),
+        r#"{"shorthand:{\"x\":42}":"ERR:unsupported op: x","shorthand:{\"y\":1}":"ERR:unsupported op: x","entry:{\"x\":42}":42,"entry:{\"y\":1}":-1}"#
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Security surface (compile-time; no node needed)
 // ---------------------------------------------------------------------------
 

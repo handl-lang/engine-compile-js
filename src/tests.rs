@@ -782,6 +782,111 @@ fn module_unbound_names_fall_back_to_runtime_members() {
     assert!(js.contains("__handl_rt.unknown_host"), "{js}");
 }
 
+// ---------------------------------------------------------------------------
+// Runtime-op coverage: `record_merge`, `flow`, `ctor_name`, `ctor_fields`,
+// `assert`/`runtime_assert`, and the `__opRef` unbound-reference guard.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn op_record_merge_emits_prelude_call() {
+    let term = Term::op_native(
+        "record_merge",
+        vec![
+            Term::const_value(json!({"a": 1})),
+            Term::const_value(json!({"b": 2})),
+        ],
+    );
+    let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("__handl_rt.record_merge("), "{js}");
+}
+
+#[test]
+fn op_flow_emits_prelude_call() {
+    let term = Term::op_native(
+        "flow",
+        vec![
+            Term::const_value(Value::Number(Number::from(1))),
+            Term::const_value(Value::Number(Number::from(2))),
+        ],
+    );
+    let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("__handl_rt.flow("), "{js}");
+}
+
+#[test]
+fn op_ctor_name_and_fields_read_the_incoming_value() {
+    // The `Seq[pv, Op]` form carries no args — the ops read `__in`
+    // (the `is_obj`/`tag_fields` convention); the `native_ops` first-arg
+    // fallback lowers the arg term instead.
+    let term = Term::op_native("ctor_name", vec![]);
+    let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("__handl_rt.ctor_name(__in)"), "{js}");
+
+    let term = Term::op_native("ctor_fields", vec![Term::op_native("id", vec![])]);
+    let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("__handl_rt.ctor_fields("), "{js}");
+}
+
+#[test]
+fn op_assert_and_runtime_assert_emit_calls_not_members() {
+    // Both ops arrive arg-less (`Op{assert, []}`/`Op{runtime_assert, []}`)
+    // but must *call* the throwing shim — a bare `__handl_rt.<name>`
+    // member would evaluate to `undefined`, not the eval-faithful error.
+    for name in ["assert", "runtime_assert"] {
+        let term = Term::op_native(name, vec![]);
+        let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
+        assert!(js.contains(&format!("__handl_rt.{name}()")), "{name}: {js}");
+    }
+}
+
+#[test]
+fn op_unknown_zero_arg_reference_uses_opref() {
+    // A bare `Op{name, []}` is an unbound-var/lazy op reference: `__opRef`
+    // resolves real runtime members and throws "unsupported op" for
+    // unknown names — never a silent `undefined` member access.
+    let term = Term::op_native("mystery_op", vec![]);
+    let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains(r#"__handl_rt.__opRef("mystery_op")"#), "{js}");
+}
+
+#[test]
+fn prelude_defines_the_requested_shims() {
+    let js = compile_to_string(&input(Term::constant(Value::Null)), &JsConfig::esm_deno()).unwrap();
+    for shim in [
+        "record_merge:",
+        "flow:",
+        "ctor_name:",
+        "ctor_fields:",
+        "assert:",
+        "runtime_assert:",
+        "__opRef:",
+    ] {
+        assert!(js.contains(shim), "missing {shim}: {js}");
+    }
+}
+
+#[test]
+fn module_object_spread_lowers_to_record_merge() {
+    let js = compile_to_string(
+        &module_input("o := { b: 2 }\nmerged := { a: 1, ...o, c: 3 }\nmerged\n"),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("__handl_rt.record_merge("), "{js}");
+}
+
+#[test]
+fn module_flow_between_held_arrows_lowers_to_flow_op() {
+    // `mk(1) >>> mk(2)` — call results are held *values*, so the
+    // `eval.flow` dispatch (`Op{flow}`) is emitted rather than `Seq`.
+    let js = compile_to_string(
+        &module_input("mk := (x) ~> (y) ~> x + y\ncomp := mk(1) >>> mk(2)\ncomp(5)\n"),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("__handl_rt.flow("), "{js}");
+}
+
 fn random_term<R: Rng>(rng: &mut R, depth: usize) -> Term {
     if depth == 0 {
         let v = match rng.random_range(0..4) {

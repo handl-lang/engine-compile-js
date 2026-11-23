@@ -68,6 +68,10 @@ const BUILTIN_OPS: &[&str] = &[
     "tag_fields",
     "obj_except",
     "obj_key",
+    "record_merge",
+    "flow",
+    "ctor_name",
+    "ctor_fields",
     "paren",
     "rest",
     "elem",
@@ -315,6 +319,26 @@ fn lower_op_body(
         // field name (`""` for non-strings, `try_object_pattern`'s
         // `as_str().unwrap_or("")`).
         "is_obj" | "tag_fields" => rt(name, vec![param.clone()]),
+        // `ctor_name`/`ctor_fields` — ctor-object pattern introspection
+        // (ADR-0152 §2, emitted by `compile_pattern`'s ctor arms). Like
+        // `is_obj`/`tag_fields` they read the incoming value — the
+        // `Seq[pv, Op]` form carries no args — and `native_ops` also
+        // honors a first arg, mirrored here.
+        "ctor_name" | "ctor_fields" => {
+            let v = if args.is_empty() {
+                param.clone()
+            } else {
+                lower_sub(&args[0], param)?
+            };
+            rt(name, vec![v])
+        }
+        // `assert`/`runtime_assert` — AST-level assertions whose
+        // payload children never reach the `Term`
+        // (`Op{assert, []}`/`Op{runtime_assert, []}` carry no args), so
+        // they must still *call* the shim (which throws the
+        // eval-faithful "unsupported" diagnostic) rather than emit a
+        // bare member reference like other 0-arg ops.
+        "assert" | "runtime_assert" => rt(name, vec![]),
         "obj_key" => {
             let v = if args.is_empty() {
                 param.clone()
@@ -501,9 +525,21 @@ fn lower_op_body(
             };
             if args.is_empty() {
                 // A 0-arg op term is the op referenced *as a value* (e.g.
-                // `var tag` for the ambient `tag` host package): emit the
-                // member, not a call.
-                callee
+                // `var tag` for the ambient `tag` host package). Route
+                // through `__opRef`: it resolves the name to the runtime
+                // member when the op/package exists and throws
+                // "unsupported op" like eval when it does not — a bare
+                // `__handl_rt.<name>` member would silently evaluate to
+                // `undefined` for unknown names (e.g. an unbound pattern
+                // variable left over from a `{x}` shorthand object
+                // pattern, which binds nothing).
+                JsAst::Call {
+                    callee: Box::new(JsAst::Member {
+                        obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                        prop: "__opRef".to_string(),
+                    }),
+                    args: vec![JsAst::Str(name.to_string())],
+                }
             } else {
                 let lowered_args: Vec<JsAst> = args
                     .iter()

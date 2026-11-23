@@ -131,6 +131,80 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     for (const k of Object.keys(v)) {{ if (!drop.has(k)) {{ out[k] = v[k]; }} }}
     return out;
   }},
+  // `record_merge` — the object-spread fold (`{{a: 1, ...o, b: 2}}`
+  // lowers to `record_merge(record_merge({{a:1}}, o), {{b:2}})`):
+  // operands evaluate left-to-right, later keys overwrite earlier
+  // ones, and a non-object operand is ignored
+  // (term_interpreter/native_ops parity — `view_fields`' tagged-object
+  // view maps onto `is_obj` here, so marker records like `__pair__`
+  // are skipped rather than merged key-by-key).
+  record_merge: (...args) => {{
+    const out = {{}};
+    for (const a of args) {{
+      if (__handl_rt.is_obj(a)) {{
+        for (const k of Object.keys(a)) out[k] = a[k];
+      }}
+    }}
+    return out;
+  }},
+  // `flow` — the `>>>` value dispatch (`eval.flow`): both operands
+  // evaluate on the incoming value; two arrow values compose into an
+  // `Arrow{{first, second}}`-shaped value (`second(first(x))` on
+  // application), anything else applies the right operand to the left
+  // (`f(x)`). JS arrow values are async `__in => …` functions, so
+  // "arrow-like" is `typeof === "function"`; the composite is itself a
+  // callable carrying the `Arrow` tag/fields so chained `flow`s keep
+  // composing and `__tag__` introspection still sees the record shape.
+  // Subset gap: bound-arrow records (`{{__term__, __bound__}}`) lower
+  // to the same function shape, so eval's "bound records apply rather
+  // than compose" distinction is not observable on this target.
+  flow: (a, b) => {{
+    const isArrow = (v) => (typeof v === "function");
+    if (isArrow(a) && isArrow(b)) {{
+      return Object.assign(
+        async (v) => await b(await a(v)),
+        {{__tag__: "Arrow", first: a, second: b}},
+      );
+    }}
+    if (isArrow(b)) return b(a);
+    throw new Error("flow: right operand is not an arrow value");
+  }},
+  // `ctor_name`/`ctor_fields` — ctor-object pattern introspection
+  // (ADR-0152 §2, emitted by `compile_pattern`'s ctor arms). The
+  // scrutinee's `__ctor__` field carries a sym literal
+  // (`{{__sym__: {{name, handle}}}}`); `ctor_name` is total — a
+  // non-ctor input yields `null` so the pattern arm falls through —
+  // and `ctor_fields` yields the sorted non-`__ctor__`/`type` field
+  // values (the "sorted-fields fallback for positional binding"),
+  // erroring on a non-object like `native_ops`.
+  ctor_name: (v) => {{
+    const c = (v && typeof v === "object" ? v.__ctor__ : null);
+    const s = (c && typeof c === "object" ? c.__sym__ : null);
+    return (s && typeof s === "object" && typeof s.name === "string" ? s.name : null);
+  }},
+  ctor_fields: (v) => {{
+    if (!__handl_rt.is_obj(v)) {{ throw new Error("ctor_fields: input is not an object"); }}
+    return Object.keys(v).filter((k) => k !== "__ctor__" && k !== "type").sort().map((k) => v[k]);
+  }},
+  // `assert`/`runtime_assert` — keyword/predicate assertions are
+  // AST-level: the `assert` node's expr child and the
+  // `runtime-assert` node's predicate/expr children never reach the
+  // lowered `Term` (`Op{{assert, []}}`/`Op{{runtime_assert, []}}`
+  // carry no payload), so — like `term_interpreter`'s "keyword
+  // assertions are not supported by the arrow interpreter" — these
+  // shims throw when evaluated rather than silently passing.
+  assert: () => {{ throw new Error("assert: keyword assertions are not supported by the JS backend"); }},
+  runtime_assert: () => {{ throw new Error("runtime_assert: predicate/expr are AST-level children; not supported by the JS backend"); }},
+  // A bare `Op{{name, []}}` is an unbound-var / lazy op *reference*:
+  // eval resolves it to a native op and errors "unsupported op" when
+  // none exists — never a silent `undefined`. The shim returns the
+  // runtime member when `name` is a real op/package (including ones a
+  // JS host attached to `__handl_rt`) and throws the eval diagnostic
+  // otherwise.
+  __opRef: (name) => {{
+    if (Object.prototype.hasOwnProperty.call(__handl_rt, name)) return __handl_rt[name];
+    throw new Error("unsupported op: " + name);
+  }},
   eq: (a, b) => __handl_rt.__eq(a, b),
   neq: (a, b) => !__handl_rt.__eq(a, b),
   __eq: (a, b) => {{
