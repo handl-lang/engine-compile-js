@@ -1,0 +1,12 @@
+--- T-014 browser e2e fixture: `worker_entry` + an absolute-URL ES
+--- `import` --- `worker_import_resolvable` keeps `https://` specifiers
+--- because they resolve inside a module worker loaded from a real URL.
+---
+--- The side-effect import only needs the module to *load* (CORS +
+--- valid ESM); the handler then answers "message" like the echo
+--- fixture. tests/browser_e2e.mjs treats a network/CORS failure here
+--- as SKIP, not FAIL --- the https smoke is environment-dependent.
+import "https://esm.sh/tslib"
+from "js" import { on }
+
+on("self", "message", (msg) ~> { pong: "https-ok", echo: msg.n })

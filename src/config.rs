@@ -142,6 +142,36 @@ impl JsOutputFormat for Inline {
     }
 }
 
+/// Default iteration bound for `Term::Loop` feedback lowering —
+/// mirrors the bound the JS backend has always emitted (`__cnt <
+/// 100000`). Overridable via [`JsConfig::loop_max_iterations`].
+pub const DEFAULT_LOOP_MAX_ITERATIONS: u64 = 100_000;
+
+/// How the scalar operator family (`add`/`sub`/`mul`/`div`, the
+/// comparisons, `mod`, `neg`, `not`) lowers to JavaScript — one of the
+/// hardcoded lowering choices surfaced by the P-002 configurability
+/// audit. The default preserves today's measured behavior; the
+/// alternative is marked experimental pending the T-017 benchmark
+/// harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpLowering {
+    /// Per-op choice (today's behavior): cheap scalar ops emit raw JS
+    /// operators (`a + b`, `a < b`, `!x`); ops with runtime semantics —
+    /// `eq`/`neq` deep equality, `and`/`or` truthiness, `pow`, data
+    /// constructors, effect ops — go through `__handl_rt` member calls
+    /// or `dispatch`.
+    #[default]
+    Mixed,
+    /// Route the scalar operator family through `__handl_rt` member
+    /// calls as well — the uniform "prelude-call" strategy with no raw
+    /// JS operators (`__handl_rt.add(a, b)`, `__handl_rt.lt(a, b)`, …).
+    ///
+    /// Experimental: requires the scalar-op members in the runtime
+    /// prelude (always emitted) and is pending T-017 measurements
+    /// before it can become a default candidate.
+    Prelude,
+}
+
 /// A `.hnl` module the driver resolved for inlining into the JS bundle —
 /// the ADR-0128 Phase-5 dep-table seam applied to `hnl compile js`.
 ///
@@ -226,6 +256,35 @@ pub struct JsConfig {
     ///   builtins), so worker entries in those formats must fully
     ///   inline their `.hnl` dep graph.
     pub worker_entry: bool,
+    /// How the scalar operator family lowers — see [`OpLowering`].
+    /// Defaults to [`OpLowering::Mixed`] (today's behavior).
+    pub op_lowering: OpLowering,
+    /// Iteration bound emitted for `Term::Loop` feedback lowering
+    /// (`__cnt < N` in the generated `while`). Defaults to
+    /// [`DEFAULT_LOOP_MAX_ITERATIONS`] (100 000 — the bound the backend
+    /// has always emitted).
+    pub loop_max_iterations: u64,
+    /// Run the post-emit [`crate::SecurityScanner`] pass over the
+    /// generated JavaScript (rejects `eval(`/`Function(` call patterns).
+    /// Defaults to `true`. Setting `false` is an escape hatch for
+    /// embedding generated code that legitimately contains those
+    /// substrings (e.g. inside string literals); it weakens the
+    /// ADR-0114 Phase-7 hardening, so prefer keeping it on.
+    pub security_scan: bool,
+    /// **Experimental** — bypass the foreign-call inline safety check.
+    ///
+    /// When `true` (and [`JsConfig::no_inline_foreign`] is `false`),
+    /// every foreign op inlines to a direct
+    /// `globalThis[<module>][<name>](...)` call regardless of the
+    /// descriptor's [`crate::is_safe_for_inlining`] verdict — including
+    /// names the safe list blocks (`setTimeout` with a string
+    /// argument, non-identifier module spellings). `no_inline_foreign`
+    /// still wins when both are set.
+    ///
+    /// Experimental: pending T-017 measurements; not part of the stable
+    /// configuration surface.
+    #[doc(hidden)]
+    pub unsafe_inline_foreign: bool,
 }
 
 impl JsConfig {
@@ -240,6 +299,10 @@ impl JsConfig {
             modules: Vec::new(),
             entry_imports: Vec::new(),
             worker_entry: false,
+            op_lowering: OpLowering::Mixed,
+            loop_max_iterations: DEFAULT_LOOP_MAX_ITERATIONS,
+            security_scan: true,
+            unsafe_inline_foreign: false,
         }
     }
 
@@ -254,6 +317,10 @@ impl JsConfig {
             modules: Vec::new(),
             entry_imports: Vec::new(),
             worker_entry: false,
+            op_lowering: OpLowering::Mixed,
+            loop_max_iterations: DEFAULT_LOOP_MAX_ITERATIONS,
+            security_scan: true,
+            unsafe_inline_foreign: false,
         }
     }
 }

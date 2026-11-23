@@ -134,6 +134,7 @@ fn descriptor_contains_dangerous(fd: &ForeignDescriptor) -> bool {
 fn dangerous_string(s: &str) -> bool {
     let lower = s.to_lowercase();
     lower.contains("<script")
+        || lower.contains("</script")
         || lower.contains("eval")
         || lower.contains("function")
         || lower.contains("setimmediate")
@@ -155,4 +156,5 @@ fn blocked_for_inlining(s: &str) -> bool {
         || lower.contains("settimeout")
         || lower.contains("document.write")
         || lower.contains("<script")
+        || lower.contains("</script")
 }

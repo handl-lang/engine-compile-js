@@ -29,6 +29,17 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   sub: (a, b) => (a - b),
   mul: (a, b) => (a * b),
   div: (a, b) => (a / b),
+  // Scalar-op members backing `JsConfig::op_lowering = OpLowering::Prelude`
+  // (the uniform prelude-call strategy). `Mixed` lowering emits raw JS
+  // operators for these and never calls the members; they are emitted
+  // unconditionally so the prelude text stays config-independent.
+  lt: (a, b) => (a < b),
+  lte: (a, b) => (a <= b),
+  gt: (a, b) => (a > b),
+  gte: (a, b) => (a >= b),
+  mod: (a, b) => (a % b),
+  neg: (a) => (-a),
+  not: (v) => (!v),
   concat: (a, b) => (Array.isArray(a) ? a.concat(b) : String(a) + String(b)),
   projEnv: (env, name) => (env[name]),
   child: (input, role) => input[role],

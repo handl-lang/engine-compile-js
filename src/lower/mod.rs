@@ -9,7 +9,7 @@ use handl_plugin_compile::{CompileError, ValueAbi};
 use hnl_engine::Term;
 use serde_json::{Number, Value};
 
-use crate::config::JsConfig;
+use crate::config::{JsConfig, OpLowering};
 
 thread_local! {
     static LOWER_CTX: std::cell::RefCell<LowerCtx> =
@@ -62,9 +62,16 @@ pub(crate) enum BoundRef {
     Op(String),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct LowerCtx {
     no_inline_foreign: bool,
+    /// Scalar-operator lowering strategy (`JsConfig::op_lowering`).
+    op_lowering: OpLowering,
+    /// `Term::Loop` feedback bound (`JsConfig::loop_max_iterations`).
+    loop_max_iterations: u64,
+    /// Bypass the foreign-call inline safety check
+    /// (`JsConfig::unsafe_inline_foreign`, experimental).
+    unsafe_inline_foreign: bool,
     /// `__sq<N>` uniquifier for `Seq`-stage const bindings.
     tmp: usize,
     /// Module-scope names resolvable inside arrow bodies — imports and
@@ -73,19 +80,50 @@ struct LowerCtx {
     bound: std::collections::HashMap<String, BoundRef>,
 }
 
+impl Default for LowerCtx {
+    /// Context defaults mirror [`JsConfig::esm_deno`]: callers that
+    /// reach the lowerer without [`with_config`] (direct `lower::*`
+    /// use) get today's behavior, not zeroed knobs.
+    fn default() -> Self {
+        Self {
+            no_inline_foreign: false,
+            op_lowering: OpLowering::Mixed,
+            loop_max_iterations: crate::config::DEFAULT_LOOP_MAX_ITERATIONS,
+            unsafe_inline_foreign: false,
+            tmp: 0,
+            bound: std::collections::HashMap::new(),
+        }
+    }
+}
+
 /// Run `f` with the lowering context derived from `config`.
 pub(crate) fn with_config<T>(config: &JsConfig, f: impl FnOnce() -> T) -> T {
-    let prev = LOWER_CTX.with(|c| c.borrow().no_inline_foreign);
+    let prev = LOWER_CTX.with(|c| {
+        let c = c.borrow();
+        (
+            c.no_inline_foreign,
+            c.op_lowering,
+            c.loop_max_iterations,
+            c.unsafe_inline_foreign,
+        )
+    });
     LOWER_CTX.with(|c| {
         *c.borrow_mut() = LowerCtx {
             no_inline_foreign: config.no_inline_foreign,
+            op_lowering: config.op_lowering,
+            loop_max_iterations: config.loop_max_iterations,
+            unsafe_inline_foreign: config.unsafe_inline_foreign,
             ..LowerCtx::default()
         };
     });
     let ret = f();
     LOWER_CTX.with(|c| {
-        c.borrow_mut().no_inline_foreign = prev;
-        c.borrow_mut().bound.clear();
+        let mut c = c.borrow_mut();
+        c.no_inline_foreign = prev.0;
+        c.op_lowering = prev.1;
+        c.loop_max_iterations = prev.2;
+        c.unsafe_inline_foreign = prev.3;
+        c.bound.clear();
     });
     ret
 }
@@ -119,6 +157,24 @@ pub(crate) fn module_bound(name: &str) -> Option<BoundRef> {
 /// Whether foreign calls are allowed to be inlined in the current lowering run.
 pub(crate) fn allow_inlining() -> bool {
     !LOWER_CTX.with(|c| c.borrow().no_inline_foreign)
+}
+
+/// The scalar-operator lowering strategy for the current run
+/// (`JsConfig::op_lowering`).
+pub(crate) fn op_lowering() -> OpLowering {
+    LOWER_CTX.with(|c| c.borrow().op_lowering)
+}
+
+/// The `Term::Loop` feedback bound for the current run
+/// (`JsConfig::loop_max_iterations`).
+pub(crate) fn loop_max_iterations() -> u64 {
+    LOWER_CTX.with(|c| c.borrow().loop_max_iterations)
+}
+
+/// Whether the foreign-call inline safety check is bypassed in the
+/// current run (`JsConfig::unsafe_inline_foreign`, experimental).
+pub(crate) fn unsafe_inline_foreign() -> bool {
+    LOWER_CTX.with(|c| c.borrow().unsafe_inline_foreign)
 }
 
 /// A serializable JavaScript expression/statement AST.

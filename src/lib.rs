@@ -14,8 +14,8 @@ pub mod security;
 
 pub use compiler::{JsCompiler, compile_to_string};
 pub use config::{
-    Browser, Bun, CommonJs, Deno, Esm, Iife, Inline, JsConfig, JsModule, JsOutputFormat, JsTarget,
-    Node,
+    Browser, Bun, CommonJs, DEFAULT_LOOP_MAX_ITERATIONS, Deno, Esm, Iife, Inline, JsConfig,
+    JsModule, JsOutputFormat, JsTarget, Node, OpLowering,
 };
 pub use emit::JsEmitter;
 pub use emit::SecurityScanner;

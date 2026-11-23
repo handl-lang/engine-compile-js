@@ -5,7 +5,11 @@ use hnl_engine::{ArrSource, Term};
 use serde_json::Value;
 
 use super::lower_applied as lower_sub;
-use super::{BoundRef, JsAst, JsBinOp, JsUnaryOp, allow_inlining, lower_value, module_bound};
+use super::{
+    BoundRef, JsAst, JsBinOp, JsUnaryOp, allow_inlining, lower_value, module_bound, op_lowering,
+    unsafe_inline_foreign,
+};
+use crate::config::OpLowering;
 
 const INPUT_NAME: &str = "__in";
 
@@ -308,6 +312,39 @@ fn lower_op_body(
         }),
         args,
     };
+    // `JsConfig::op_lowering`: `Prelude` routes the scalar operator
+    // family through `__handl_rt.<name>` member calls (the uniform
+    // prelude-call strategy) instead of raw JS operators; `Mixed`
+    // keeps today's per-op inline emit. Arity checks match the inline
+    // forms either way.
+    let prelude_ops = op_lowering() == OpLowering::Prelude;
+    let scalar_binop = |op: JsBinOp| -> Result<JsAst, CompileError> {
+        if prelude_ops {
+            if args.len() != 2 {
+                return Err(CompileError::InvalidInput(format!(
+                    "binary op `{name}` requires 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            return Ok(rt(name, applied_args(args)?));
+        }
+        binop(op)
+    };
+    let scalar_unop = |op: JsUnaryOp| -> Result<JsAst, CompileError> {
+        if args.len() != 1 {
+            return Err(CompileError::InvalidInput(format!(
+                "unary op `{name}` requires 1 argument, got {}",
+                args.len()
+            )));
+        }
+        if prelude_ops {
+            return Ok(rt(name, applied_args(args)?));
+        }
+        Ok(JsAst::UnaryOp {
+            op,
+            expr: Box::new(lower_sub(&args[0], param)?),
+        })
+    };
 
     let body = match name {
         // Ops that read the arrow's *incoming* value (not arg terms).
@@ -453,37 +490,17 @@ fn lower_op_body(
                 key: Box::new(key),
             }
         }
-        // Comparisons / logic / math.
+        // Comparisons / logic / math. The scalar family honors
+        // `JsConfig::op_lowering` (`Mixed` → raw JS operators,
+        // `Prelude` → `__handl_rt.<name>` member calls).
         "eq" | "neq" | "and" | "or" | "pow" => rt(name, applied_args(args)?),
-        "lt" => binop(JsBinOp::Lt)?,
-        "lte" => binop(JsBinOp::Le)?,
-        "gt" => binop(JsBinOp::Gt)?,
-        "gte" => binop(JsBinOp::Ge)?,
-        "mod" => binop(JsBinOp::Mod)?,
-        "neg" => {
-            if args.len() != 1 {
-                return Err(CompileError::InvalidInput(format!(
-                    "unary op `neg` requires 1 argument, got {}",
-                    args.len()
-                )));
-            }
-            JsAst::UnaryOp {
-                op: JsUnaryOp::Neg,
-                expr: Box::new(lower_sub(&args[0], param)?),
-            }
-        }
-        "not" => {
-            if args.len() != 1 {
-                return Err(CompileError::InvalidInput(format!(
-                    "unary op `not` requires 1 argument, got {}",
-                    args.len()
-                )));
-            }
-            JsAst::UnaryOp {
-                op: JsUnaryOp::Not,
-                expr: Box::new(lower_sub(&args[0], param)?),
-            }
-        }
+        "lt" => scalar_binop(JsBinOp::Lt)?,
+        "lte" => scalar_binop(JsBinOp::Le)?,
+        "gt" => scalar_binop(JsBinOp::Gt)?,
+        "gte" => scalar_binop(JsBinOp::Ge)?,
+        "mod" => scalar_binop(JsBinOp::Mod)?,
+        "neg" => scalar_unop(JsUnaryOp::Neg)?,
+        "not" => scalar_unop(JsUnaryOp::Not)?,
         "json" => {
             let template = lit.and_then(Value::as_str).ok_or_else(|| {
                 CompileError::InvalidInput("json: missing template literal".to_string())
@@ -496,10 +513,10 @@ fn lower_op_body(
                 ],
             )
         }
-        "add" => binop(JsBinOp::Add)?,
-        "sub" => binop(JsBinOp::Sub)?,
-        "mul" => binop(JsBinOp::Mul)?,
-        "div" => binop(JsBinOp::Div)?,
+        "add" => scalar_binop(JsBinOp::Add)?,
+        "sub" => scalar_binop(JsBinOp::Sub)?,
+        "mul" => scalar_binop(JsBinOp::Mul)?,
+        "div" => scalar_binop(JsBinOp::Div)?,
         "concat" => {
             if args.len() != 2 {
                 return Err(CompileError::InvalidInput(format!(
@@ -802,6 +819,14 @@ fn lower_foreign_op_body(
 
     if !allow_inlining() {
         return emit_js_call(module, name, &lowered_args, lit);
+    }
+
+    // Experimental escape hatch (`JsConfig::unsafe_inline_foreign`):
+    // skip the descriptor safety verdict — every foreign op inlines to
+    // `globalThis[module][name](...)`. `no_inline_foreign` still wins
+    // (checked above).
+    if unsafe_inline_foreign() {
+        return Ok(inline_foreign_call(module, name, lowered_args));
     }
 
     if let Some(lit) = lit {

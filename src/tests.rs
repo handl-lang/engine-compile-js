@@ -287,6 +287,10 @@ fn iife_wrapping() {
         modules: Vec::new(),
         entry_imports: Vec::new(),
         worker_entry: false,
+        op_lowering: crate::OpLowering::Mixed,
+        loop_max_iterations: crate::DEFAULT_LOOP_MAX_ITERATIONS,
+        security_scan: true,
+        unsafe_inline_foreign: false,
     };
     let js = compile_to_string(
         &input(Term::const_value(Value::Number(Number::from(42)))),
@@ -309,6 +313,10 @@ fn inline_format() {
         modules: Vec::new(),
         entry_imports: Vec::new(),
         worker_entry: false,
+        op_lowering: crate::OpLowering::Mixed,
+        loop_max_iterations: crate::DEFAULT_LOOP_MAX_ITERATIONS,
+        security_scan: true,
+        unsafe_inline_foreign: false,
     };
     let js = compile_to_string(
         &input(Term::const_value(Value::Number(Number::from(42)))),
@@ -911,6 +919,10 @@ fn worker_entry_iife_emits_classic_worker_script() {
         modules: Vec::new(),
         entry_imports: Vec::new(),
         worker_entry: true,
+        op_lowering: crate::OpLowering::Mixed,
+        loop_max_iterations: crate::DEFAULT_LOOP_MAX_ITERATIONS,
+        security_scan: true,
+        unsafe_inline_foreign: false,
     };
     config.modules = vec![crate::JsModule {
         path: "/pkgs/dep/dep.hnl".to_string(),
@@ -1121,6 +1133,10 @@ fn iife_browser() -> JsConfig {
         modules: Vec::new(),
         entry_imports: Vec::new(),
         worker_entry: false,
+        op_lowering: crate::OpLowering::Mixed,
+        loop_max_iterations: crate::DEFAULT_LOOP_MAX_ITERATIONS,
+        security_scan: true,
+        unsafe_inline_foreign: false,
     }
 }
 
@@ -1135,6 +1151,10 @@ fn inline_browser() -> JsConfig {
         modules: Vec::new(),
         entry_imports: Vec::new(),
         worker_entry: false,
+        op_lowering: crate::OpLowering::Mixed,
+        loop_max_iterations: crate::DEFAULT_LOOP_MAX_ITERATIONS,
+        security_scan: true,
+        unsafe_inline_foreign: false,
     }
 }
 
@@ -1419,4 +1439,171 @@ fn denylisted_op_spellings_fail_to_compile() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// T-016 (P-002): compiler configurability — `JsConfig` knobs for the
+// hardcoded lowering choices (`op_lowering`, `loop_max_iterations`,
+// `security_scan`, `unsafe_inline_foreign`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn op_lowering_mixed_is_the_default_inline_emit() {
+    // `OpLowering::Mixed` (the default) keeps today's behavior: scalar
+    // ops emit raw JS operators, not `__handl_rt` member calls.
+    let term = Term::op_native(
+        "add",
+        vec![
+            Term::const_value(Value::Number(Number::from(1))),
+            Term::const_value(Value::Number(Number::from(2))),
+        ],
+    );
+    let mut config = JsConfig::esm_deno();
+    config.op_lowering = crate::OpLowering::Mixed;
+    let js = compile_to_string(&input(term), &config).unwrap();
+    assert!(js.contains("1 + 2"), "{js}");
+    assert!(!js.contains("__handl_rt.add("), "{js}");
+}
+
+#[test]
+fn op_lowering_prelude_routes_scalar_ops_through_rt() {
+    // `OpLowering::Prelude` — the uniform prelude-call strategy — emits
+    // `__handl_rt.<name>(…)` member calls for the whole scalar family
+    // instead of raw JS operators.
+    let mut config = JsConfig::esm_deno();
+    config.op_lowering = crate::OpLowering::Prelude;
+
+    let add = Term::op_native(
+        "add",
+        vec![
+            Term::const_value(Value::Number(Number::from(1))),
+            Term::const_value(Value::Number(Number::from(2))),
+        ],
+    );
+    let js = compile_to_string(&input(add), &config).unwrap();
+    assert!(js.contains("__handl_rt.add(1, 2)"), "{js}");
+    assert!(!js.contains("1 + 2"), "{js}");
+
+    let lt = Term::op_native(
+        "lt",
+        vec![
+            Term::const_value(Value::Number(Number::from(1))),
+            Term::const_value(Value::Number(Number::from(2))),
+        ],
+    );
+    let js = compile_to_string(&input(lt), &config).unwrap();
+    assert!(js.contains("__handl_rt.lt(1, 2)"), "{js}");
+    assert!(!js.contains("1 < 2"), "{js}");
+
+    let not = Term::op_native("not", vec![Term::const_value(Value::Bool(true))]);
+    let js = compile_to_string(&input(not), &config).unwrap();
+    assert!(js.contains("__handl_rt.not(true)"), "{js}");
+    assert!(!js.contains("(!true)"), "{js}");
+}
+
+#[test]
+fn op_lowering_prelude_applies_to_module_sources() {
+    // The knob threads through `lower::with_config` on the file-level
+    // module emit too — `.hnl` sources get the same strategy.
+    let mut config = JsConfig::esm_deno();
+    config.op_lowering = crate::OpLowering::Prelude;
+    let js = compile_to_string(
+        &module_input("add := (a, b) ~> a + b\nadd(20, 22)\n"),
+        &config,
+    )
+    .unwrap();
+    assert!(js.contains("__handl_rt.add("), "{js}");
+}
+
+#[test]
+fn prelude_defines_scalar_op_members_for_prelude_strategy() {
+    // The `Prelude` strategy's `__handl_rt.<name>` calls need members
+    // for the whole scalar family — `add`/`sub`/`mul`/`div` already
+    // existed; `lt`/`lte`/`gt`/`gte`/`mod`/`neg`/`not` were added for
+    // the knob. They are emitted unconditionally (the prelude text is
+    // config-independent).
+    let js = compile_to_string(&input(Term::constant(Value::Null)), &JsConfig::esm_deno()).unwrap();
+    for member in [
+        "lt: (a, b) => (a < b)",
+        "lte: (a, b) => (a <= b)",
+        "gt: (a, b) => (a > b)",
+        "gte: (a, b) => (a >= b)",
+        "mod: (a, b) => (a % b)",
+        "neg: (a) => (-a)",
+        "not: (v) => (!v)",
+    ] {
+        assert!(js.contains(member), "missing `{member}`: {js}");
+    }
+}
+
+#[test]
+fn loop_max_iterations_is_configurable() {
+    // `Term::Loop` feedback emits `__cnt < N`; `N` is
+    // `JsConfig::loop_max_iterations` (default 100 000).
+    let term = Term::loop_feedback(Term::const_value(Value::Number(Number::from(42))));
+    let mut config = JsConfig::esm_deno();
+    config.loop_max_iterations = 7;
+    let js = compile_to_string(&input(term), &config).unwrap();
+    assert!(js.contains("__cnt < 7"), "{js}");
+    assert!(!js.contains("100000"), "{js}");
+
+    // Default stays 100 000.
+    let js = compile_to_string(
+        &input(Term::loop_feedback(Term::const_value(Value::Number(
+            Number::from(42),
+        )))),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("__cnt < 100000"), "{js}");
+}
+
+#[test]
+fn security_scan_disabled_permits_eval_substring() {
+    // A string literal containing `eval(` trips the SecurityScanner's
+    // substring check on the single-term path; `security_scan = false`
+    // is the documented escape hatch.
+    let term = Term::constant(Value::String("eval(".to_string()));
+    assert!(compile_to_string(&input(term.clone()), &JsConfig::esm_deno()).is_err());
+
+    let mut config = JsConfig::esm_deno();
+    config.security_scan = false;
+    let js = compile_to_string(&input(term), &config).unwrap();
+    assert!(js.contains(r#""eval(""#), "{js}");
+}
+
+#[test]
+fn unsafe_inline_foreign_bypasses_safety_check() {
+    // A descriptor whose module is not a static identifier fails
+    // `is_safe_for_inlining` → `__handl_rt.jsCall` by default;
+    // `unsafe_inline_foreign` (experimental) inlines it anyway.
+    let desc = json!({
+        "module": "my lib",
+        "name": "run",
+        "arg_types": [],
+        "return_type": "void"
+    });
+    let foreign_term = || Term::Op {
+        dim: Box::new(Term::constant(Value::Number(Number::from(1)))),
+        name: "run".to_string(),
+        args: vec![],
+        source: ArrSource::Foreign("my lib".to_string()),
+        lit: Some(desc.clone()),
+        attrs: None,
+    };
+
+    let js = compile_to_string(&input(foreign_term()), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("__handl_rt.jsCall"), "{js}");
+    assert!(!js.contains(r#"globalThis["my lib"]"#), "{js}");
+
+    let mut config = JsConfig::esm_deno();
+    config.unsafe_inline_foreign = true;
+    let js = compile_to_string(&input(foreign_term()), &config).unwrap();
+    assert!(js.contains(r#"globalThis["my lib"]["run"]"#), "{js}");
+    assert!(!js.contains("__handl_rt.jsCall"), "{js}");
+
+    // `no_inline_foreign` still wins when both flags are set.
+    config.no_inline_foreign = true;
+    let js = compile_to_string(&input(foreign_term()), &config).unwrap();
+    assert!(js.contains("__handl_rt.jsCall"), "{js}");
 }

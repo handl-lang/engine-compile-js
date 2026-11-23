@@ -27,7 +27,16 @@ ES imports restricted to resolvable specifiers.
 
 `tests/e2e.rs` is the proof harness: it compiles `.hnl` fixtures through
 the public API and executes the emitted JS under real `node`, asserting
-on stdout/exit status.
+on stdout/exit status. `tests/browser_e2e.mjs` is the real-browser
+counterpart for `worker_entry`: it compiles `tests/browser/*.hnl` via
+`cargo run --example emit_worker` and loads the bundles as module
+Web Workers in headless Chromium through Playwright (request
+interception stands in for an HTTP server), asserting the
+`js.on("self","message")` round-trip, `ArrayBuffer` transfer-list
+detach, and an `https://` ES-import smoke. It is an optional stage —
+run it with `node tests/browser_e2e.mjs` (`--strict` to fail on
+missing playwright/browsers instead of skipping); missing
+toolchain pieces print `SKIP` and exit 0.
 
 ## Development
 
@@ -36,7 +45,7 @@ cargo run --manifest-path xtask/Cargo.toml -- gate   # fmt → clippy → test �
 ```
 
 `xtask/` provides the gate tasks (`fmt`, `clippy`, `test`, `doc`, `check`,
-`gate`); `ci.sh` is the same gate entry for the bupha shell runner. Deps
+`gate`); `workflows/gate.yaml` is the bupha/peregrin gate entry. Deps
 are git deps on `branch = "main"`; locally the workspace-root
 `.cargo/config.toml` patches them to sibling checkouts (dev-only, never
 committed).

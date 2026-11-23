@@ -58,12 +58,19 @@ impl Compiler for JsCompiler {
                     let emitter = JsEmitter;
                     let full = if format_name == "esm" {
                         let body = emitter.emit_module(&stmts)?;
-                        SecurityScanner::new().scan(&body)?;
+                        if js_config.security_scan {
+                            SecurityScanner::new().scan(&body)?;
+                        }
                         let prelude = runtime_prelude(js_config.format.as_ref());
                         format!("{prelude}{body}")
                     } else {
                         let prelude = runtime_prelude(js_config.format.as_ref());
-                        crate::module::emit_module_surface(&stmts, format_name, &prelude)?
+                        crate::module::emit_module_surface(
+                            &stmts,
+                            format_name,
+                            &prelude,
+                            js_config.security_scan,
+                        )?
                     };
                     return Ok(Box::new(JsOutput::new(full)));
                 }
@@ -81,7 +88,11 @@ impl Compiler for JsCompiler {
 
         let main = lower::with_config(js_config, || lower::lower(&input.term))?;
         let emitter = JsEmitter;
-        let main_body = emitter.emit_secure(&main)?;
+        let main_body = if js_config.security_scan {
+            emitter.emit_secure(&main)?
+        } else {
+            emitter.emit_expr(&main)?
+        };
         let wrapped = js_config.format.wrap(&main_body);
         let mut full = if js_config.format.name() == "esm" || js_config.format.name() == "commonjs"
         {

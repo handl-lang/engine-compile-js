@@ -37,6 +37,10 @@ fn main() {
         modules: Vec::new(),
         entry_imports: Vec::new(),
         worker_entry,
+        op_lowering: handl_plugin_compile_js::OpLowering::Mixed,
+        loop_max_iterations: handl_plugin_compile_js::DEFAULT_LOOP_MAX_ITERATIONS,
+        security_scan: true,
+        unsafe_inline_foreign: false,
     };
     match compile_to_string(&input, &config) {
         Ok(js) => print!("{js}"),

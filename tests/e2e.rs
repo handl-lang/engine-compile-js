@@ -1097,3 +1097,254 @@ fn e2e_denylisted_effect_op_spellings_fail_to_compile() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// T-016 (P-002): compiler configurability — a non-default `JsConfig`
+// knob produces working JS under node.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_op_lowering_prelude_strategy() {
+    require_node!();
+    // `JsConfig::op_lowering = OpLowering::Prelude` — the uniform
+    // prelude-call strategy: every scalar op emits a `__handl_rt.<name>`
+    // member call instead of a raw JS operator. The emitted bundle must
+    // still evaluate to the same values under node.
+    let mut config = esm_node();
+    config.op_lowering = handl_plugin_compile_js::OpLowering::Prelude;
+    let run = run_program_with(
+        "op-lowering-prelude",
+        r#"
+add := (a, b) ~> a + b
+mul := (a, b) ~> a * b
+lt := (a, b) ~> a < b
+gt := (a, b) ~> a > b
+flip := (n) ~> 0 - n
+total := add(mul(6, 7), 8)
+half := flip(add(9, 9))
+checks := { smaller: lt(3, 4), bigger: gt(5, 4) }
+{ total: total, half: half, smaller: checks.smaller, bigger: checks.bigger }
+"#,
+        config,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // 6*7+8 = 50; -(9+9) = -18; 3<4 and 5>4.
+    assert_eq!(
+        run.stdout.trim(),
+        r#"{"total":50,"half":-18,"smaller":true,"bigger":true}"#
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-010: `data` declarations in expression position — `data` (or the
+// `F := { … }` family-record spelling) inside `do { … }` blocks.
+// `splice_decl_blocks` flattens the desugared former/ctor/`F.rec` assign
+// group into the *enclosing* block's statement list, so the constructors
+// bind in that block's scope: usable by later statements of the same
+// block, popped with it — eval's `eval_block` pushes a scope and
+// `env_assign` defines block-locally (`engine-exec` `native_ops.rs`).
+// These fixtures execute the emitted JS under node.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_data_decl_inside_do_block_binds_for_later_statements() {
+    require_node!();
+    // `Nat := { … }` inside `do { … }` desugars to the former/ctor/
+    // `Nat.rec` assign group spliced into the block — `Succ`/`Zero`
+    // resolve for `two` and the `match` in later statements of the
+    // same block. The block's value is its last statement's value.
+    let run = run_program(
+        "data-in-do",
+        r#"
+probe := do {
+  Nat := { Zero : Nat, Succ : (p : Nat) ~> Nat }
+  two := Succ(Succ(Zero))
+  match two { Zero: 0, Succ(p): match p { Zero: 1, Succ(q): 2, _: 9 }, _: 8 }
+}
+probe
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // match(Succ(Succ(Zero))) → 2 through two levels of ctor dispatch.
+    assert_eq!(run.stdout.trim(), "2");
+}
+
+#[test]
+fn e2e_data_decl_inside_do_block_scoped_to_block() {
+    require_node!();
+    // Eval scopes the spliced decl group to the `do` block
+    // (`eval_block`'s pushed scope): `Nat`/`Zero`/`Succ` are unbound
+    // after the block — the compiled module must fail the same way
+    // (`unsupported op: Nat`), not leak the family into module scope.
+    // This is also the regression guard for the flattened-decl-group
+    // check: a bare `do {}` whose children are *all* bindings must not
+    // take the `data`-decl emit path.
+    let run = run_program(
+        "data-in-do-scope",
+        r#"
+do {
+  Nat := { Zero : Nat, Succ : (p : Nat) ~> Nat }
+  leaked := Succ(Zero)
+}
+Nat
+"#,
+        "try { const v = await import(\"./prog.mjs\"); \
+         console.log(\"imported:\" + JSON.stringify(v.default)); } \
+         catch (e) { console.log(\"threw:\" + e.message); }\n",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert!(
+        run.stdout.contains("threw:unsupported op: Nat"),
+        "{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn e2e_data_keyword_decl_inside_do_block() {
+    require_node!();
+    // `data Nat := { … }` (the retired keyword, still accepted) inside
+    // a `do` block: the parser's stray `var "data"` marker is stripped
+    // the way `module_prep` strips declarations textually, so the
+    // constructors bind in the block scope like the keyword-free
+    // spelling.
+    let run = run_program(
+        "data-kw-in-do",
+        r#"
+probe := do {
+  data Nat := { Zero : Nat, Succ : (p : Nat) ~> Nat }
+  two := Succ(Succ(Zero))
+  match two { Zero: 0, Succ(p): match p { Zero: 1, Succ(q): 2, _: 9 }, _: 8 }
+}
+probe
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(run.stdout.trim(), "2");
+}
+
+#[test]
+fn e2e_data_keyword_decl_top_level_binds_module_scope() {
+    require_node!();
+    // `data Nat := { … }` at top level — previously the desugared
+    // statement AST's last arena node was an orphaned ctor `alt`, so
+    // the last-node-is-root assumption failed the compile outright.
+    // The constructors must bind at module scope for later statements.
+    let run = run_program(
+        "data-kw-top",
+        r#"
+data Nat := { Zero : Nat, Succ : (p : Nat) ~> Nat }
+to_num := n ~> match n { Zero: 0, Succ(p): 1 + to_num(p) }
+to_num(Succ(Succ(Zero)))
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(run.stdout.trim(), "2");
+}
+
+// ---------------------------------------------------------------------------
+// T-013: source maps — `JsConfig::source_map` on the single-term path
+// appends `//# sourceMappingURL=` and a second `main.js.map` artifact.
+// (The `.hnl` module path currently ignores the flag — noted gap.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_source_map_emits_url_and_valid_v3_map() {
+    use handl_plugin_compile::{ArtifactContent, Compiler, CompilerConfig};
+    use handl_plugin_compile_js::JsCompiler;
+
+    let term = Term::op_native(
+        "add",
+        vec![
+            Term::const_value(Value::Number(serde_json::Number::from(20))),
+            Term::const_value(Value::Number(serde_json::Number::from(22))),
+        ],
+    );
+    let mut ast = Ast::new();
+    let root = ast.push(AstNode::new("module"));
+    let input = CompilerInput::new(
+        "test".to_string(),
+        ast,
+        root,
+        Language::new(),
+        term,
+        TypecheckReport::default(),
+    );
+    let mut config = JsConfig::esm_deno();
+    config.source_map = true;
+    let output = JsCompiler
+        .compile(&input, &config as &dyn CompilerConfig)
+        .expect("compile with source_map");
+    let js = String::from_utf8_lossy(output.primary_output().expect("primary output")).to_string();
+    assert!(
+        js.contains("//# sourceMappingURL=main.js.map"),
+        "missing sourceMappingURL trailer:\n{js}"
+    );
+    let map_artifact = output
+        .artifacts()
+        .iter()
+        .find(|a| a.name == "main.js.map")
+        .expect("main.js.map artifact");
+    let ArtifactContent::String(map) = &map_artifact.content else {
+        panic!("source map artifact is not a string");
+    };
+    let v: Value = serde_json::from_str(map).expect("source map is valid JSON");
+    assert_eq!(v["version"], 3, "{map}");
+    assert_eq!(v["file"], "main.js", "{map}");
+    assert!(
+        v["mappings"].as_str().is_some_and(|m| !m.is_empty()),
+        "{map}"
+    );
+    assert_eq!(v["sources"], serde_json::json!(["<source>"]), "{map}");
+    assert_eq!(v["sourcesContent"], serde_json::json!(["test"]), "{map}");
+    assert!(v["names"].is_array(), "{map}");
+    // Flat V3 map (no `sections` — that field is for index maps).
+    assert!(v.get("sections").is_none(), "{map}");
+}
+
+// ---------------------------------------------------------------------------
+// T-013: deterministic property fixture — random arithmetic/record
+// pipelines compiled through the module emit and executed under node,
+// asserting eval-equivalent output (the expected value is computed in
+// Rust while generating the source). Bounded: 8 cases ≈ 8 node spawns.
+// ---------------------------------------------------------------------------
+
+/// A random integer arithmetic expression over literals — fully
+/// parenthesized `+`/`-`/`*` trees (no division: keeps results integral
+/// and JSON-comparison exact). Returns `(source, value)`.
+fn gen_arith<R: rand::Rng>(rng: &mut R, depth: usize) -> (String, i64) {
+    if depth == 0 || rng.random_range(0..4) == 0 {
+        let n = rng.random_range(-20..=20);
+        return (n.to_string(), n as i64);
+    }
+    let (ls, lv) = gen_arith(rng, depth - 1);
+    let (rs, rv) = gen_arith(rng, depth - 1);
+    match rng.random_range(0..3) {
+        0 => (format!("({ls} + {rs})"), lv + rv),
+        1 => (format!("({ls} - {rs})"), lv - rv),
+        _ => (format!("({ls} * {rs})"), lv * rv),
+    }
+}
+
+#[test]
+fn e2e_fuzz_arithmetic_record_pipelines_match_eval() {
+    require_node!();
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
+    for case in 0..8 {
+        // `{ a: e1, b: e2, c: e3 }` — a record literal of random
+        // arithmetic pipelines as the module's trailing value.
+        let (e1, v1) = gen_arith(&mut rng, 3);
+        let (e2, v2) = gen_arith(&mut rng, 3);
+        let (e3, v3) = gen_arith(&mut rng, 2);
+        let source = format!("{{ a: {e1}, b: {e2}, c: {e3} }}\n");
+        let expected = format!(r#"{{"a":{v1},"b":{v2},"c":{v3}}}"#);
+        let run = run_program(&format!("fuzz-{case}"), &source, print_default());
+        assert!(run.succeeded(), "case {case} node failed:\n{}", run.stderr);
+        assert_eq!(run.stdout.trim(), expected, "case {case} ({source})");
+    }
+}

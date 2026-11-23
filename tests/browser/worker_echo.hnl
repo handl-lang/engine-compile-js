@@ -1,0 +1,28 @@
+--- T-014 browser e2e fixture: a `worker_entry` bundle exercising the
+--- browser-worker spelling of the `js/worker` convention ---
+--- `js.on("self", "message", arrow)` on the real
+--- `DedicatedWorkerGlobalScope`.
+---
+--- On each "message" the handler:
+---   1. posts an explicit reply carrying a 16-byte `ArrayBuffer` filled
+---      with `0x07` bytes, transferred (not cloned) via the postMessage
+---      transfer list --- the parent's copy arrives as a real
+---      ArrayBuffer and the worker's own `byteLength` reads 0 after;
+---   2. returns a record the `js.on` reply convention posts back
+---      automatically --- `remaining` is the buffer's `byteLength`
+---      *after* the transfer, so `0` proves the detach reached the
+---      worker.
+---
+--- Compiled by tests/browser_e2e.mjs via `cargo run --example
+--- emit_worker -- tests/browser/worker_echo.hnl`.
+from "js" import { on, call, construct, invoke }
+
+ab := construct("", "ArrayBuffer", [16], [], "js_object", false)
+u8 := construct("", "Uint8Array", [ab], [], "js_object", false)
+invoke(u8, "fill", [7], [], "js_object", false)
+
+on("self", "message", (msg) ~> do {
+  call("self", "postMessage", [{ echoed: msg.n, buf: ab }, [ab]], [], "void", false)
+  remaining := call("Reflect", "get", [ab, "byteLength"], [], "js_number", false)
+  { echoed: msg.n, remaining: remaining }
+})

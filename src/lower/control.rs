@@ -4,7 +4,7 @@ use handl_plugin_compile::CompileError;
 use hnl_engine::Term;
 use serde_json::{Number, Value};
 
-use crate::lower::{JsAst, JsBinOp, JsUnaryOp};
+use crate::lower::{JsAst, JsBinOp, JsUnaryOp, loop_max_iterations};
 
 const INPUT_NAME: &str = "__in";
 
@@ -135,7 +135,9 @@ fn lower_loop_applied(body: &Term, input: &JsAst) -> Result<JsAst, CompileError>
     let cnt = "__cnt";
     let pair = "__pair";
     let out = "__out";
-    let max_iterations = JsAst::Num(Number::from(100_000));
+    // `JsConfig::loop_max_iterations` — the feedback bound the loop
+    // emits as `__cnt < N` (default 100 000).
+    let max_iterations = JsAst::Num(Number::from(loop_max_iterations()));
 
     let block = JsAst::Block(vec![
         let_decl(saved, input.clone()),

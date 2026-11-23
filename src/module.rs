@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use handl_kit_arrow_lower::lower_ast;
-use handl_language::{Ast, AstNode, AstRef, Language};
+use handl_language::{Ast, AstNode, AstRef, Language, Span};
 use handl_plugin_compile::{CompileError, CompilerInput};
 use handl_plugin_ext_diag::split_statements;
 use hnl_engine::Term;
@@ -69,6 +69,18 @@ const DECL_ONLY_KINDS: &[&str] = &[
 /// `__handl_rt[<spec>]`; unresolved specs keep their `__handl_rt`
 /// member-path / ES-import emit.
 pub(crate) fn try_compile_module(
+    input: &CompilerInput,
+    config: &JsConfig,
+) -> Result<Option<Vec<JsAst>>, CompileError> {
+    // The lowering knobs (`op_lowering`, `loop_max_iterations`,
+    // `no_inline_foreign`, `unsafe_inline_foreign`) live in the
+    // thread-local `LowerCtx` — the module emit must run inside
+    // `with_config` just like the single-term path does, or the
+    // config would be silently ignored for `.hnl` sources.
+    lower::with_config(config, || try_compile_module_inner(input, config))
+}
+
+fn try_compile_module_inner(
     input: &CompilerInput,
     config: &JsConfig,
 ) -> Result<Option<Vec<JsAst>>, CompileError> {
@@ -499,10 +511,15 @@ impl<'e> ModuleCtx<'e> {
 /// keeps them as `require()` calls. `prelude` is placed per format:
 /// inside the wrapper for `iife` (self-contained), top-level for
 /// `commonjs`/`inline` (matching each format's `wrap()` contract).
+///
+/// `security_scan` is `JsConfig::security_scan`: when `false` the
+/// [`SecurityScanner`] pass over the emitted body and namespace
+/// surface is skipped.
 pub(crate) fn emit_module_surface(
     stmts: &[JsAst],
     format_name: &str,
     prelude: &str,
+    security_scan: bool,
 ) -> Result<String, CompileError> {
     if !matches!(format_name, "commonjs" | "iife" | "inline") {
         return Err(CompileError::InvalidInput(format!(
@@ -550,8 +567,10 @@ pub(crate) fn emit_module_surface(
     let surface = JsAst::Object(named);
     let body = emitter.emit_module(&plain)?;
     let surface_js = emitter.emit_expr(&surface)?;
-    SecurityScanner::new().scan(&body)?;
-    SecurityScanner::new().scan(&surface_js)?;
+    if security_scan {
+        SecurityScanner::new().scan(&body)?;
+        SecurityScanner::new().scan(&surface_js)?;
+    }
     let full = match format_name {
         "commonjs" => format!(
             "{prelude}module.exports = (async () => {{\n{body}  return {surface_js};\n}})();\n"
@@ -634,8 +653,172 @@ fn parse_statement(lang: &Language, text: &str) -> Result<(Ast, AstRef), String>
     if ast.is_empty() {
         return Ok((ast, AstRef::new(0)));
     }
-    let len = ast.len();
-    Ok((ast, AstRef::new(len - 1)))
+    let mut ast = ast;
+    strip_data_keyword_residue(&mut ast);
+    let root = statement_root(&ast);
+    Ok((ast, root))
+}
+
+/// Drop child references to `var "data"` residue nodes.
+///
+/// The retired `data` keyword still parses (`data F := { … }`,
+/// `data F :: …`) as a stray `var "data"` marker child of the
+/// declaration's surface block. `desugar_data` consumes the
+/// declaration but leaves the marker in the parent's `children`
+/// array, where block lowering would evaluate `"data"` as an unbound
+/// op. Eval never sees it — `module_prep` strips declarations
+/// textually before parse — so the compile does the same one level
+/// down: every `children` payload entry pointing at a `var`
+/// node whose payload is `"data"` is removed. The marker node itself
+/// stays in the arena as unreachable residue (indices are stable).
+fn strip_data_keyword_residue(ast: &mut Ast) {
+    let markers: Vec<bool> = ast
+        .nodes()
+        .iter()
+        .map(|n| n.kind == "var" && n.payload.as_str() == Some("data"))
+        .collect();
+    for i in 0..ast.len() {
+        let Some(node) = ast.get_mut(AstRef::new(i)) else {
+            continue;
+        };
+        let Some(obj) = node.payload.as_object_mut() else {
+            continue;
+        };
+        if let Some(children) = obj.get_mut("children").and_then(Value::as_array_mut) {
+            children.retain(|v| {
+                v.as_u64()
+                    .map(|n| !markers.get(n as usize).copied().unwrap_or(false))
+                    .unwrap_or(true)
+            });
+        }
+    }
+}
+
+/// Node indices `node`'s payload references as AST children: the
+/// `children` role array plus `function`'s `body` field (desugar-minted
+/// functions carry `{"body": idx, "params": […]}` instead of
+/// `children`). Other numeric payload fields (`termination`, lit
+/// `handle`s, …) are values, not arena links.
+fn payload_child_refs(payload: &Value, out: &mut Vec<usize>) {
+    if let Some(children) = payload.get("children").and_then(Value::as_array) {
+        out.extend(
+            children
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize)),
+        );
+    }
+    if let Some(body) = payload.get("body").and_then(Value::as_u64) {
+        out.push(body as usize);
+    }
+}
+
+/// The statement's root node.
+///
+/// The Pratt convention "root is the last arena node" does not survive
+/// every statement shape: parsers and `desugar` leave *orphaned residue*
+/// in the arena — a `data` declaration's ctor `alt` and superseded
+/// `__splice__` blocks trail the real root, while `from "…" import
+/// { a as b }` emits `import.alias` pair nodes *before* `stmt.import`
+/// (the names live in its `names` payload, not `children`).
+/// `ast.len() - 1` and "biggest unreferenced subtree" both misfire:
+/// residue can sit at either end and can out-reach the root when the
+/// root keeps children in payload fields (`stmt.import.names`).
+///
+/// Recover the root in two passes over the *unreferenced* candidates:
+///
+/// 1. **Outermost span wins.** The true root's span covers the whole
+///    statement; *spanned* residue sits strictly inside it (`import.alias`
+///    @`a as b`, ctor `alt` @`Name : T`, the superseded `Nat := {…}`
+///    assign a `data` decl desugars away). A candidate whose span is
+///    strictly contained in another candidate's is eliminated. Spanless
+///    candidates (desugar-minted nodes — including the live
+///    `__splice__` root of a top-level `data` decl) cannot be contained
+///    and survive this pass.
+/// 2. **Rank survivors by `(reach, index)`**: subtree size over
+///    `children`/`body` edges, ties toward the highest index — closest
+///    to the last-node convention. Reach, not span, decides here: the
+///    live root contains every desugared binding, while dead residue
+///    reaches only its own slice — and a *spanned* candidate can still
+///    be dead (the pre-desugar `Nat := {…}` assign keeps its span after
+///    `__splice__` takes over).
+///
+/// Falls back to `len - 1` when no unreferenced node exists (should not
+/// happen — every well-formed AST has exactly one root).
+fn statement_root(ast: &Ast) -> AstRef {
+    let n = ast.len();
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut referenced = vec![false; n];
+    for (i, node) in ast.nodes().iter().enumerate() {
+        let mut refs = Vec::new();
+        payload_child_refs(&node.payload, &mut refs);
+        for r in refs {
+            if r < n {
+                referenced[r] = true;
+                edges[i].push(r);
+            }
+        }
+    }
+    // (reach, index) per unreferenced candidate.
+    let mut cands: Vec<(usize, usize)> = Vec::new();
+    for (i, is_referenced) in referenced.iter().enumerate() {
+        if *is_referenced {
+            continue;
+        }
+        // Iterative DFS over `edges` — arenas are small (one statement),
+        // and candidates are few (usually exactly one).
+        let mut seen = vec![false; n];
+        let mut stack = vec![i];
+        let mut reach = 0usize;
+        while let Some(cur) = stack.pop() {
+            if cur >= n || seen[cur] {
+                continue;
+            }
+            seen[cur] = true;
+            reach += 1;
+            stack.extend_from_slice(&edges[cur]);
+        }
+        cands.push((reach, i));
+    }
+    // Pass 1: drop candidates whose span is strictly inside another
+    // candidate's span.
+    let spans: Vec<Option<Span>> = (0..n)
+        .map(|i| ast.get(AstRef::new(i)).and_then(|nd| nd.span))
+        .collect();
+    let cand_idx: Vec<usize> = cands.iter().map(|&(_, i)| i).collect();
+    let survivors: Vec<usize> = cand_idx
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let Some(si) = spans[i] else {
+                return true; // spanless residue can't be proven contained
+            };
+            !cand_idx.iter().any(|&j| {
+                j != i
+                    && spans[j].is_some_and(|sj| {
+                        sj.start <= si.start
+                            && si.end <= sj.end
+                            && (sj.start < si.start || si.end < sj.end)
+                    })
+            })
+        })
+        .collect();
+    // Pass 2: rank survivors by reach, then index.
+    let mut best: Option<(usize, usize)> = None; // (reach, index)
+    for &i in &survivors {
+        let (reach, _) = cands
+            .iter()
+            .find(|&&(_, ci)| ci == i)
+            .copied()
+            .unwrap_or((0, i));
+        let better = match best {
+            None => true,
+            Some((b_reach, b_idx)) => reach > b_reach || (reach == b_reach && i > b_idx),
+        };
+        if better {
+            best = Some((reach, i));
+        }
+    }
+    AstRef::new(best.map(|(_, i)| i).unwrap_or(n - 1))
 }
 
 fn children_of(node: &AstNode) -> Vec<usize> {
@@ -846,7 +1029,13 @@ impl ModuleCtx<'_> {
             // blocks into *any* parent with a `statements` role — the
             // unflagged surface `block` the assigns were spliced into.
             _ if is_splice_block(node) => self.emit_splice_block(lang, ast, node).map(|_| ()),
-            _ if self.is_flattened_decl_group(lang, ast, node) => {
+            // A user `do { … }`/`{ … }` block that happens to contain a
+            // `data` decl plus only `:=` statements is *not* a flattened
+            // decl group: eval's `eval_block` pushes a scope, so the
+            // constructors pop with the block. Flattening it would leak
+            // the family into module scope — guard on the surface text
+            // under the node's span (`do`/`{` vs `data`/family name).
+            _ if self.is_flattened_decl_group(lang, ast, node) && !is_user_block(node, text) => {
                 self.emit_splice_block(lang, ast, node).map(|_| ())
             }
             // `export data F :: …` parses as `export <var data>` spliced
@@ -1493,6 +1682,29 @@ impl ModuleCtx<'_> {
 /// this per-statement walk cannot run — it re-parses each chunk).
 fn is_splice_block(node: &AstNode) -> bool {
     node.kind == "block" && node.payload.get("__splice__").and_then(Value::as_bool) == Some(true)
+}
+
+/// Whether `node` is a user-written block (`do { … }`, `{ … }`) rather
+/// than the surface `block` a `data` declaration desugars into. Both
+/// are `block`-kinded with an identical payload shape, so the tell is
+/// the statement text under the node's span: a decl group starts with
+/// `data`/the family name, a user block with `do` or `{`. A missing
+/// span (desugar-minted nodes carry none) or out-of-range span is *not*
+/// a user block — the flatten path stays the default.
+fn is_user_block(node: &AstNode, text: &str) -> bool {
+    let Some(span) = node.span else {
+        return false;
+    };
+    let Some(src) = text.get(span.start..) else {
+        return false;
+    };
+    let t = src.trim_start();
+    t.starts_with('{')
+        || (t.starts_with("do")
+            && t[2..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_')))
 }
 
 /// Evaluate an AST subtree as a JSON literal — the restricted shape a
