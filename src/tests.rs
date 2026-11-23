@@ -283,6 +283,7 @@ fn iife_wrapping() {
         source_map: false,
         modules: Vec::new(),
         entry_imports: Vec::new(),
+        worker_entry: false,
     };
     let js = compile_to_string(
         &input(Term::const_value(Value::Number(Number::from(42)))),
@@ -304,6 +305,7 @@ fn inline_format() {
         source_map: false,
         modules: Vec::new(),
         entry_imports: Vec::new(),
+        worker_entry: false,
     };
     let js = compile_to_string(
         &input(Term::const_value(Value::Number(Number::from(42)))),
@@ -864,6 +866,77 @@ fn module_unsupported_data_shape_errors() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("export data"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// T-004: worker-entry bundles — ESM-only, module-only, self-contained.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worker_entry_requires_esm_format() {
+    let mut config = JsConfig::cjs_node();
+    config.worker_entry = true;
+    let err = compile_to_string(&module_input("x := 1\n"), &config).unwrap_err();
+    assert!(err.to_string().contains("esm"), "{err}");
+}
+
+#[test]
+fn worker_entry_rejects_single_term_input() {
+    // A synthetic `CompilerInput` (empty `Language`) cannot take the
+    // file-level module emit — there is no module surface to wire.
+    let mut config = JsConfig::esm_deno();
+    config.worker_entry = true;
+    let err = compile_to_string(&input(Term::constant(Value::Null)), &config).unwrap_err();
+    assert!(err.to_string().contains("module source"), "{err}");
+}
+
+#[test]
+fn worker_entry_rejects_unresolvable_imports() {
+    let mut config = JsConfig::esm_deno();
+    config.worker_entry = true;
+    // `./dep.hnl` was not resolved through `entry_imports`, so a real ES
+    // `import` survives — unresolvable inside a blob/object-URL worker.
+    let err = compile_to_string(
+        &module_input("from \"./dep.hnl\" import { f }\nf(1)\n"),
+        &config,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("worker_entry"), "{err}");
+    assert!(err.to_string().contains("./dep.hnl"), "{err}");
+}
+
+#[test]
+fn worker_entry_keeps_builtin_imports_and_inlines_deps() {
+    // `node:` builtins resolve inside a worker global scope and stay as
+    // real ES imports; resolved `.hnl` deps inline into `__handl_rt`
+    // namespaces — the bundle carries no unresolvable specifier.
+    let mut config = JsConfig::esm_deno();
+    config.worker_entry = true;
+    config.modules = vec![crate::JsModule {
+        path: "/pkgs/dep/dep.hnl".to_string(),
+        source: "export double := (x) ~> x * 2\n".to_string(),
+        imports: Vec::new(),
+    }];
+    config.entry_imports = vec![("dep".to_string(), "/pkgs/dep/dep.hnl".to_string())];
+    let js = compile_to_string(
+        &module_input(
+            "from \"node:worker_threads\" import { parentPort }\n\
+             from \"dep\" import { double }\n\
+             echo := (msg) ~> double(msg)\n",
+        ),
+        &config,
+    )
+    .unwrap();
+    assert!(
+        js.contains("import { parentPort } from \"node:worker_threads\";"),
+        "{js}"
+    );
+    assert!(js.contains("__handl_rt.dep = __mod_dep_0;"), "{js}");
+    assert!(js.contains("__handl_rt.dep.double("), "{js}");
+    assert!(!js.contains("from \"dep\""), "{js}");
+    // Prelude + inlined dep + entry body — one self-contained file.
+    assert!(js.contains("var __handl_rt"), "{js}");
+    assert!(js.contains("const __mod_dep_0"), "{js}");
 }
 
 // ---------------------------------------------------------------------------

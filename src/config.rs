@@ -169,6 +169,38 @@ pub struct JsConfig {
     /// canonical path — for `CompilerInput::source` (which carries no
     /// path of its own).
     pub entry_imports: Vec<(String, String)>,
+    /// Compile the input as a **worker entry bundle**: one self-contained
+    /// ES module — runtime prelude + the inlined `.hnl` dep graph —
+    /// loadable via `new Worker(url_or_blob, { type: "module" })`.
+    ///
+    /// The flag is a *bundle contract*, not a code convention: the
+    /// worker's message wiring lives in the `.hnl` source itself,
+    /// exactly as `lib-js`'s `js/worker` package spells it — the entry
+    /// registers its handler at module top level with
+    /// `js.on("self", "message", arrow)` (browser workers;
+    /// `on_message_self` in `js/worker`) or `js.on(port, "message",
+    /// arrow)` over a concrete `EventTarget` such as Node's
+    /// `parentPort`. The `js.on` trampoline unwraps `MessageEvent.data`,
+    /// awaits the compiled arrow, and posts a non-null result back to
+    /// the parent automatically.
+    ///
+    /// Constraints enforced at compile time:
+    ///
+    /// - the output format must be `esm` (inlined deps use top-level
+    ///   `await`; a worker bundle is always an ES module — load it with
+    ///   `{ type: "module" }`, classic-script `importScripts` workers
+    ///   are not supported yet);
+    /// - the input must go through the file-level module emit (a
+    ///   `.hnl` module source — the single-term path has no module
+    ///   surface to wire);
+    /// - every surviving ES `import` must be self-contained-resolvable:
+    ///   builtin schemes (`node:`, `bun:`, `deno:`) and absolute URLs
+    ///   (`https://…`) are kept; relative or filesystem-absolute
+    ///   specifiers cannot resolve inside a blob/object-URL worker and
+    ///   are a compile error — resolve them to `.hnl` files via
+    ///   [`JsConfig::modules`]/[`JsConfig::entry_imports`] so they inline
+    ///   instead.
+    pub worker_entry: bool,
 }
 
 impl JsConfig {
@@ -182,6 +214,7 @@ impl JsConfig {
             source_map: false,
             modules: Vec::new(),
             entry_imports: Vec::new(),
+            worker_entry: false,
         }
     }
 
@@ -195,6 +228,7 @@ impl JsConfig {
             source_map: false,
             modules: Vec::new(),
             entry_imports: Vec::new(),
+            worker_entry: false,
         }
     }
 }

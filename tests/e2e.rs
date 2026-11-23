@@ -588,6 +588,129 @@ get_or : Opt ~> Number ~> Number = o ~> d ~> match o { None: d, Some(x): x }
 }
 
 // ---------------------------------------------------------------------------
+// T-004: worker-entry bundles — a `.hnl` worker module compiles to ONE
+// self-contained ESM file (prelude + inlined deps) that a real
+// `node:worker_threads` Worker (or a browser-shaped `self` global)
+// loads and answers `"message"` events on.
+// ---------------------------------------------------------------------------
+
+/// Compile `source` as a worker-entry bundle (ESM + `worker_entry`).
+fn compile_worker(source: &str) -> String {
+    let mut config = esm_node();
+    config.worker_entry = true;
+    compile_to_string(&module_input(source), &config).expect("compile worker entry")
+}
+
+#[test]
+fn e2e_worker_entry_node_worker_roundtrip_and_transfer() {
+    require_node!();
+    // The worker module wires its own message loop — the `js/worker`
+    // convention (`lib-js/src/worker/index.hnl`): `js.on` over a concrete
+    // EventTarget. Node's worker global scope has no `self`/`postMessage`
+    // (verified: all undefined), so the entry imports `parentPort` — a
+    // `node:` builtin specifier the worker-entry check keeps as a real
+    // ES import. The handler explicitly `postMessage`s a record
+    // carrying an `ArrayBuffer` plus a transfer list, then returns a
+    // value the `js.on` reply convention posts back automatically; the
+    // reply's `remaining` field is the buffer's `byteLength` *after*
+    // the transfer — 0 proves the detach, 16 would mean it cloned.
+    let worker_js = compile_worker(
+        r#"
+from "node:worker_threads" import { parentPort }
+from "js" import {
+  on as js_on,
+  call as js_call,
+  construct as js_construct,
+  invoke as js_invoke,
+}
+
+ab := js_construct("", "ArrayBuffer", [16], [], "js_object", false)
+
+js_on(parentPort, "message", (msg) ~> do {
+  js_invoke(parentPort, "postMessage", [{ echoed: msg.n, buf: ab }, [ab]], [], "void", false)
+  remaining := js_call("Reflect", "get", [ab, "byteLength"], [], "js_number", false)
+  { echoed: msg.n, remaining: remaining }
+})
+"#,
+    );
+    let driver = r#"
+import { Worker } from "node:worker_threads";
+const worker = new Worker(new URL("./worker.mjs", import.meta.url));
+const msgs = await new Promise((resolve, reject) => {
+  const acc = [];
+  worker.on("message", (m) => {
+    acc.push(m);
+    if (acc.length === 2) resolve(acc);
+  });
+  worker.on("error", reject);
+  worker.postMessage({ n: 21 });
+  setTimeout(() => reject(new Error("worker reply timeout")), 10000);
+});
+worker.terminate();
+const [explicit, reply] = msgs;
+if (!(explicit.buf instanceof ArrayBuffer) || explicit.buf.byteLength !== 16) {
+  throw new Error("transfer failed — buf did not arrive as a 16-byte ArrayBuffer: " + JSON.stringify(explicit));
+}
+if (explicit.echoed !== 21 || reply.echoed !== 21 || reply.remaining !== 0) {
+  throw new Error("bad round-trip: " + JSON.stringify(msgs));
+}
+console.log("worker-ok");
+"#;
+    let run = run_node(
+        "worker-node",
+        &[("worker.mjs", worker_js.as_str()), ("driver.mjs", driver)],
+        "driver.mjs",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(run.stdout.trim(), "worker-ok");
+}
+
+#[test]
+fn e2e_worker_entry_browser_shaped_self() {
+    require_node!();
+    // The browser-worker spelling of the same convention: the entry
+    // registers `js.on("self", "message", arrow)` and the `on` trampoline
+    // replies to the worker global itself (`isPeer`). Node has no real
+    // worker `self`, so the driver installs a minimal
+    // `DedicatedWorkerGlobalScope`-shaped fake *before* importing the
+    // bundle — `globalThis["self"]` is what the shim resolves.
+    let worker_js = compile_worker(
+        r#"
+from "js" import { on as js_on }
+
+js_on("self", "message", (msg) ~> { echo: msg.n, pong: "yes" })
+"#,
+    );
+    let driver = r#"
+const listeners = new Map();
+const sent = [];
+globalThis.self = {
+  addEventListener: (name, fn) => listeners.set(name, fn),
+  removeEventListener: (name) => listeners.delete(name),
+  postMessage: (m) => sent.push(m),
+  importScripts: () => {},
+  close: () => {},
+};
+await import("./worker.mjs");
+const listener = listeners.get("message");
+if (typeof listener !== "function") throw new Error("worker did not register a message listener");
+listener({ data: { n: 7 } });
+await new Promise((r) => setTimeout(r, 100));
+if (sent.length !== 1) throw new Error("expected 1 reply, got " + sent.length);
+const m = sent[0];
+if (m.echo !== 7 || m.pong !== "yes") throw new Error("bad reply: " + JSON.stringify(m));
+console.log("self-ok");
+"#;
+    let run = run_node(
+        "worker-self",
+        &[("worker.mjs", worker_js.as_str()), ("driver.mjs", driver)],
+        "driver.mjs",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(run.stdout.trim(), "self-ok");
+}
+
+// ---------------------------------------------------------------------------
 // Security surface (compile-time; no node needed)
 // ---------------------------------------------------------------------------
 
