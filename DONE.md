@@ -9,3 +9,4 @@
 - T-016 CONFIG: audit hardcoded lowering choices → JsConfig knobs (op strategy, async policy, data encoding, formats, worker\_entry, sourcemaps, security, target) · pri:high · owner:devin · created:2026-11-23 · links:P-002 · epic:compile-js-prod · done:2026-11-23
 - T-014 GAP: real-browser e2e via Playwright — worker\_entry bundle in Chromium/Firefox WebWorker, js.on message round-trip, transfer list, https: import smoke · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
 - T-010 GAP: data decls nested in expression position (inside do {}) — splice\_decl\_blocks flattening works but not e2e-covered; add fixture · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
+- T-013 GAP: hardening — SecurityScanner hostile-input corpus expansion, source-map e2e assertion, fuzz/property fixtures for emitted JS · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
