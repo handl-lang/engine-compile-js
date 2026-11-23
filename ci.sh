@@ -38,7 +38,16 @@ failed() { echo "   FAILED: $*" >&2; fail=1; }
 
 run_fmt()    { note fmt;    cargo fmt --check || failed 'cargo fmt --check'; }
 run_clippy() { note clippy; cargo clippy --all-targets -- -D warnings || failed 'cargo clippy'; }
-run_test()   { note test;   cargo test || failed 'cargo test'; }
+run_test() {
+    note test
+    # tests/e2e.rs executes emitted JS under node; without it the suite
+    # would silently skip, so a missing runtime fails the stage.
+    if ! command -v node >/dev/null 2>&1; then
+        failed 'node not on PATH — tests/e2e.rs needs it to run emitted JS'
+        return
+    fi
+    cargo test || failed 'cargo test'
+}
 run_doc()    { note doc;    RUSTDOCFLAGS='-D warnings' cargo doc --no-deps || failed 'cargo doc'; }
 
 case "$stage" in

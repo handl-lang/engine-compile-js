@@ -9,6 +9,9 @@ use crate::config::JsOutputFormat;
 /// concatenated into one file — a consumer plus its `__handl_rt.<pkg>`
 /// imports — then share a single `__handl_rt` instead of failing on a
 /// duplicate declaration.
+// `format!` (not `.to_string()`) is load-bearing: the literal's `{{`/`}}`
+// escapes produce the single braces the JS needs.
+#[allow(clippy::useless_format)]
 pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     format!(
         r#"var __handl_rt = globalThis.__handl_rt ||= {{

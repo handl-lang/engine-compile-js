@@ -56,15 +56,70 @@ pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
 /// Op names the calculus/lowerer reserves — a module binding under one
 /// of these names still resolves as the builtin in argument position.
 const BUILTIN_OPS: &[&str] = &[
-    "id", "tag", "pair_tag", "loop_outcome", "arr_len", "arr_drop", "match_fail",
-    "is_obj", "has_field", "tag_fields", "obj_except", "obj_key",
-    "paren", "rest", "elem", "product", "array", "record", "field_access",
-    "eq", "neq", "and", "or", "not", "neg", "pow", "mod", "lt", "lte", "gt",
-    "gte", "add", "sub", "mul", "div", "concat", "json", "proj_env", "await",
-    "assert", "runtime_assert", "export", "import", "extend_env", "apply",
-    "app", "resolve", "eval_template", "match_shell", "loop_step", "object",
-    "fanout", "sum", "choice", "left", "right", "first", "second", "assign",
-    "desugar_error", "proj_child", "proj_child_or", "proj_rest", "compare",
+    "id",
+    "tag",
+    "pair_tag",
+    "loop_outcome",
+    "arr_len",
+    "arr_drop",
+    "match_fail",
+    "is_obj",
+    "has_field",
+    "tag_fields",
+    "obj_except",
+    "obj_key",
+    "paren",
+    "rest",
+    "elem",
+    "product",
+    "array",
+    "record",
+    "field_access",
+    "eq",
+    "neq",
+    "and",
+    "or",
+    "not",
+    "neg",
+    "pow",
+    "mod",
+    "lt",
+    "lte",
+    "gt",
+    "gte",
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "concat",
+    "json",
+    "proj_env",
+    "await",
+    "assert",
+    "runtime_assert",
+    "export",
+    "import",
+    "extend_env",
+    "apply",
+    "app",
+    "resolve",
+    "eval_template",
+    "match_shell",
+    "loop_step",
+    "object",
+    "fanout",
+    "sum",
+    "choice",
+    "left",
+    "right",
+    "first",
+    "second",
+    "assign",
+    "desugar_error",
+    "proj_child",
+    "proj_child_or",
+    "proj_rest",
+    "compare",
 ];
 
 /// Lower the application of a primitive term to an input value.
@@ -198,10 +253,10 @@ fn lower_op_body(
     // not reserve: `a + b` and `add(x, y)` both produce `Op{add, [a, b]}`,
     // so a bound name colliding with a builtin op cannot be told apart
     // from the builtin use — preferring the builtin is the honest choice.
-    if let Some(bound) = module_bound(name) {
-        if args.is_empty() || !BUILTIN_OPS.contains(&name) {
-            return lower_bound_op_body(&bound, args, source, lit, param);
-        }
+    if let Some(bound) = module_bound(name)
+        && (args.is_empty() || !BUILTIN_OPS.contains(&name))
+    {
+        return lower_bound_op_body(&bound, args, source, lit, param);
     }
 
     if let ArrSource::Foreign(module) = &source {
@@ -324,14 +379,9 @@ fn lower_op_body(
                 let vals = applied_args(args)?;
                 let mut props = Vec::with_capacity(vals.len());
                 for (i, v) in vals.into_iter().enumerate() {
-                    let key = keys
-                        .get(i)
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            CompileError::InvalidInput(
-                                "record: key is not a string".to_string(),
-                            )
-                        })?;
+                    let key = keys.get(i).and_then(Value::as_str).ok_or_else(|| {
+                        CompileError::InvalidInput("record: key is not a string".to_string())
+                    })?;
                     props.push((key.to_string(), v));
                 }
                 JsAst::Object(props)
@@ -345,9 +395,7 @@ fn lower_op_body(
             // arg with no lit — lower it as the key expression.
             let key = match lit {
                 Some(Value::String(s)) => JsAst::Str(s.clone()),
-                Some(v @ (Value::Number(_) | Value::Bool(_))) => {
-                    JsAst::Raw(v.to_string())
-                }
+                Some(v @ (Value::Number(_) | Value::Bool(_))) => JsAst::Raw(v.to_string()),
                 _ if args.len() >= 2 => lower_sub(&args[1], param)?,
                 _ => {
                     return Err(CompileError::InvalidInput(
@@ -573,13 +621,11 @@ fn lower_bound_arrow_record(
     lit: Option<&Value>,
     param: &JsAst,
 ) -> Result<Option<JsAst>, CompileError> {
-    let is_bound_record = lit
-        .and_then(Value::as_array)
-        .is_some_and(|keys| {
-            keys.len() == 2
-                && keys[0].as_str() == Some("__term__")
-                && keys[1].as_str() == Some("__bound__")
-        });
+    let is_bound_record = lit.and_then(Value::as_array).is_some_and(|keys| {
+        keys.len() == 2
+            && keys[0].as_str() == Some("__term__")
+            && keys[1].as_str() == Some("__bound__")
+    });
     if !is_bound_record || args.len() != 2 {
         return Ok(None);
     }

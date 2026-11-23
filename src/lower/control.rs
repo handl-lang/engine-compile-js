@@ -317,7 +317,7 @@ fn host_member_callee(callee: &Term) -> Option<String> {
         return None;
     }
     let field = lit.as_ref().and_then(Value::as_str)?;
-    let recv = args.first().and_then(|r| host_member_receiver(r))?;
+    let recv = args.first().and_then(host_member_receiver)?;
     let quoted = serde_json::to_string(&Value::String(field.to_string()))
         .unwrap_or_else(|_| "\"_\"".to_string());
     Some(format!("{recv}[{quoted}]"))
@@ -336,7 +336,7 @@ fn host_member_receiver(recv: &Term) -> Option<String> {
     };
     if name == "field_access" {
         let field = lit.as_ref().and_then(Value::as_str)?;
-        let base = args.first().and_then(|r| host_member_receiver(r))?;
+        let base = args.first().and_then(host_member_receiver)?;
         let quoted = serde_json::to_string(&Value::String(field.to_string()))
             .unwrap_or_else(|_| "\"_\"".to_string());
         return Some(format!("{base}[{quoted}]"));
@@ -411,7 +411,6 @@ fn flatten_host_member_app<'t>(
             all.extend(args.iter());
             Some((path, all))
         }
-        _ => host_member_callee(callee)
-            .map(|path| (path, args.iter().collect())),
+        _ => host_member_callee(callee).map(|path| (path, args.iter().collect())),
     }
 }

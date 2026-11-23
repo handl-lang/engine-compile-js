@@ -77,9 +77,10 @@ struct LowerCtx {
 pub(crate) fn with_config<T>(config: &JsConfig, f: impl FnOnce() -> T) -> T {
     let prev = LOWER_CTX.with(|c| c.borrow().no_inline_foreign);
     LOWER_CTX.with(|c| {
-        let mut ctx = LowerCtx::default();
-        ctx.no_inline_foreign = config.no_inline_foreign;
-        *c.borrow_mut() = ctx;
+        *c.borrow_mut() = LowerCtx {
+            no_inline_foreign: config.no_inline_foreign,
+            ..LowerCtx::default()
+        };
     });
     let ret = f();
     LOWER_CTX.with(|c| {

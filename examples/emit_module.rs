@@ -4,12 +4,14 @@
 use handl_language::{Ast, AstNode};
 use handl_plugin_compile::CompilerInput;
 use handl_plugin_compile_js::{Esm, JsConfig, compile_to_string};
-use hnl_engine_typecheck::TypecheckReport;
 use hnl_engine::Term;
+use hnl_engine_typecheck::TypecheckReport;
 use serde_json::Value;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: emit_module <file.hnl>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: emit_module <file.hnl>");
     let src = std::fs::read_to_string(&path).expect("read source");
     let lang = handl_kit_data_prelude::language_from_yaml().expect("canonical language");
     let mut ast = Ast::new();

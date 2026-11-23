@@ -20,12 +20,12 @@ use std::path::Path;
 use handl_kit_arrow_lower::lower_ast;
 use handl_language::{Ast, AstNode, AstRef, Language};
 use handl_plugin_compile::{CompileError, CompilerInput};
+use handl_plugin_ext_diag::split_statements;
+use hnl_engine::Term;
 use hnl_engine_lex_pattern::lex;
 use hnl_engine_parse::{ParserEngine, ParserRequest};
 use hnl_engine_parse_pratt::PrattEngine;
 use hnl_engine_transform_rewrite::RewriteEngine;
-use handl_plugin_ext_diag::split_statements;
-use hnl_engine::Term;
 use serde_json::Value;
 
 use crate::config::JsConfig;
@@ -53,8 +53,7 @@ const CIRCULAR_IMPORT: &str = "circular import detected";
 /// desugared `block` binds constructors in a private env the per-statement
 /// lowering cannot lift to module scope yet (stub, see report).
 const DECL_ONLY_KINDS: &[&str] = &[
-    "cap", "handle", "trait", "impl", "type", "law", "data", "sort", "grade",
-    "rewrite", "infer",
+    "cap", "handle", "trait", "impl", "type", "law", "data", "sort", "grade", "rewrite", "infer",
 ];
 
 /// Try to compile `input` as a whole `.hnl` module.
@@ -82,8 +81,7 @@ pub(crate) fn try_compile_module(
     }
 
     let mut bundle = Bundle::new(config);
-    let entry_edges: HashMap<String, String> =
-        config.entry_imports.iter().cloned().collect();
+    let entry_edges: HashMap<String, String> = config.entry_imports.iter().cloned().collect();
     let emit = bundle.emit_module_body(lang, &input.source, entry_edges, false)?;
     let mut out = bundle.out;
     out.extend(emit.stmts);
@@ -241,10 +239,10 @@ impl<'a> Bundle<'a> {
                 // error — propagate it (`ModuleLoader` errors the same
                 // way at eval time); other emit gaps degrade to an empty
                 // namespace + a marker comment.
-                if let CompileError::InvalidInput(m) = &e {
-                    if m.starts_with(CIRCULAR_IMPORT) {
-                        return Err(e);
-                    }
+                if let CompileError::InvalidInput(m) = &e
+                    && m.starts_with(CIRCULAR_IMPORT)
+                {
+                    return Err(e);
                 }
                 self.out.push(JsAst::Comment(format!(
                     "compile-js: dep `{spec}` ({path}) not inlined: {e}"
@@ -296,9 +294,7 @@ impl<'a> Bundle<'a> {
 fn bound_expr(r: &BoundRef) -> JsAst {
     match r {
         BoundRef::Arrow(n) | BoundRef::Ident(n) => JsAst::Ident(n.clone()),
-        BoundRef::Member(p) | BoundRef::DepArrow(p) | BoundRef::Ns(p) => {
-            JsAst::Raw(p.clone())
-        }
+        BoundRef::Member(p) | BoundRef::DepArrow(p) | BoundRef::Ns(p) => JsAst::Raw(p.clone()),
         BoundRef::Shim(n) | BoundRef::Op(n) => JsAst::Raw(rt_member_path(&[n])),
     }
 }
@@ -332,10 +328,7 @@ impl<'e> ModuleCtx<'e> {
         // object, not a call, and their `pkg.f(a, b)` calls take the
         // host spread-args convention (`BoundRef::Member`).
         for name in ["tag", "hash_map"] {
-            bound.insert(
-                name.to_string(),
-                BoundRef::Member(rt_member_path(&[name])),
-            );
+            bound.insert(name.to_string(), BoundRef::Member(rt_member_path(&[name])));
         }
         ModuleCtx {
             bound,
@@ -462,9 +455,7 @@ fn quoted_range(s: &str) -> Option<(usize, usize)> {
     let bytes = s.as_bytes();
     let start = bytes.iter().position(|&b| b == b'"' || b == b'\'')?;
     let quote = bytes[start];
-    let end = s[start + 1..]
-        .find(quote as char)
-        .map(|i| start + 1 + i)?;
+    let end = s[start + 1..].find(quote as char).map(|i| start + 1 + i)?;
     Some((start, end + 1))
 }
 
@@ -563,10 +554,7 @@ fn import_names(node: &AstNode) -> Vec<(String, String)> {
                 Value::String(s) => Some((s.clone(), js_ident(s))),
                 Value::Object(_) => {
                     let name = item.get("name")?.as_str()?;
-                    let local = item
-                        .get("as")
-                        .and_then(Value::as_str)
-                        .unwrap_or(name);
+                    let local = item.get("as").and_then(Value::as_str).unwrap_or(name);
                     Some((name.to_string(), js_ident(local)))
                 }
                 _ => None,
@@ -577,6 +565,9 @@ fn import_names(node: &AstNode) -> Vec<(String, String)> {
 }
 
 impl ModuleCtx<'_> {
+    // The statement walk carries the parse triple (`ast`/`root`/`node`)
+    // plus emit context — grouping them would obscure the roles.
+    #[allow(clippy::too_many_arguments)]
     fn emit_statement(
         &mut self,
         g: &mut Bundle,
@@ -621,12 +612,7 @@ impl ModuleCtx<'_> {
     /// `assign`-layout node (`target`/`value` roles), a `bind`
     /// (`payload.name` + child 0), or an `op` declaration (`payload.name`;
     /// its value is the node itself).
-    fn binding_parts(
-        &self,
-        lang: &Language,
-        ast: &Ast,
-        node: &AstNode,
-    ) -> Option<(String, usize)> {
+    fn binding_parts(&self, lang: &Language, ast: &Ast, node: &AstNode) -> Option<(String, usize)> {
         // `assign` layout only for declared-binding kinds — otherwise a
         // `call` node's `[callee, args]` children would be misread as
         // `target`/`value`.
@@ -642,16 +628,16 @@ impl ModuleCtx<'_> {
             let value_idx = child_at(node, lang, "value", 1)?;
             return Some((name, value_idx));
         }
-        if node.kind == "bind" {
-            if let Some(name) = node.payload.get("name").and_then(Value::as_str) {
-                if let Some(&value_idx) = children_of(node).first() {
-                    return Some((name.to_string(), value_idx));
-                }
-            }
+        if node.kind == "bind"
+            && let Some(name) = node.payload.get("name").and_then(Value::as_str)
+            && let Some(&value_idx) = children_of(node).first()
+        {
+            return Some((name.to_string(), value_idx));
         }
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_binding(
         &mut self,
         lang: &Language,
@@ -677,8 +663,7 @@ impl ModuleCtx<'_> {
             // export record when declared `export`.
             self.stmts.push(decl);
             if export {
-                self.exports
-                    .push((name.to_string(), JsAst::Ident(js_name)));
+                self.exports.push((name.to_string(), JsAst::Ident(js_name)));
             }
         } else {
             self.stmts.push(if export {
@@ -731,16 +716,16 @@ impl ModuleCtx<'_> {
         if is_last {
             // A quoted arrow exports the function itself rather than
             // running it against `null`.
-            if let Term::Arr { value, .. } = &term {
-                if let Ok(inner) = serde_json::from_value::<Term>(value.clone()) {
-                    let arrow = self.with_env(|| lower::lower(&inner))?;
-                    if self.dep {
-                        self.tail = Some(arrow);
-                    } else {
-                        self.stmts.push(JsAst::ExportDefault(Box::new(arrow)));
-                    }
-                    return Ok(());
+            if let Term::Arr { value, .. } = &term
+                && let Ok(inner) = serde_json::from_value::<Term>(value.clone())
+            {
+                let arrow = self.with_env(|| lower::lower(&inner))?;
+                if self.dep {
+                    self.tail = Some(arrow);
+                } else {
+                    self.stmts.push(JsAst::ExportDefault(Box::new(arrow)));
                 }
+                return Ok(());
             }
             if self.dep {
                 // Dep mode: the trailing expression's value *is* the
@@ -755,7 +740,12 @@ impl ModuleCtx<'_> {
         Ok(())
     }
 
-    fn emit_export(&mut self, lang: &Language, ast: &Ast, node: &AstNode) -> Result<(), CompileError> {
+    fn emit_export(
+        &mut self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+    ) -> Result<(), CompileError> {
         let Some(&child_idx) = children_of(node).first() else {
             return Err(CompileError::InvalidInput(
                 "export: missing declaration child".to_string(),
@@ -765,7 +755,15 @@ impl ModuleCtx<'_> {
             .get(AstRef::new(child_idx))
             .ok_or_else(|| CompileError::InvalidInput("export: child out of bounds".to_string()))?;
         if let Some((name, value_idx)) = self.binding_parts(lang, ast, child) {
-            return self.emit_binding(lang, ast, AstRef::new(child_idx), child, &name, value_idx, true);
+            return self.emit_binding(
+                lang,
+                ast,
+                AstRef::new(child_idx),
+                child,
+                &name,
+                value_idx,
+                true,
+            );
         }
         // `export name` / `export name: T` — re-export the bound name.
         let name = match child.kind.as_str() {
@@ -787,18 +785,13 @@ impl ModuleCtx<'_> {
                     // Inlined module: the name joins the export record —
                     // its bound value when one exists, `null` for a
                     // type-only export (`module_prep` parity).
-                    let expr = self
-                        .bound
-                        .get(&n)
-                        .map(bound_expr)
-                        .unwrap_or(JsAst::Null);
+                    let expr = self.bound.get(&n).map(bound_expr).unwrap_or(JsAst::Null);
                     self.exports.push((n, expr));
                     return Ok(());
                 }
                 let js = js_ident(&n);
                 self.bind(n, BoundRef::Arrow(js.clone()));
-                self.stmts
-                    .push(JsAst::ExportNames(vec![(js.clone(), js)]));
+                self.stmts.push(JsAst::ExportNames(vec![(js.clone(), js)]));
                 Ok(())
             }
             None => Err(CompileError::InvalidInput(
@@ -813,10 +806,7 @@ impl ModuleCtx<'_> {
     fn splice_exports(&mut self, spec: &str, exports: &[(String, JsAst)]) {
         for (name, _) in exports {
             let local = js_ident(name);
-            self.bind(
-                local,
-                BoundRef::DepArrow(rt_member_path(&[spec, name])),
-            );
+            self.bind(local, BoundRef::DepArrow(rt_member_path(&[spec, name])));
         }
     }
 
@@ -836,17 +826,13 @@ impl ModuleCtx<'_> {
             .get("path")
             .and_then(Value::as_str)
             .map(String::from)
-            .or_else(|| {
-                children_of(node)
-                    .first()
-                    .and_then(|&i| var_name_of(ast, i))
-            })
+            .or_else(|| children_of(node).first().and_then(|&i| var_name_of(ast, i)))
             .ok_or_else(|| CompileError::InvalidInput("import: missing path".to_string()))?;
         let alias = node
             .payload
             .get("alias")
             .and_then(Value::as_str)
-            .map(|a| js_ident(a));
+            .map(js_ident);
         let names = import_names(node);
         // `from "<spec>" export a, b` — a re-export. `import`/`export`
         // share the `stmt.import` node (the trailing keyword isn't in
@@ -876,46 +862,41 @@ impl ModuleCtx<'_> {
         // names as arrow-convention member paths — the imports become
         // real values instead of dead stubs. Prelude-owned specs
         // (`tag`) keep their shims.
-        if !PRELUDE_OWNED.contains(&spec.as_str()) {
-            if let Some(dep_path) = self.edges.get(&spec).cloned() {
-                let exports = g.ensure_module(lang, &spec, &dep_path)?;
-                if reexport {
-                    for (imported, _) in names.iter().filter(|(i, _)| i != "*") {
-                        let path = rt_member_path(&[&spec, imported]);
-                        self.bind(js_ident(imported), BoundRef::DepArrow(path.clone()));
-                        if self.dep {
-                            self.exports
-                                .push((imported.clone(), JsAst::Raw(path)));
-                        }
-                    }
-                    return Ok(());
-                }
-                if let Some(m) = &alias {
-                    self.bind(m.clone(), BoundRef::Ns(rt_member_path(&[&spec])));
-                }
-                let star =
-                    spec.ends_with('*') || names.iter().any(|(i, _)| i == "*");
-                if star {
-                    if alias.is_none() {
-                        self.splice_exports(&spec, &exports);
-                    }
-                } else {
-                    for (imported, local) in &names {
-                        self.bind(
-                            local.clone(),
-                            BoundRef::DepArrow(rt_member_path(&[&spec, imported])),
-                        );
-                    }
-                    // `import "spec"` — the splice form.
-                    if names.is_empty()
-                        && alias.is_none()
-                        && !text.trim_start().starts_with("from")
-                    {
-                        self.splice_exports(&spec, &exports);
+        if !PRELUDE_OWNED.contains(&spec.as_str())
+            && let Some(dep_path) = self.edges.get(&spec).cloned()
+        {
+            let exports = g.ensure_module(lang, &spec, &dep_path)?;
+            if reexport {
+                for (imported, _) in names.iter().filter(|(i, _)| i != "*") {
+                    let path = rt_member_path(&[&spec, imported]);
+                    self.bind(js_ident(imported), BoundRef::DepArrow(path.clone()));
+                    if self.dep {
+                        self.exports.push((imported.clone(), JsAst::Raw(path)));
                     }
                 }
                 return Ok(());
             }
+            if let Some(m) = &alias {
+                self.bind(m.clone(), BoundRef::Ns(rt_member_path(&[&spec])));
+            }
+            let star = spec.ends_with('*') || names.iter().any(|(i, _)| i == "*");
+            if star {
+                if alias.is_none() {
+                    self.splice_exports(&spec, &exports);
+                }
+            } else {
+                for (imported, local) in &names {
+                    self.bind(
+                        local.clone(),
+                        BoundRef::DepArrow(rt_member_path(&[&spec, imported])),
+                    );
+                }
+                // `import "spec"` — the splice form.
+                if names.is_empty() && alias.is_none() && !text.trim_start().starts_with("from") {
+                    self.splice_exports(&spec, &exports);
+                }
+            }
+            return Ok(());
         }
 
         if reexport {

@@ -3,8 +3,8 @@
 use handl_plugin_compile::{CompileError, Compiler, CompilerConfig, CompilerInput, CompilerOutput};
 
 use crate::config::JsConfig;
-use crate::emit::{JsEmitter, SecurityScanner};
 use crate::emit::source_map::{SourceMapBuilder, span_to_line_col};
+use crate::emit::{JsEmitter, SecurityScanner};
 use crate::lower;
 use crate::output::JsOutput;
 use crate::runtime::prelude::runtime_prelude;
@@ -28,15 +28,15 @@ impl Compiler for JsCompiler {
         // statements — walk them and emit `import`/`export`/`const`
         // declarations. Inputs without a real `Language` (tests' synthetic
         // `CompilerInput`s) fall through to the single-term path.
-        if js_config.format.name() == "esm" {
-            if let Some(stmts) = crate::module::try_compile_module(input, js_config)? {
-                let emitter = JsEmitter;
-                let body = emitter.emit_module(&stmts)?;
-                SecurityScanner::new().scan(&body)?;
-                let prelude = runtime_prelude(js_config.format.as_ref());
-                let full = format!("{prelude}{body}");
-                return Ok(Box::new(JsOutput::new(full)));
-            }
+        if js_config.format.name() == "esm"
+            && let Some(stmts) = crate::module::try_compile_module(input, js_config)?
+        {
+            let emitter = JsEmitter;
+            let body = emitter.emit_module(&stmts)?;
+            SecurityScanner::new().scan(&body)?;
+            let prelude = runtime_prelude(js_config.format.as_ref());
+            let full = format!("{prelude}{body}");
+            return Ok(Box::new(JsOutput::new(full)));
         }
 
         let main = lower::with_config(js_config, || lower::lower(&input.term))?;

@@ -51,12 +51,12 @@ fn const_int() {
 fn const_float() {
     let js = compile_to_string(
         &input(Term::constant(Value::Number(
-            Number::from_f64(3.14).unwrap(),
+            Number::from_f64(1.25).unwrap(),
         ))),
         &JsConfig::esm_deno(),
     )
     .unwrap();
-    assert!(js.contains("export default 3.14;"), "{js}");
+    assert!(js.contains("export default 1.25;"), "{js}");
 }
 
 #[test]
@@ -539,14 +539,11 @@ fn fuzz_random_terms_compile() {
     let mut rng = rand::rng();
     for _ in 0..50 {
         let term = random_term(&mut rng, 3);
-        match compile_to_string(&input(term), &JsConfig::esm_deno()) {
-            Ok(js) => {
-                assert!(!js.is_empty());
-                assert!(!js.contains("eval("), "{js}");
-                assert!(!js.contains("new Function("), "{js}");
-                assert!(!js.contains("Function("), "{js}");
-            }
-            Err(_) => {}
+        if let Ok(js) = compile_to_string(&input(term), &JsConfig::esm_deno()) {
+            assert!(!js.is_empty());
+            assert!(!js.contains("eval("), "{js}");
+            assert!(!js.contains("new Function("), "{js}");
+            assert!(!js.contains("Function("), "{js}");
         }
     }
 }
@@ -705,13 +702,16 @@ fn module_resolved_deps_inline_into_handl_rt_namespaces() {
         &config,
     )
     .unwrap();
-    assert!(js.contains("const __mod_dep_0 = (await (async () => {"), "{js}");
-    assert!(js.contains(r#"return {"f": f, "g": g};"#), "{js}");
-    assert!(js.contains(r#"__handl_rt["dep-pkg"] = __mod_dep_0;"#), "{js}");
     assert!(
-        js.contains(r#"await __handl_rt["dep-pkg"].f("#),
+        js.contains("const __mod_dep_0 = (await (async () => {"),
         "{js}"
     );
+    assert!(js.contains(r#"return {"f": f, "g": g};"#), "{js}");
+    assert!(
+        js.contains(r#"__handl_rt["dep-pkg"] = __mod_dep_0;"#),
+        "{js}"
+    );
+    assert!(js.contains(r#"await __handl_rt["dep-pkg"].f("#), "{js}");
     // No dead ES import or stub-member reference is emitted for it.
     assert!(!js.contains("import { f } from"), "{js}");
 }
@@ -746,11 +746,11 @@ fn module_dep_transitive_imports_and_no_export_fallback() {
     let dep = js.find("const __mod_dep").expect("{js}");
     assert!(inner < dep, "{js}");
     assert!(js.contains(r#"return {"base": base};"#), "{js}");
-    assert!(js.contains(r#"__handl_rt["./inner"] = __mod_inner_0;"#), "{js}");
     assert!(
-        js.contains(r#"await __handl_rt["./inner"].base("#),
+        js.contains(r#"__handl_rt["./inner"] = __mod_inner_0;"#),
         "{js}"
     );
+    assert!(js.contains(r#"await __handl_rt["./inner"].base("#), "{js}");
 }
 
 #[test]
