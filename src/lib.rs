@@ -12,7 +12,7 @@ pub mod output;
 pub mod runtime;
 pub mod security;
 
-pub use compiler::{JsCompiler, compile_to_string};
+pub use compiler::{JS_IR_KIND, JsCompiler, JsIr, compile_to_string};
 pub use config::{
     Browser, Bun, CommonJs, DEFAULT_LOOP_MAX_ITERATIONS, Deno, Esm, Iife, Inline, JsConfig,
     JsModule, JsOutputFormat, JsTarget, Node, OpLowering,

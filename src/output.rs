@@ -20,6 +20,16 @@ impl JsOutput {
         }
     }
 
+    /// Create a JS output from pre-rendered artifacts (`main.js`, plus
+    /// `main.js.map` when `source_map` is on) — the shape the codegen
+    /// kernel's `Emitter` path produces as a `Change` set.
+    pub(crate) fn from_artifacts(artifacts: Vec<Artifact>) -> Self {
+        Self {
+            target: "js".to_string(),
+            artifacts,
+        }
+    }
+
     /// Create a JS output with both `main.js` and a `.map` artifact.
     pub fn new_with_source_map(
         js: impl Into<String>,
