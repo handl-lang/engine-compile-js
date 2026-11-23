@@ -6,8 +6,8 @@ use serde_json::Value;
 
 use super::lower_applied as lower_sub;
 use super::{
-    BoundRef, JsAst, JsBinOp, JsUnaryOp, allow_inlining, lower_value, module_bound, op_lowering,
-    unsafe_inline_foreign,
+    BoundRef, JsAst, JsBinOp, JsUnaryOp, allow_inlining, dispatch_all_ops, lower_value,
+    module_bound, op_lowering, unsafe_inline_foreign,
 };
 use crate::config::OpLowering;
 
@@ -49,11 +49,63 @@ pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
             args,
             source,
             lit,
+            dim,
             ..
-        } => lower_op(name, args, source.clone(), lit.as_ref()),
+        } => lower_op(
+            name,
+            args,
+            source.clone(),
+            lit.as_ref(),
+            dim_label(dim).as_deref(),
+        ),
         _ => Err(CompileError::Lower(format!(
             "primitive lowerer received non-primitive term: {term:?}"
         ))),
+    }
+}
+
+/// The op's named-dimension label for handler dispatch — `dim.dim_label()`
+/// covers the literal `Const "S"`/`Arr "S"` forms; compound dim terms
+/// (which eval would evaluate to a label) resolve to `None` here, the
+/// "unnamed dimension — every handler eligible" case.
+fn dim_label(dim: &Term) -> Option<String> {
+    dim.dim_label()
+}
+
+/// Op names eligible for `JsConfig::dispatch_all_ops` routing through
+/// `__handl_rt.dispatch`: pure functions of their evaluated argument
+/// terms — no `lit` payload, no incoming-value read. Everything else
+/// (lit-carrying ops, `param`-reading ops, data constructors) keeps its
+/// dedicated emit even under the flag.
+const DISPATCHABLE_OPS: &[&str] = &[
+    "add", "sub", "mul", "div", "mod", "neg", "not", "lt", "lte", "gt", "gte", "eq", "neq", "and",
+    "or", "pow", "concat",
+];
+
+/// `__handl_rt.dispatch("name", [args], dim, incoming)` — eval's
+/// `dispatch_op` fallback for `Native` ops: covering handler impls
+/// (grades-filtered stack scan, then the incoming value's own `impls`)
+/// apply first; uncovered ops fall back to the `__handl_rt.<name>`
+/// member, then "unsupported op".
+fn dispatch_call(
+    name: &str,
+    lowered_args: Vec<JsAst>,
+    dim_label: Option<&str>,
+    incoming: &JsAst,
+) -> JsAst {
+    JsAst::Call {
+        callee: Box::new(JsAst::Member {
+            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+            prop: "dispatch".to_string(),
+        }),
+        args: vec![
+            JsAst::Str(name.to_string()),
+            JsAst::Array(lowered_args),
+            dim_label
+                .map(|d| JsAst::Str(d.to_string()))
+                .unwrap_or(JsAst::Null),
+            incoming.clone(),
+        ],
     }
 }
 
@@ -151,12 +203,14 @@ pub fn lower_applied(term: &Term, _input: &JsAst) -> Result<JsAst, CompileError>
             args,
             source,
             lit,
+            dim,
             ..
         } => Ok(JsAst::Await(Box::new(lower_op_body(
             name,
             args,
             source.clone(),
             lit.as_ref(),
+            dim_label(dim).as_deref(),
             _input,
         )?))),
         Term::Seq { axis, fst, snd } => {
@@ -227,9 +281,10 @@ fn lower_op(
     args: &[Term],
     source: ArrSource,
     lit: Option<&Value>,
+    dim_label: Option<&str>,
 ) -> Result<JsAst, CompileError> {
     let param = JsAst::Ident(INPUT_NAME.to_string());
-    let body = lower_op_body(name, args, source, lit, &param)?;
+    let body = lower_op_body(name, args, source, lit, dim_label, &param)?;
     Ok(JsAst::ArrowFn {
         params: vec![INPUT_NAME.to_string()],
         body: Box::new(body),
@@ -238,12 +293,15 @@ fn lower_op(
 
 /// The body of an `Op` arrow evaluated against the incoming value
 /// `param` — `lower_op` wraps it in `async __in => …`; `lower_applied`
-/// passes the concrete input expression instead.
+/// passes the concrete input expression instead. `dim_label` is the
+/// op's named-dimension label (`Term::Op::dim` resolved to a literal
+/// string) forwarded to handler dispatch for `grades` coverage.
 fn lower_op_body(
     name: &str,
     args: &[Term],
     source: ArrSource,
     lit: Option<&Value>,
+    dim_label: Option<&str>,
     param: &JsAst,
 ) -> Result<JsAst, CompileError> {
     // `await` is the `js.await` promise bridge (`handl-packages/js`): it
@@ -264,7 +322,7 @@ fn lower_op_body(
     if let Some(bound) = module_bound(name)
         && (args.is_empty() || !BUILTIN_OPS.contains(&name))
     {
-        return lower_bound_op_body(&bound, args, source, lit, param);
+        return lower_bound_op_body(&bound, args, source, lit, dim_label, param);
     }
 
     if let ArrSource::Foreign(module) = &source {
@@ -284,7 +342,26 @@ fn lower_op_body(
                  (effect operations have no runtime semantics here)"
             )));
         }
-        return lower_foreign_op_body(name, args, module, lit, param);
+        return lower_foreign_op_body(name, args, module, lit, dim_label, param);
+    }
+
+    // `JsConfig::dispatch_all_ops`: route the pure arg-op family —
+    // the scalar operators plus `eq`/`neq`/`and`/`or`/`pow`/`concat` —
+    // through `__handl_rt.dispatch` so covering `handle` frames can
+    // intercept them (eval's `dispatch_op` consults handlers for
+    // *every* `Native` op before `apply_native`). Ops that read the
+    // incoming value (`id`, `elem`, `field_access`, …) or carry `lit`
+    // payloads (`record`, `json`, `proj_env`, …) keep their dedicated
+    // emit — the dispatch fallback cannot reproduce lit/incoming
+    // semantics, so even under the flag those ops bypass handlers
+    // (documented residual gap).
+    if dispatch_all_ops() && matches!(source, ArrSource::Native) && DISPATCHABLE_OPS.contains(&name)
+    {
+        let lowered_args: Vec<JsAst> = args
+            .iter()
+            .map(|a| lower_sub(a, param))
+            .collect::<Result<_, _>>()?;
+        return Ok(dispatch_call(name, lowered_args, dim_label, param));
     }
 
     let binop = |op: JsBinOp| -> Result<JsAst, CompileError> {
@@ -604,14 +681,9 @@ fn lower_op_body(
                     // uncovered ops fall back to the `__handl_rt.<name>`
                     // member inside `dispatch`, then "unsupported op".
                     // `args` evaluates once into the array `dispatch`
-                    // unpacks.
-                    JsAst::Call {
-                        callee: Box::new(JsAst::Member {
-                            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                            prop: "dispatch".to_string(),
-                        }),
-                        args: vec![JsAst::Str(name.to_string()), JsAst::Array(lowered_args)],
-                    }
+                    // unpacks; `param` is the incoming value for the
+                    // second (`impls`-field) handler channel.
+                    dispatch_call(name, lowered_args, dim_label, param)
                 } else {
                     JsAst::Call {
                         callee: Box::new(JsAst::Member {
@@ -635,10 +707,11 @@ fn lower_bound_op_body(
     args: &[Term],
     source: ArrSource,
     lit: Option<&Value>,
+    dim_label: Option<&str>,
     param: &JsAst,
 ) -> Result<JsAst, CompileError> {
     if let BoundRef::Op(real) = bound {
-        return lower_op_body(real, args, source, lit, param);
+        return lower_op_body(real, args, source, lit, dim_label, param);
     }
     let applied = args
         .iter()
@@ -810,6 +883,7 @@ fn lower_foreign_op_body(
     args: &[Term],
     module: &str,
     lit: Option<&Value>,
+    dim_label: Option<&str>,
     param: &JsAst,
 ) -> Result<JsAst, CompileError> {
     let lowered_args: Vec<JsAst> = args
@@ -817,62 +891,54 @@ fn lower_foreign_op_body(
         .map(|a| lower_sub(a, param))
         .collect::<Result<_, _>>()?;
 
-    if !allow_inlining() {
-        return emit_js_call(module, name, &lowered_args, lit);
-    }
-
+    // Eval's `dispatch_op` covers `Foreign` sources too — the op `name`
+    // is the handler-routing key. Route every foreign call through
+    // `__handl_rt.dispatchForeign`, whose uncovered fallback is exactly
+    // the call this function used to emit directly (`inline` selects
+    // `globalThis[module][name]`, otherwise `jsCall`).
+    let (descriptors, inline) = if !allow_inlining() {
+        (foreign_descriptors(lit)?, false)
     // Experimental escape hatch (`JsConfig::unsafe_inline_foreign`):
     // skip the descriptor safety verdict — every foreign op inlines to
     // `globalThis[module][name](...)`. `no_inline_foreign` still wins
     // (checked above).
-    if unsafe_inline_foreign() {
-        return Ok(inline_foreign_call(module, name, lowered_args));
-    }
-
-    if let Some(lit) = lit {
+    } else if unsafe_inline_foreign() {
+        (Value::Null, true)
+    } else if let Some(lit) = lit {
         let desc = crate::security::validate_foreign_descriptor(lit)?;
         if crate::security::is_safe_for_inlining(&desc) {
-            return Ok(inline_foreign_call(module, name, lowered_args));
+            (Value::Null, true)
+        } else {
+            (desc.to_json(), false)
         }
-    }
-
-    emit_js_call(module, name, &lowered_args, lit)
-}
-
-fn inline_foreign_call(module: &str, name: &str, args: Vec<JsAst>) -> JsAst {
-    JsAst::Call {
-        callee: Box::new(JsAst::Index {
-            obj: Box::new(JsAst::Index {
-                obj: Box::new(JsAst::Ident("globalThis".to_string())),
-                key: Box::new(JsAst::Str(module.to_string())),
-            }),
-            key: Box::new(JsAst::Str(name.to_string())),
-        }),
-        args,
-    }
-}
-
-fn emit_js_call(
-    module: &str,
-    name: &str,
-    args: &[JsAst],
-    maybe_desc: Option<&Value>,
-) -> Result<JsAst, CompileError> {
-    let descriptors = match maybe_desc {
-        Some(v) => crate::security::validate_foreign_descriptor(v)?.to_json(),
-        None => Value::Null,
+    } else {
+        (Value::Null, false)
     };
     let raw = serde_json::to_string(&descriptors).map_err(|e| CompileError::Emit(e.to_string()))?;
     Ok(JsAst::Call {
         callee: Box::new(JsAst::Member {
             obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-            prop: "jsCall".to_string(),
+            prop: "dispatchForeign".to_string(),
         }),
         args: vec![
-            JsAst::Str(module.to_string()),
             JsAst::Str(name.to_string()),
-            JsAst::Array(args.to_vec()),
+            JsAst::Array(lowered_args),
+            dim_label
+                .map(|d| JsAst::Str(d.to_string()))
+                .unwrap_or(JsAst::Null),
+            param.clone(),
+            JsAst::Str(module.to_string()),
             JsAst::Raw(raw),
+            JsAst::Bool(inline),
         ],
     })
+}
+
+/// The validated foreign descriptor as JSON (`null` when absent) — the
+/// `descriptors` argument `jsCall`/`dispatchForeign` carry.
+fn foreign_descriptors(lit: Option<&Value>) -> Result<Value, CompileError> {
+    match lit {
+        Some(v) => Ok(crate::security::validate_foreign_descriptor(v)?.to_json()),
+        None => Ok(Value::Null),
+    }
 }

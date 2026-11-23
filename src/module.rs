@@ -1512,6 +1512,7 @@ impl ModuleCtx<'_> {
         // `from "<spec>" …` carries `payload.path` (payload_extract);
         // bare `import "<spec>"` keeps the spec as its string child (the
         // `import` prefix rule has no extract step).
+        let names = import_names(node);
         let spec = node
             .payload
             .get("path")
@@ -1524,7 +1525,41 @@ impl ModuleCtx<'_> {
             .get("alias")
             .and_then(Value::as_str)
             .map(js_ident);
-        let names = import_names(node);
+        // `payload.alias` is context-dependent — eval's `import` op
+        // (`native_ops`) reads it differently per `names` shape:
+        //
+        // - braced `names` array (`{ a, b as x }`): `alias` is dead
+        //   payload — eval's array branch never reads it, so `as m`
+        //   after a list binds nothing here either;
+        // - `import * as m` (or a names-less import): `alias` is the
+        //   *namespace* binding — `m` sees the whole module record;
+        // - `from "s" import name as local` (single non-`*` name):
+        //   `alias` is the *local rename* — eval binds only `local` →
+        //   the `name` export and leaves `name` itself unbound.
+        let names_is_list = matches!(node.payload.get("names"), Some(Value::Array(_)));
+        let single_import = match names.as_slice() {
+            [(imported, _)] if !names_is_list && imported != "*" => Some(imported.clone()),
+            _ => None,
+        };
+        let renamed = if single_import.is_some() {
+            alias.clone()
+        } else {
+            None
+        };
+        let ns_alias = if names_is_list || renamed.is_some() {
+            None
+        } else {
+            alias.clone()
+        };
+        // The local name a `(imported, local)` pair binds: the `as`
+        // rename when this is the single-name form, else the pair's
+        // own local (already `js_ident`ed by `import_names`).
+        let local_of = |imported: &str, local: &str| -> String {
+            match (&renamed, &single_import) {
+                (Some(a), Some(s)) if s == imported => a.clone(),
+                _ => local.to_string(),
+            }
+        };
         // `from "<spec>" export a, b` — a re-export. `import`/`export`
         // share the `stmt.import` node (the trailing keyword isn't in
         // the payload), so the tail is read from the statement text —
@@ -1535,14 +1570,14 @@ impl ModuleCtx<'_> {
         // `await` op — never inlined (its file is decl-only) even when a
         // dep table resolves `js` to a path.
         if spec == JS_PACKAGE {
-            for (imported, local) in &names {
+            for (imported, local) in names.iter().filter(|(i, _)| i != "*") {
                 let bound = match imported.as_str() {
                     "await" => BoundRef::Op("await".to_string()),
                     other => BoundRef::Shim(other.to_string()),
                 };
-                self.bind(local.clone(), bound);
+                self.bind(local_of(imported, local), bound);
             }
-            if let Some(m) = &alias {
+            if let Some(m) = &ns_alias {
                 self.bind(m.clone(), BoundRef::Member("__handl_rt".to_string()));
             }
             return Ok(());
@@ -1567,23 +1602,24 @@ impl ModuleCtx<'_> {
                 }
                 return Ok(());
             }
-            if let Some(m) = &alias {
+            if let Some(m) = &ns_alias {
                 self.bind(m.clone(), BoundRef::Ns(rt_member_path(&[&spec])));
             }
             let star = spec.ends_with('*') || names.iter().any(|(i, _)| i == "*");
             if star {
-                if alias.is_none() {
+                if ns_alias.is_none() {
                     self.splice_exports(&spec, &exports);
                 }
             } else {
                 for (imported, local) in &names {
                     self.bind(
-                        local.clone(),
+                        local_of(imported, local),
                         BoundRef::DepArrow(rt_member_path(&[&spec, imported])),
                     );
                 }
                 // `import "spec"` — the splice form.
-                if names.is_empty() && alias.is_none() && !text.trim_start().starts_with("from") {
+                if names.is_empty() && ns_alias.is_none() && !text.trim_start().starts_with("from")
+                {
                     self.splice_exports(&spec, &exports);
                 }
             }
@@ -1607,13 +1643,13 @@ impl ModuleCtx<'_> {
             // Host module (no backing file): names bind `__handl_rt`
             // member paths — prelude shims when present, dead members
             // otherwise.
-            for (imported, local) in &names {
+            for (imported, local) in names.iter().filter(|(i, _)| i != "*") {
                 self.bind(
-                    local.clone(),
+                    local_of(imported, local),
                     BoundRef::Member(rt_member_path(&[&spec, imported])),
                 );
             }
-            if let Some(m) = &alias {
+            if let Some(m) = &ns_alias {
                 self.bind(m.clone(), BoundRef::Member(rt_member_path(&[&spec])));
             }
             return Ok(());
@@ -1623,13 +1659,13 @@ impl ModuleCtx<'_> {
             // An unresolved path spec inside an inlined module cannot
             // emit an ES `import` (illegal inside the dep's IIFE) — the
             // names keep member-path stub semantics.
-            for (imported, local) in &names {
+            for (imported, local) in names.iter().filter(|(i, _)| i != "*") {
                 self.bind(
-                    local.clone(),
+                    local_of(imported, local),
                     BoundRef::Member(rt_member_path(&[&spec, imported])),
                 );
             }
-            if let Some(m) = &alias {
+            if let Some(m) = &ns_alias {
                 self.bind(m.clone(), BoundRef::Member(rt_member_path(&[&spec])));
             }
             return Ok(());
@@ -1638,7 +1674,7 @@ impl ModuleCtx<'_> {
         // Path specifier → a real ES import (emitted verbatim; specifier
         // resolution is the embedder's concern).
         if spec.ends_with("*") || names.iter().any(|(i, _)| i == "*") {
-            let ns = alias.clone().unwrap_or_else(|| "module".to_string());
+            let ns = ns_alias.clone().unwrap_or_else(|| "module".to_string());
             self.bind(ns.clone(), BoundRef::Ident(ns.clone()));
             self.stmts.push(JsAst::Import {
                 spec,
@@ -1649,7 +1685,8 @@ impl ModuleCtx<'_> {
         }
         let named = names
             .iter()
-            .map(|(imported, local)| (imported.clone(), local.clone()))
+            .filter(|(imported, _)| imported != "*")
+            .map(|(imported, local)| (imported.clone(), local_of(imported, local)))
             .collect::<Vec<_>>();
         for (_, local) in &named {
             self.bind(local.clone(), BoundRef::Arrow(local.clone()));

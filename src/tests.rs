@@ -291,6 +291,7 @@ fn iife_wrapping() {
         loop_max_iterations: crate::DEFAULT_LOOP_MAX_ITERATIONS,
         security_scan: true,
         unsafe_inline_foreign: false,
+        dispatch_all_ops: false,
     };
     let js = compile_to_string(
         &input(Term::const_value(Value::Number(Number::from(42)))),
@@ -317,6 +318,7 @@ fn inline_format() {
         loop_max_iterations: crate::DEFAULT_LOOP_MAX_ITERATIONS,
         security_scan: true,
         unsafe_inline_foreign: false,
+        dispatch_all_ops: false,
     };
     let js = compile_to_string(
         &input(Term::const_value(Value::Number(Number::from(42)))),
@@ -389,9 +391,13 @@ fn safe_foreign_descriptor_validates_and_inlines() {
         attrs: None,
     };
     let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
-    assert!(js.contains(r#"globalThis["math"]"#), "{js}");
-    assert!(js.contains(r#"["add"]"#), "{js}");
-    assert!(!js.contains("__handl_rt.jsCall"), "{js}");
+    // Foreign ops route through `dispatchForeign` (T-008: handler
+    // interception parity) — a safe descriptor selects the `inline`
+    // flag, whose uncovered fallback is the prelude's
+    // `globalThis[module][name](...)` call.
+    assert!(js.contains(r#"__handl_rt.dispatchForeign("add""#), "{js}");
+    assert!(js.contains(r#""math", null, true)"#), "{js}");
+    assert!(js.contains("globalThis[module][name]"), "{js}");
 }
 
 #[test]
@@ -406,7 +412,7 @@ fn unsafe_foreign_descriptor_rejected_by_validation() {
 }
 
 #[test]
-fn no_inline_foreign_emits_runtime_js_call() {
+fn no_inline_foreign_emits_dispatch_foreign_fallback() {
     let desc = json!({
         "module": "math",
         "name": "add",
@@ -427,7 +433,12 @@ fn no_inline_foreign_emits_runtime_js_call() {
         attrs: None,
     };
     let js = compile_to_string(&input(term), &config).unwrap();
-    assert!(js.contains("__handl_rt.jsCall"), "{js}");
+    // `dispatchForeign` carries the validated descriptor JSON and the
+    // `inline = false` flag — its uncovered fallback is `jsCall`.
+    assert!(js.contains(r#"__handl_rt.dispatchForeign("add""#), "{js}");
+    assert!(js.contains(r#""math", {"#), "{js}");
+    assert!(js.contains(r#""module":"math""#), "{js}");
+    assert!(js.contains(", false)"), "{js}");
 }
 
 #[test]
@@ -923,6 +934,7 @@ fn worker_entry_iife_emits_classic_worker_script() {
         loop_max_iterations: crate::DEFAULT_LOOP_MAX_ITERATIONS,
         security_scan: true,
         unsafe_inline_foreign: false,
+        dispatch_all_ops: false,
     };
     config.modules = vec![crate::JsModule {
         path: "/pkgs/dep/dep.hnl".to_string(),
@@ -1137,6 +1149,7 @@ fn iife_browser() -> JsConfig {
         loop_max_iterations: crate::DEFAULT_LOOP_MAX_ITERATIONS,
         security_scan: true,
         unsafe_inline_foreign: false,
+        dispatch_all_ops: false,
     }
 }
 
@@ -1155,6 +1168,7 @@ fn inline_browser() -> JsConfig {
         loop_max_iterations: crate::DEFAULT_LOOP_MAX_ITERATIONS,
         security_scan: true,
         unsafe_inline_foreign: false,
+        dispatch_all_ops: false,
     }
 }
 
@@ -1593,17 +1607,173 @@ fn unsafe_inline_foreign_bypasses_safety_check() {
     };
 
     let js = compile_to_string(&input(foreign_term()), &JsConfig::esm_deno()).unwrap();
-    assert!(js.contains("__handl_rt.jsCall"), "{js}");
-    assert!(!js.contains(r#"globalThis["my lib"]"#), "{js}");
+    // Unsafe descriptor → `dispatchForeign` with `inline = false`
+    // (the `jsCall` fallback) and the descriptor JSON carried through.
+    assert!(js.contains(r#"__handl_rt.dispatchForeign("run""#), "{js}");
+    assert!(js.contains(r#""my lib", {"#), "{js}");
+    assert!(js.contains(r#""module":"my lib""#), "{js}");
+    assert!(js.contains(", false)"), "{js}");
+    assert!(!js.contains(r#""my lib", null, true"#), "{js}");
 
     let mut config = JsConfig::esm_deno();
     config.unsafe_inline_foreign = true;
     let js = compile_to_string(&input(foreign_term()), &config).unwrap();
-    assert!(js.contains(r#"globalThis["my lib"]["run"]"#), "{js}");
-    assert!(!js.contains("__handl_rt.jsCall"), "{js}");
+    // `unsafe_inline_foreign` selects `inline = true` (`null`
+    // descriptors) — the prelude's `globalThis[module][name]` call.
+    assert!(js.contains(r#""my lib", null, true)"#), "{js}");
+    assert!(js.contains("globalThis[module][name]"), "{js}");
 
     // `no_inline_foreign` still wins when both flags are set.
     config.no_inline_foreign = true;
     let js = compile_to_string(&input(foreign_term()), &config).unwrap();
-    assert!(js.contains("__handl_rt.jsCall"), "{js}");
+    assert!(js.contains(r#"__handl_rt.dispatchForeign("run""#), "{js}");
+    assert!(js.contains(r#""my lib", {"#), "{js}");
+    assert!(js.contains(", false)"), "{js}");
+    assert!(!js.contains(r#""my lib", null, true"#), "{js}");
+}
+
+// ---------------------------------------------------------------------------
+// T-018: `import.alias` — `{ orig as alias }`, `name as local`, `* as ns`.
+// The parser leaves `import.alias` pair nodes as arena residue before
+// `stmt.import`; only the normalized `payload.names`/`payload.alias`
+// drive the binds below.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn module_js_package_braced_aliases_bind_shims() {
+    // The T-018 repro: `from "js" import { on as js_on, call as js_call }`
+    // — each alias binds the same `__handl_rt` shim the original name
+    // would (`on` → event trampoline, `call` → host call).
+    let js = compile_to_string(
+        &module_input(
+            "from \"js\" import { on as js_on, call as js_call }\nexport run := (t, h) ~> do {\n  l := js_on(t, \"ping\", h)\n  js_call(\"console\", \"log\", [l], [], \"js_object\", false)\n}\n",
+        ),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("__handl_rt.on("), "{js}");
+    assert!(js.contains("__handl_rt.call("), "{js}");
+    // No ES import is emitted for the `js` contract package.
+    assert!(!js.contains("from \"js\""), "{js}");
+}
+
+#[test]
+fn module_js_package_single_name_and_namespace_aliases() {
+    // `from "s" import name as local` — `payload.names` is the bare
+    // string and `payload.alias` is the local rename; `await` still
+    // binds the real await op under the alias.
+    let js = compile_to_string(
+        &module_input(
+            "from \"js\" import on as js_on\nfrom \"js\" import await as js_await\nexport run := (p) ~> js_await(js_on(\"self\", \"x\", p))\n",
+        ),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("__handl_rt.on("), "{js}");
+    assert!(js.contains("(await "), "{js}");
+
+    // `from "js" import * as jsm` — the namespace alias binds the whole
+    // `__handl_rt` contract object; `jsm.on` member-calls resolve to
+    // the same shim.
+    let js = compile_to_string(
+        &module_input(
+            "from \"js\" import * as jsm\nexport run := (t, h) ~> jsm.on(t, \"ping\", h)\n",
+        ),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    // `jsm` binds the `__handl_rt` contract object; the member access
+    // emits the bracket-path call into the same `on` shim.
+    assert!(js.contains("__handl_rt[\"on\"]"), "{js}");
+}
+
+#[test]
+fn module_dep_and_external_aliases() {
+    // A resolved `.hnl` dep: `{ f as g }` binds `g` to the dep's `f`
+    // member path — alias changes only the local name.
+    let mut config = JsConfig::esm_deno();
+    config.modules = vec![crate::JsModule {
+        path: "/pkgs/dep/dep.hnl".to_string(),
+        source: "export f := (x) ~> x + 1\n".to_string(),
+        imports: Vec::new(),
+    }];
+    config.entry_imports = vec![("dep".to_string(), "/pkgs/dep/dep.hnl".to_string())];
+    let js = compile_to_string(
+        &module_input(
+            "from \"dep\" import { f as g }\nfrom \"node:path\" import { join as j }\nexport run := (x) ~> j(g(x))\n",
+        ),
+        &config,
+    )
+    .unwrap();
+    assert!(
+        js.contains(r#"__handl_rt.__apply(__handl_rt.dep.f"#),
+        "{js}"
+    );
+    // Unresolved path specifier → real ES import with `orig as alias`.
+    assert!(
+        js.contains(r#"import { join as j } from "node:path";"#),
+        "{js}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-008: effect-parity remainder — `dispatch_all_ops`, dim-label
+// threading, and the `dispatchForeign` routing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dispatch_all_ops_routes_scalar_ops_through_dispatch() {
+    // Default (`dispatch_all_ops = false`): `add` keeps its dedicated
+    // emit — documented divergence from eval's `dispatch_op`, which
+    // consults handlers for every `Native` op.
+    let term = || {
+        Term::op_native(
+            "add",
+            vec![
+                Term::const_value(Value::Number(Number::from(1))),
+                Term::const_value(Value::Number(Number::from(2))),
+            ],
+        )
+    };
+    let js = compile_to_string(&input(term()), &JsConfig::esm_deno()).unwrap();
+    assert!(!js.contains(r#"dispatch("add""#), "{js}");
+
+    // The flag routes the pure arg-op family through `dispatch` so a
+    // covering `handle` frame can intercept it.
+    let mut config = JsConfig::esm_deno();
+    config.dispatch_all_ops = true;
+    let js = compile_to_string(&input(term()), &config).unwrap();
+    assert!(js.contains(r#"__handl_rt.dispatch("add""#), "{js}");
+}
+
+#[test]
+fn op_dim_label_reaches_handler_dispatch() {
+    // A literal-string dim (`Const "S"`/`Arr "S"` — the `~[S]~>` grade
+    // surface) is forwarded to `dispatch`/`dispatchForeign` as the
+    // `grades`-coverage label; the incoming value rides along as the
+    // second handler channel.
+    let named = Term::op_native_dim(
+        "mystery",
+        Term::constant(Value::String("S".to_string())),
+        vec![Term::const_value(Value::Number(Number::from(1)))],
+    );
+    let js = compile_to_string(&input(named), &JsConfig::esm_deno()).unwrap();
+    assert!(
+        js.contains(r#"__handl_rt.dispatch("mystery", [1], "S", __in)"#),
+        "{js}"
+    );
+
+    let foreign = Term::Op {
+        dim: Box::new(Term::constant(Value::String("net".to_string()))),
+        name: "fetch".to_string(),
+        args: vec![],
+        source: ArrSource::Foreign("http".to_string()),
+        lit: None,
+        attrs: None,
+    };
+    let js = compile_to_string(&input(foreign), &JsConfig::esm_deno()).unwrap();
+    assert!(
+        js.contains(r#"dispatchForeign("fetch", [], "net", __in, "http", null, false)"#),
+        "{js}"
+    );
 }

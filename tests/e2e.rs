@@ -1348,3 +1348,87 @@ fn e2e_fuzz_arithmetic_record_pipelines_match_eval() {
         assert_eq!(run.stdout.trim(), expected, "case {case} ({source})");
     }
 }
+
+// ---------------------------------------------------------------------------
+// T-018: `import.alias` end-to-end — aliased `js` contract imports and a
+// `* as` namespace binding executed under real `node`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_import_alias_js_contract_and_namespace() {
+    require_node!();
+    // The original T-018 repro shape plus the single-name and namespace
+    // alias forms: `{ on as js_on, call as js_call, await as js_await }`,
+    // `* as jsm`. Every alias binds the same `__handl_rt` shim/await op
+    // the original name would.
+    let run = run_program(
+        "import-alias",
+        r#"
+from "js" import { on as js_on, call as js_call, await as js_await }
+from "js" import * as jsm
+et := jsm.construct("", "EventTarget", [], [], "js_object", false)
+ev := jsm.construct("", "Event", ["ping"], [], "js_object", false)
+h := js_on(et, "ping", (e) ~> js_await(js_call("console", "log", ["aliased-ping"], [], "js_object", false)))
+jsm.invoke(et, "dispatchEvent", [ev], [], "js_object", false)
+jsm.off(et, "ping", h)
+"done"
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert!(run.stdout.contains("aliased-ping"), "{}", run.stdout);
+    assert_eq!(run.stdout.trim().lines().last().unwrap(), "\"done\"");
+}
+
+// ---------------------------------------------------------------------------
+// T-008: effect-parity remainder — `dispatchForeign` interception,
+// `grades` coverage, and the incoming-value handler channel, exercised
+// against the runtime directly (compiled `.hnl` cannot spell `Foreign`
+// ops; the runtime member is the honest surface for host/driver JS).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_dispatch_foreign_interception_grades_and_incoming() {
+    require_node!();
+    let run = run_program(
+        "dispatch-foreign",
+        "x := 1\n",
+        r#"
+await import("./prog.mjs");
+const rt = globalThis.__handl_rt;
+globalThis.__probe_mod = { ping: async (n) => n * 10 };
+// Covered foreign op: the `handle` frame's impl intercepts before the
+// host fallback (`globalThis[module][name]`).
+const covered = await rt.handle(
+  async () => rt.dispatchForeign("ping", [4], null, null, "__probe_mod", null, true),
+  "T", async () => ({ ping: async (a) => a + 1 }), null);
+console.log("covered:" + covered);
+// Uncovered foreign op falls back to the inline host call.
+const bare = await rt.dispatchForeign("ping", [4], null, null, "__probe_mod", null, true);
+console.log("bare:" + bare);
+// `grades` coverage: the handler declares grades ["S"] — a "T"-dimmed
+// dispatch skips it (host fallback), an "S"-dimmed one intercepts.
+const graded = await rt.handle(
+  async () => ({
+    s: await rt.dispatchForeign("ping", [2], "S", null, "__probe_mod", null, true),
+    t: await rt.dispatchForeign("ping", [2], "T", null, "__probe_mod", null, true),
+  }),
+  "T", async () => ({ grades: ["S"], ping: async (a) => a + 100 }), null);
+console.log("graded:" + JSON.stringify(graded));
+// The incoming value's own `impls` is the second handler channel —
+// consulted after the whole stack, with no grades constraint.
+const viaIncoming = await rt.dispatchForeign(
+  "ping", [2], null, { impls: { ping: async (a) => a + 1000 } },
+  "__probe_mod", null, true);
+console.log("incoming:" + viaIncoming);
+"#,
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(
+        run.stdout.trim(),
+        r#"covered:5
+bare:40
+graded:{"s":102,"t":20}
+incoming:1002"#
+    );
+}

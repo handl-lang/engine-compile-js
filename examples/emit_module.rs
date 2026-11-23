@@ -41,6 +41,7 @@ fn main() {
         loop_max_iterations: handl_plugin_compile_js::DEFAULT_LOOP_MAX_ITERATIONS,
         security_scan: true,
         unsafe_inline_foreign: false,
+        dispatch_all_ops: false,
     };
     match compile_to_string(&input, &config) {
         Ok(js) => print!("{js}"),

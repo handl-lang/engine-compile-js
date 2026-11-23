@@ -72,6 +72,9 @@ struct LowerCtx {
     /// Bypass the foreign-call inline safety check
     /// (`JsConfig::unsafe_inline_foreign`, experimental).
     unsafe_inline_foreign: bool,
+    /// Route the pure arg-op family through `__handl_rt.dispatch`
+    /// (`JsConfig::dispatch_all_ops`) for handler-interception parity.
+    dispatch_all_ops: bool,
     /// `__sq<N>` uniquifier for `Seq`-stage const bindings.
     tmp: usize,
     /// Module-scope names resolvable inside arrow bodies — imports and
@@ -90,6 +93,7 @@ impl Default for LowerCtx {
             op_lowering: OpLowering::Mixed,
             loop_max_iterations: crate::config::DEFAULT_LOOP_MAX_ITERATIONS,
             unsafe_inline_foreign: false,
+            dispatch_all_ops: false,
             tmp: 0,
             bound: std::collections::HashMap::new(),
         }
@@ -105,6 +109,7 @@ pub(crate) fn with_config<T>(config: &JsConfig, f: impl FnOnce() -> T) -> T {
             c.op_lowering,
             c.loop_max_iterations,
             c.unsafe_inline_foreign,
+            c.dispatch_all_ops,
         )
     });
     LOWER_CTX.with(|c| {
@@ -113,6 +118,7 @@ pub(crate) fn with_config<T>(config: &JsConfig, f: impl FnOnce() -> T) -> T {
             op_lowering: config.op_lowering,
             loop_max_iterations: config.loop_max_iterations,
             unsafe_inline_foreign: config.unsafe_inline_foreign,
+            dispatch_all_ops: config.dispatch_all_ops,
             ..LowerCtx::default()
         };
     });
@@ -123,6 +129,7 @@ pub(crate) fn with_config<T>(config: &JsConfig, f: impl FnOnce() -> T) -> T {
         c.op_lowering = prev.1;
         c.loop_max_iterations = prev.2;
         c.unsafe_inline_foreign = prev.3;
+        c.dispatch_all_ops = prev.4;
         c.bound.clear();
     });
     ret
@@ -175,6 +182,14 @@ pub(crate) fn loop_max_iterations() -> u64 {
 /// current run (`JsConfig::unsafe_inline_foreign`, experimental).
 pub(crate) fn unsafe_inline_foreign() -> bool {
     LOWER_CTX.with(|c| c.borrow().unsafe_inline_foreign)
+}
+
+/// Whether pure arg-ops route through `__handl_rt.dispatch` in the
+/// current run (`JsConfig::dispatch_all_ops`) — eval's `dispatch_op`
+/// consults handlers for every `Native` op; this flag extends that
+/// coverage to the scalar family at a per-op async-dispatch cost.
+pub(crate) fn dispatch_all_ops() -> bool {
+    LOWER_CTX.with(|c| c.borrow().dispatch_all_ops)
 }
 
 /// A serializable JavaScript expression/statement AST.

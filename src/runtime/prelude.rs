@@ -58,24 +58,51 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   handlerImpl: (h, op) => ((h !== null && typeof h === "object")
     ? (((h.impls !== null && typeof h.impls === "object") ? h.impls[op] : undefined) ?? h[op])
     : undefined),
-  // Innermost-first covering impl for `op`, or `undefined` (the
-  // `dispatch_op` stack scan; `grades` coverage and carried-handler
-  // precedence are subset gaps — see `__apply`).
-  __handlerImplFor: (op) => {{
+  // Innermost-first covering impl for `op` at named dimension `dim`,
+  // or `undefined` (the `dispatch_op` stack scan). `grades` coverage
+  // mirrors eval's `covers`: a handler declaring a `grades` list
+  // covers only the named dimensions it lists; a non-array `grades`
+  // covers nothing; no `grades` field is dimension-agnostic. `dim`
+  // `null`/`undefined` is an *unnamed* dimension — every handler is
+  // eligible. A compound `dim` term the lowerer cannot resolve to a
+  // literal label also arrives as `null` (eval would evaluate it;
+  // documented subset gap).
+  __handlerImplFor: (op, dim) => {{
     const hs = __handl_rt.__handlers;
     for (let i = hs.length - 1; i >= 0; i--) {{
-      const impl = __handl_rt.handlerImpl(hs[i], op);
+      const h = hs[i];
+      if (dim !== null && dim !== undefined) {{
+        const g = ((h !== null && (typeof h === "object" || typeof h === "function"))
+          ? h.grades : undefined);
+        if (g !== undefined && (!Array.isArray(g) || !g.includes(dim))) continue;
+      }}
+      const impl = __handl_rt.handlerImpl(h, op);
       if (impl !== undefined) return impl;
     }}
     return undefined;
   }},
-  // Apply an arrow value with deep-handler reinstall (subset of
-  // `attach_carried_handler` + the engines' carried-`handlers` scan):
-  // `fn.__carried__` collects the handler frames `handle` attached to
-  // arrow results; each application pushes them for the call's extent.
-  // Precedence gap vs eval: carried frames sit *on top of* the ambient
-  // stack here, while `dispatch_op` consults the stack before the
-  // incoming value's carried handlers.
+  // `dispatch_op`'s two handler channels, in eval's order: the
+  // grades-aware handler-stack scan first, then the *incoming* value's
+  // own `impls`/`op` fields — consulted after the whole stack and
+  // with no grades constraint (eval reads `handler_impl(incoming)`
+  // directly). `incoming` `null`/`undefined` skips the second channel.
+  __handlerFor: (name, dim, incoming) => {{
+    const impl = __handl_rt.__handlerImplFor(name, dim);
+    if (impl !== undefined) return impl;
+    if (incoming !== null && incoming !== undefined) {{
+      return __handl_rt.handlerImpl(incoming, name);
+    }}
+    return undefined;
+  }},
+  // Apply an arrow value with deep-handler reinstall
+  // (`attach_carried_handler`): `fn.__carried__` collects the handler
+  // frames `handle` attached to arrow results; each application pushes
+  // them for the call's extent — innermost-last on `__handlers`, the
+  // same order eval's `HandlerStackGuard` produces (carried frames are
+  // pushed at apply time, so they precede ambient `handle` frames).
+  // The *incoming value's own* `impls` channel is separate: eval's
+  // `dispatch_op` consults it only after the whole stack — `__handlerFor`
+  // reproduces that ordering.
   __apply: async (fn, input) => {{
     const carried = ((typeof fn === "function" || (fn !== null && typeof fn === "object"))
       ? fn.__carried__ : undefined);
@@ -92,6 +119,14 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   // a bare ≥2-ary impl (no resume journal on this target) errors on
   // arity rather than silently running with `undefined` params.
   // `__apply` itself stays arity-agnostic for ordinary calls.
+  // Honest-throw territory (eval features with no JS-async-arrow
+  // analogue): multi-shot `resume` replay journals (a ≥2-ary impl
+  // suspends to its `handle` driver at eval; here it is always the
+  // arity error above) and serialized-`Term` impls — eval accepts an
+  // impl JSON that deserializes to a `Term`; handler values on this
+  // target are JS arrow functions / records only, so a `__term__`-style
+  // payload inside `impls` is not interpreted (it would fail the
+  // "not an arrow value" check rather than silently mis-run).
   __applyHandler: async (impl, input) => {{
     if (typeof impl === "function" && impl.length > 1) {{
       throw new Error("handler impl is ≥2-ary: multi-shot `resume` is not supported by the JS backend");
@@ -165,7 +200,7 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     if (sig === null || typeof sig !== "object" || Array.isArray(sig)) return v;
     const outSig = {{}};
     for (const k of Object.keys(sig)) {{
-      const impl = __handl_rt.__handlerImplFor(k);
+      const impl = __handl_rt.__handlerImplFor(k, null);
       if (impl === undefined) {{
         outSig[k] = sig[k];
         continue;
@@ -178,14 +213,21 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     indices[0] = outSig;
     return Object.assign({{}}, v, {{ indices: indices }});
   }},
-  // Generic op dispatch (the `dispatch_op` fallback): covering handler
-  // impls apply as arrow values — `args` is the evaluated argument
-  // array; a lone arg feeds the impl bare, several pack into the array
-  // (the `app` arg-input convention). Uncovered ops fall back to the
+  // Generic op dispatch (the `dispatch_op` fallback): `dim` is the
+  // op's named-dimension label (`null` for unnamed dims — every
+  // handler eligible), `incoming` the op arrow's input value (eval's
+  // second handler channel — the value's own `impls`/`op` fields).
+  // Covering handler impls apply as arrow values — `args` is the
+  // evaluated argument array; a lone arg feeds the impl bare, several
+  // pack into the array (the `app` arg-input convention — a subset
+  // divergence: eval applies impls to `incoming`, not the op args;
+  // serialized-`Term` impls and multi-shot `resume` journals are not
+  // portable to JS async arrows and stay honest throws — see
+  // `__applyHandler`). Uncovered ops fall back to the
   // `__handl_rt.<name>` member (host ops/packages) and finally to the
   // eval-faithful "unsupported op" error.
-  dispatch: async (name, args) => {{
-    const impl = __handl_rt.__handlerImplFor(name);
+  dispatch: async (name, args, dim, incoming) => {{
+    const impl = __handl_rt.__handlerFor(name, dim, incoming);
     if (impl !== undefined) {{
       if (typeof impl !== "function") {{
         throw new Error("handler impl for op '" + name + "' is not an arrow value");
@@ -196,6 +238,29 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     const member = __handl_rt[name];
     if (typeof member === "function") return await member(...args);
     throw new Error("unsupported op: " + name);
+  }},
+  // Foreign-op dispatch — eval's `dispatch_op` covers `ArrSource::
+  // Foreign` ops too (the op `name` is the routing key; `module`
+  // only selects the host function). A covering handler impl applies
+  // to the evaluated `args` exactly like `dispatch`; uncovered ops
+  // run the fallback the lowerer would have emitted directly —
+  // `inline` selects the `globalThis[module][name](...)` call,
+  // otherwise `jsCall` (keeping the promise-box / `__lastError`
+  // conventions). `descriptors` is the validated foreign descriptor
+  // JSON (`null` when inlined or absent).
+  dispatchForeign: async (name, args, dim, incoming, module, descriptors, inline) => {{
+    const impl = __handl_rt.__handlerFor(name, dim, incoming);
+    if (impl !== undefined) {{
+      if (typeof impl !== "function") {{
+        throw new Error("handler impl for op '" + name + "' is not an arrow value");
+      }}
+      const argInput = (args.length === 1) ? args[0] : args;
+      return await __handl_rt.__applyHandler(impl, argInput);
+    }}
+    if (inline) {{
+      return await globalThis[module][name](...args);
+    }}
+    return __handl_rt.jsCall(module, name, args, descriptors);
   }},
   // `perform(op, arg)` — the in-flight dispatch half of the io module's
   // perform builtin (`native_ops::perform_dispatch`): a covered op
@@ -214,7 +279,7 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     if (name === null) {{
       throw new Error("perform: op operand must be a string or sym");
     }}
-    const impl = __handl_rt.__handlerImplFor(name);
+    const impl = __handl_rt.__handlerImplFor(name, null);
     if (impl !== undefined) {{
       if (typeof impl !== "function") {{
         throw new Error("handler impl for op '" + name + "' is not an arrow value");
@@ -404,7 +469,7 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     // indistinguishable from a multi-arg tuple on this target).
     if (__handl_rt.__handlers.length > 0) {{
       return async (input) => __handl_rt.dispatch(
-        name, Array.isArray(input) ? input : [input]);
+        name, Array.isArray(input) ? input : [input], null, input);
     }}
     if (Object.prototype.hasOwnProperty.call(__handl_rt, name)) return __handl_rt[name];
     throw new Error("unsupported op: " + name);

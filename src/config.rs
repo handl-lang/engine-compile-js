@@ -285,6 +285,26 @@ pub struct JsConfig {
     /// configuration surface.
     #[doc(hidden)]
     pub unsafe_inline_foreign: bool,
+    /// Route the pure arg-op family (the scalar operators plus
+    /// `eq`/`neq`/`and`/`or`/`pow`/`concat`) through
+    /// `__handl_rt.dispatch` instead of inline JS operators / direct
+    /// `__handl_rt` member calls.
+    ///
+    /// Eval's `dispatch_op` consults the dynamic-extent handler stack
+    /// for *every* `Native` op before `apply_native` — a `handle` frame
+    /// can therefore intercept `add`/`lt`/etc. The default lowering
+    /// gives those ops dedicated emit that bypasses handler dispatch
+    /// entirely; this flag restores interception coverage for the
+    /// ops whose semantics are a pure function of their arguments.
+    ///
+    /// Cost: every covered op becomes an `await`ed async dispatch —
+    /// measurably slower on arithmetic-heavy code, and still not full
+    /// parity: ops that read the incoming value or carry `lit`
+    /// payloads (`elem`, `field_access`, `record`, `json`, `proj_env`,
+    /// …) keep their dedicated emit and bypass handlers even under the
+    /// flag (the dispatch fallback cannot reproduce lit/incoming
+    /// semantics). Defaults to `false`.
+    pub dispatch_all_ops: bool,
 }
 
 impl JsConfig {
@@ -303,6 +323,7 @@ impl JsConfig {
             loop_max_iterations: DEFAULT_LOOP_MAX_ITERATIONS,
             security_scan: true,
             unsafe_inline_foreign: false,
+            dispatch_all_ops: false,
         }
     }
 
@@ -321,6 +342,7 @@ impl JsConfig {
             loop_max_iterations: DEFAULT_LOOP_MAX_ITERATIONS,
             security_scan: true,
             unsafe_inline_foreign: false,
+            dispatch_all_ops: false,
         }
     }
 }
