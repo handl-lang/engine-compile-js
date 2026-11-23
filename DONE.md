@@ -17,3 +17,4 @@
 - T-007 GAP: upstream handl-kit-arrow-lower divergences — >>> Seq-vs-compose (comp(5)=10 vs eval 12), {x} field-pun unsupported; fix in host repo or canonical AST normalization · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
 - T-009 GAP: 'export data …' surface form — parser/module\_prep produces 'export \<var data>' residue; needs upstream parse fix then emit support · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
 - T-020 T-020 JS-side: wire 'export data …' through engine-compile-js module.rs (upstream module\_prep fixed in host@4c16fbb5) + e2e fixture · pri:high · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
+- T-026 ADOPT kernel@e2e8e93 acc field — engine term\_interpreter.rs:158 thread acc into handler frame · pri:high · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
