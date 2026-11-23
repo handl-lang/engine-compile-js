@@ -18,3 +18,4 @@
 - T-009 GAP: 'export data …' surface form — parser/module\_prep produces 'export \<var data>' residue; needs upstream parse fix then emit support · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
 - T-020 T-020 JS-side: wire 'export data …' through engine-compile-js module.rs (upstream module\_prep fixed in host@4c16fbb5) + e2e fixture · pri:high · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
 - T-026 ADOPT kernel@e2e8e93 acc field — engine term\_interpreter.rs:158 thread acc into handler frame · pri:high · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
+- T-025 ADOPT kernel@e2e8e93 acc field — host arrow-lower: construct Term::Handle with acc (lib.rs:834-843) + un-decline acc nodes (L2056-2074) + tests/lower.rs:428 · pri:high · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
