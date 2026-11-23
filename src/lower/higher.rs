@@ -83,14 +83,34 @@ fn lower_handle_applied(
 ) -> Result<JsAst, CompileError> {
     let body_fn = crate::lower::lower(body)?;
     let impl_fn = crate::lower::lower(impl_)?;
-    let handle = rt_call(
+    // `impl_` is a *scheme* evaluated under the same incoming as the
+    // body (eval order: impl value first, then push, then body). The
+    // lowered impl is an async arrow for scheme terms; a constant term
+    // lowers to its value directly — the thunk yields either as the
+    // handler value `handle` pushes.
+    let impl_value = match &impl_fn {
+        JsAst::ArrowFn { .. } => JsAst::Call {
+            callee: Box::new(impl_fn.clone()),
+            args: vec![input.clone()],
+        },
+        _ => impl_fn.clone(),
+    };
+    let impl_thunk = JsAst::ArrowFn {
+        params: Vec::new(),
+        body: Box::new(impl_value),
+    };
+    // `await __handl_rt.handle(bodyFn, "target", implThunk, input)` —
+    // the runtime pushes the handler, runs `body` under it (ops route
+    // through `__handl_rt.dispatch`), runs the `IO`-former post-pass and
+    // `return` clause, pops in `finally`, and attaches the carried
+    // handler to arrow results.
+    Ok(JsAst::Await(Box::new(rt_call(
         "handle",
-        vec![body_fn, JsAst::Str(target.to_string()), impl_fn],
-    );
-    // `handle(..)(input)` applies `impl` — a lowered (async) arrow — so
-    // its result is a Promise and the call is awaited.
-    Ok(JsAst::Await(Box::new(JsAst::Call {
-        callee: Box::new(handle),
-        args: vec![input.clone()],
-    })))
+        vec![
+            body_fn,
+            JsAst::Str(target.to_string()),
+            impl_thunk,
+            input.clone(),
+        ],
+    ))))
 }

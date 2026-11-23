@@ -12,29 +12,6 @@ use hnl_engine::{Term, term::RewriteWitness};
 
 use crate::JsAst;
 
-const INPUT_NAME: &str = "__in";
-
-fn input_ident() -> JsAst {
-    JsAst::Ident(INPUT_NAME.to_string())
-}
-
-fn rt_call(name: &str, args: Vec<JsAst>) -> JsAst {
-    JsAst::Call {
-        callee: Box::new(JsAst::Member {
-            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-            prop: name.to_string(),
-        }),
-        args,
-    }
-}
-
-fn arrow_fn(body: JsAst) -> JsAst {
-    JsAst::ArrowFn {
-        params: vec![INPUT_NAME.to_string()],
-        body: Box::new(body),
-    }
-}
-
 /// Lower a proof combinator to a top-level JS arrow.
 pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
     match term {
@@ -64,34 +41,31 @@ pub fn lower_applied(term: &Term, input: &JsAst) -> Result<JsAst, CompileError> 
 }
 
 fn lower_rewrite(
-    source: &Term,
-    target: &Term,
+    _source: &Term,
+    _target: &Term,
     witness: &RewriteWitness,
 ) -> Result<JsAst, CompileError> {
-    Ok(arrow_fn(lower_rewrite_applied(
-        source,
-        target,
-        witness,
-        &input_ident(),
-    )?))
+    Err(rewrite_unsupported(witness))
 }
 
 fn lower_rewrite_applied(
-    source: &Term,
-    target: &Term,
+    _source: &Term,
+    _target: &Term,
     witness: &RewriteWitness,
-    input: &JsAst,
+    _input: &JsAst,
 ) -> Result<JsAst, CompileError> {
-    let s = crate::lower::lower(source)?;
-    let t = crate::lower::lower(target)?;
-    let w = JsAst::Str(witness_name(witness));
-    let rewrite = rt_call("rewrite", vec![s, t, w]);
-    // `rewrite(..)` returns the lowered (async) source arrow; applying it
-    // yields a Promise, so the call is awaited.
-    Ok(JsAst::Await(Box::new(JsAst::Call {
-        callee: Box::new(rewrite),
-        args: vec![input.clone()],
-    })))
+    Err(rewrite_unsupported(witness))
+}
+
+/// `Term::Rewrite` has no eval semantics to port — every evaluator
+/// (`term_interpreter`, tree-walk, `nbe`) returns `NotImplemented` — so
+/// the honest lowering is a compile error, not a fabricated result.
+fn rewrite_unsupported(witness: &RewriteWitness) -> CompileError {
+    CompileError::Lower(format!(
+        "rewrite (~>) with {} witness is not supported by the JS backend \
+         (eval returns NotImplemented for Term::Rewrite)",
+        witness_name(witness)
+    ))
 }
 
 fn witness_name(witness: &RewriteWitness) -> String {

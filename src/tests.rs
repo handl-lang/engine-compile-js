@@ -194,7 +194,8 @@ fn app_emits_call() {
         vec![Term::const_value(Value::Number(Number::from(1)))],
     );
     let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
-    assert!(js.contains("\"fn\"(1)"), "{js}");
+    // Applications route through `__apply` (carried-handler reinstall).
+    assert!(js.contains(r#"__handl_rt.__apply("fn", 1)"#), "{js}");
     assert!(js.contains("__in"), "{js}");
 }
 
@@ -253,14 +254,16 @@ fn handle_lowering() {
 
 #[test]
 fn rewrite_lowering() {
+    // `Term::Rewrite` has no eval semantics (every evaluator returns
+    // `NotImplemented`), so the honest lowering is a compile error —
+    // never a fabricated `__handl_rt.rewrite` call.
     let term = Term::Rewrite {
         source: Box::new(Term::const_value(Value::Number(Number::from(1)))),
         target: Box::new(Term::const_value(Value::Number(Number::from(2)))),
         witness: RewriteWitness::Named("foo".to_string()),
     };
-    let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
-    assert!(js.contains("__handl_rt.rewrite"), "{js}");
-    assert!(js.contains(r#""foo""#), "{js}");
+    let err = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap_err();
+    assert!(format!("{err}").contains("rewrite"), "{err}");
 }
 
 #[test]
@@ -451,7 +454,7 @@ fn arrows_emit_async_and_applications_are_awaited() {
     );
     let js = compile_to_string(&input(app), &JsConfig::esm_deno()).unwrap();
     assert!(js.contains("await"), "{js}");
-    assert!(js.contains("\"fn\"(1)"), "{js}");
+    assert!(js.contains(r#"__handl_rt.__apply("fn", 1)"#), "{js}");
 }
 
 #[test]
@@ -624,10 +627,11 @@ fn module_exports_and_internal_bindings() {
     assert!(js.contains("export const main = async __in =>"), "{js}");
     assert!(js.contains("__handl_rt.elem(__in, 0)"), "{js}");
     assert!(js.contains("+"), "{js}");
-    // Cross-statement references emit the bound JS name, awaited with the
-    // `app` arg-input (the arg tuple).
-    assert!(js.contains("await helper("), "{js}");
-    assert!(js.contains("await plus(["), "{js}");
+    // Cross-statement references emit the bound JS name through
+    // `__apply` (carried-handler reinstall) with the `app` arg-input
+    // (the arg tuple).
+    assert!(js.contains("await __handl_rt.__apply(helper, "), "{js}");
+    assert!(js.contains("__handl_rt.__apply(plus, ["), "{js}");
     assert!(!js.contains("__handl_rt.export"), "{js}");
 }
 
@@ -683,7 +687,7 @@ fn module_effect_statements_and_default_export() {
     // The trailing expression statement runs for effect at import time
     // and its result is the default export.
     assert!(js.contains("export default"), "{js}");
-    assert!(js.contains("await x(2)"), "{js}");
+    assert!(js.contains("await __handl_rt.__apply(x, 2)"), "{js}");
 }
 
 #[test]
@@ -713,7 +717,10 @@ fn module_resolved_deps_inline_into_handl_rt_namespaces() {
         js.contains(r#"__handl_rt["dep-pkg"] = __mod_dep_0;"#),
         "{js}"
     );
-    assert!(js.contains(r#"await __handl_rt["dep-pkg"].f("#), "{js}");
+    assert!(
+        js.contains(r#"__handl_rt.__apply(__handl_rt["dep-pkg"].f, "#),
+        "{js}"
+    );
     // No dead ES import or stub-member reference is emitted for it.
     assert!(!js.contains("import { f } from"), "{js}");
 }
@@ -752,7 +759,10 @@ fn module_dep_transitive_imports_and_no_export_fallback() {
         js.contains(r#"__handl_rt["./inner"] = __mod_inner_0;"#),
         "{js}"
     );
-    assert!(js.contains(r#"await __handl_rt["./inner"].base("#), "{js}");
+    assert!(
+        js.contains(r#"__handl_rt.__apply(__handl_rt["./inner"].base, "#),
+        "{js}"
+    );
 }
 
 #[test]
@@ -781,7 +791,10 @@ fn module_unbound_names_fall_back_to_runtime_members() {
         &JsConfig::esm_deno(),
     )
     .unwrap();
-    assert!(js.contains("__handl_rt.unknown_host"), "{js}");
+    // Unbound names emit a native op call — routed through `dispatch`,
+    // whose uncovered fallback resolves the `__handl_rt.<name>` member
+    // (or throws "unsupported op") at run time.
+    assert!(js.contains(r#"__handl_rt.dispatch("unknown_host""#), "{js}");
 }
 
 #[test]
@@ -873,11 +886,51 @@ fn module_unsupported_data_shape_errors() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn worker_entry_requires_esm_format() {
+fn worker_entry_rejects_commonjs_format() {
+    // `commonjs` emits `module.exports = …`, which does not exist in a
+    // worker global scope — only `esm` (module worker) and
+    // `iife`/`inline` (classic worker script) can carry a worker entry.
     let mut config = JsConfig::cjs_node();
     config.worker_entry = true;
     let err = compile_to_string(&module_input("x := 1\n"), &config).unwrap_err();
     assert!(err.to_string().contains("esm"), "{err}");
+    assert!(err.to_string().contains("commonjs"), "{err}");
+}
+
+#[test]
+fn worker_entry_iife_emits_classic_worker_script() {
+    // `worker_entry` + `iife`: a self-contained classic-script bundle —
+    // no `import`/`export` declarations, async IIFE wrapper (the body
+    // uses `await` for inlined deps / applied expressions).
+    let mut config = JsConfig {
+        target: Box::new(Browser),
+        format: Box::new(Iife),
+        debug: false,
+        no_inline_foreign: false,
+        source_map: false,
+        modules: Vec::new(),
+        entry_imports: Vec::new(),
+        worker_entry: true,
+    };
+    config.modules = vec![crate::JsModule {
+        path: "/pkgs/dep/dep.hnl".to_string(),
+        source: "export double := (x) ~> x * 2\n".to_string(),
+        imports: Vec::new(),
+    }];
+    config.entry_imports = vec![("dep".to_string(), "/pkgs/dep/dep.hnl".to_string())];
+    let js = compile_to_string(
+        &module_input("from \"dep\" import { double }\necho := (m) ~> double(m)\n"),
+        &config,
+    )
+    .unwrap();
+    assert!(js.starts_with("(async function()"), "{js}");
+    assert!(js.contains("const __mod_dep_0"), "{js}");
+    // No ES module syntax survives (the prelude mentions `import` in
+    // comments/`import(spec)`, so match declaration forms only).
+    assert!(!js.contains("export"), "{js}");
+    assert!(!js.contains("import { "), "{js}");
+    assert!(!js.contains("import * as"), "{js}");
+    assert!(!js.contains("module.exports"), "{js}");
 }
 
 #[test]
@@ -932,7 +985,10 @@ fn worker_entry_keeps_builtin_imports_and_inlines_deps() {
         "{js}"
     );
     assert!(js.contains("__handl_rt.dep = __mod_dep_0;"), "{js}");
-    assert!(js.contains("__handl_rt.dep.double("), "{js}");
+    assert!(
+        js.contains("__handl_rt.__apply(__handl_rt.dep.double, "),
+        "{js}"
+    );
     assert!(!js.contains("from \"dep\""), "{js}");
     // Prelude + inlined dep + entry body — one self-contained file.
     assert!(js.contains("var __handl_rt"), "{js}");
@@ -954,7 +1010,10 @@ fn op_record_merge_emits_prelude_call() {
         ],
     );
     let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
-    assert!(js.contains("__handl_rt.record_merge("), "{js}");
+    // `record_merge` is a `Native` op with no dedicated match arm — it
+    // routes through `dispatch`, whose uncovered fallback calls the
+    // `__handl_rt.record_merge` member.
+    assert!(js.contains(r#"__handl_rt.dispatch("record_merge""#), "{js}");
 }
 
 #[test]
@@ -967,7 +1026,10 @@ fn op_flow_emits_prelude_call() {
         ],
     );
     let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
-    assert!(js.contains("__handl_rt.flow("), "{js}");
+    // `flow` has no dedicated match arm — as a `Native` op it routes
+    // through `dispatch`, whose uncovered fallback calls the
+    // `__handl_rt.flow` member.
+    assert!(js.contains(r#"__handl_rt.dispatch("flow""#), "{js}");
 }
 
 #[test]
@@ -1029,7 +1091,7 @@ fn module_object_spread_lowers_to_record_merge() {
         &JsConfig::esm_deno(),
     )
     .unwrap();
-    assert!(js.contains("__handl_rt.record_merge("), "{js}");
+    assert!(js.contains(r#"__handl_rt.dispatch("record_merge""#), "{js}");
 }
 
 #[test]
@@ -1041,7 +1103,184 @@ fn module_flow_between_held_arrows_lowers_to_flow_op() {
         &JsConfig::esm_deno(),
     )
     .unwrap();
-    assert!(js.contains("__handl_rt.flow("), "{js}");
+    assert!(js.contains(r#"__handl_rt.dispatch("flow""#), "{js}");
+}
+
+// ---------------------------------------------------------------------------
+// T-005: non-ESM module formats — `commonjs`/`iife`/`inline` module emit.
+// ---------------------------------------------------------------------------
+
+/// IIFE output on the Browser target.
+fn iife_browser() -> JsConfig {
+    JsConfig {
+        target: Box::new(Browser),
+        format: Box::new(Iife),
+        debug: false,
+        no_inline_foreign: false,
+        source_map: false,
+        modules: Vec::new(),
+        entry_imports: Vec::new(),
+        worker_entry: false,
+    }
+}
+
+/// Inline output on the Browser target.
+fn inline_browser() -> JsConfig {
+    JsConfig {
+        target: Box::new(Browser),
+        format: Box::new(Inline),
+        debug: false,
+        no_inline_foreign: false,
+        source_map: false,
+        modules: Vec::new(),
+        entry_imports: Vec::new(),
+        worker_entry: false,
+    }
+}
+
+#[test]
+fn module_commonjs_exports_become_awaited_namespace() {
+    // `export` decls strip to plain bindings; the namespace object —
+    // named exports plus `"default"` — is returned from an async IIFE
+    // assigned to `module.exports`, so `require()` yields a Promise.
+    let js = compile_to_string(
+        &module_input("export plus := (a, b) ~> a + b\nplus(20, 22)\n"),
+        &JsConfig::cjs_node(),
+    )
+    .unwrap();
+    assert!(js.contains("module.exports = (async () => {"), "{js}");
+    assert!(js.contains("const plus = async __in =>"), "{js}");
+    assert!(js.contains(r#""plus": plus"#), "{js}");
+    assert!(js.contains(r#""default":"#), "{js}");
+    assert!(js.contains("return {"), "{js}");
+    assert!(!js.contains("export "), "{js}");
+    assert!(!js.contains("import { "), "{js}");
+}
+
+#[test]
+fn module_commonjs_lowers_surviving_imports_to_require() {
+    // CJS has a real module loader: an unresolved path specifier and a
+    // `node:` builtin both become `require()` bindings — the same
+    // specifier-resolution contract ESM imports have (the embedder's
+    // concern), never a silent global.
+    let js = compile_to_string(
+        &module_input(
+            "from \"node:path\" import { join }\nimport \"./setup.js\"\nexport run := (x) ~> join(x)\n",
+        ),
+        &JsConfig::cjs_node(),
+    )
+    .unwrap();
+    assert!(
+        js.contains(r#"const { "join": join } = require("node:path")"#),
+        "{js}"
+    );
+    assert!(js.contains(r#"require("./setup.js");"#), "{js}");
+    assert!(js.contains(r#""run": run"#), "{js}");
+}
+
+#[test]
+fn module_commonjs_inlined_deps_still_inline() {
+    // Dep inlining is format-independent: the `__mod_*` const +
+    // `__handl_rt[spec]` binding are emitted inside the async wrapper.
+    let mut config = JsConfig::cjs_node();
+    config.modules = vec![crate::JsModule {
+        path: "/pkgs/dep/dep.hnl".to_string(),
+        source: "export double := (x) ~> x * 2\n".to_string(),
+        imports: Vec::new(),
+    }];
+    config.entry_imports = vec![("dep".to_string(), "/pkgs/dep/dep.hnl".to_string())];
+    let js = compile_to_string(
+        &module_input("from \"dep\" import { double }\nexport quad := (x) ~> double(double(x))\n"),
+        &config,
+    )
+    .unwrap();
+    assert!(
+        js.contains("const __mod_dep_0 = (await (async () => {"),
+        "{js}"
+    );
+    // `dep` is a valid JS ident → `.dep` member path (bracket form is
+    // for kebab specs like `dep-pkg`).
+    assert!(js.contains("__handl_rt.dep = __mod_dep_0;"), "{js}");
+    assert!(js.contains(r#""quad": quad"#), "{js}");
+    assert!(!js.contains("from \"dep\""), "{js}");
+}
+
+#[test]
+fn module_iife_returns_namespace_promise() {
+    // IIFE: a self-contained `(async function () { … })();` — the
+    // prelude lives inside the wrapper; the script evaluates to a
+    // Promise of the export namespace.
+    let js = compile_to_string(
+        &module_input("export inc := (x) ~> x + 1\ninc(41)\n"),
+        &iife_browser(),
+    )
+    .unwrap();
+    assert!(js.starts_with("(async function() {"), "{js}");
+    assert!(js.contains("var __handl_rt"), "{js}");
+    assert!(js.contains(r#""inc": inc"#), "{js}");
+    assert!(js.contains(r#""default":"#), "{js}");
+    assert!(!js.contains("export"), "{js}");
+    assert!(!js.contains("module.exports"), "{js}");
+}
+
+#[test]
+fn module_inline_emits_classic_script() {
+    // Inline: prelude + a bare async-IIFE expression statement — no
+    // module header at all; the completion value is the namespace
+    // promise.
+    let js = compile_to_string(
+        &module_input("export dbl := (x) ~> x * 2\ndbl(21)\n"),
+        &inline_browser(),
+    )
+    .unwrap();
+    assert!(js.contains("var __handl_rt"), "{js}");
+    assert!(js.contains("(async () => {"), "{js}");
+    assert!(js.contains(r#""dbl": dbl"#), "{js}");
+    assert!(js.contains(r#""default":"#), "{js}");
+    assert!(!js.contains("export"), "{js}");
+    assert!(!js.contains("module.exports"), "{js}");
+}
+
+#[test]
+fn module_iife_and_inline_reject_external_imports() {
+    // A classic script has no module loader — not even `node:` builtins
+    // — so any surviving ES `import` is a hard compile error, while
+    // `commonjs` lowers the same source to `require()` (covered above).
+    for (name, config) in [("iife", iife_browser()), ("inline", inline_browser())] {
+        let err = compile_to_string(
+            &module_input("from \"node:path\" import { join }\njoin(\"a\")\n"),
+            &config,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be expressed"),
+            "{name}: {err}"
+        );
+        assert!(err.to_string().contains("node:path"), "{name}: {err}");
+    }
+    // `commonjs` accepts the same source.
+    compile_to_string(
+        &module_input("from \"node:path\" import { join }\njoin(\"a\")\n"),
+        &JsConfig::cjs_node(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn module_non_esm_export_name_reexport_and_signature() {
+    // `export f` deferred + `export { g }`-style pending exports and a
+    // signature export all land in the namespace object.
+    let js = compile_to_string(
+        &module_input(
+            "export f\nf := (x) ~> x + 1\nexport sig : Nat ~> Nat\nexport run := (x) ~> f(x)\n",
+        ),
+        &JsConfig::cjs_node(),
+    )
+    .unwrap();
+    assert!(js.contains(r#""f": f"#), "{js}");
+    assert!(js.contains(r#""sig": sig"#), "{js}");
+    assert!(js.contains(r#""run": run"#), "{js}");
+    assert!(js.contains("let sig = null;"), "{js}");
 }
 
 fn random_term<R: Rng>(rng: &mut R, depth: usize) -> Term {
@@ -1073,5 +1312,111 @@ fn random_term<R: Rng>(rng: &mut R, depth: usize) -> Term {
             Value::String(format!("f{}", rng.random::<u32>())),
         ),
         _ => random_term(rng, depth - 1),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T-006 (P5a/P5b): effect-semantics parity — `handle` runtime call shape,
+// `dispatch` routing for unknown ops, and the op-spelling denylist.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn handle_lowering_emits_runtime_handle_call() {
+    // `Term::Handle` lowers to `await __handl_rt.handle(bodyFn, target,
+    // implThunk, input)` — the runtime owns the handler stack, dispatch,
+    // IO-former post-pass, `return` clause, and carried-handler attach.
+    let term = Term::handle(
+        Term::op_native(
+            "Foo",
+            vec![Term::const_value(Value::Number(Number::from(1)))],
+        ),
+        "Foo",
+        Term::op_native_lit(
+            "record",
+            vec![Term::op_native(
+                "add",
+                vec![
+                    Term::const_value(Value::Number(Number::from(1))),
+                    Term::const_value(Value::Number(Number::from(2))),
+                ],
+            )],
+            json!(["Foo"]),
+        ),
+    );
+    let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("__handl_rt.handle("), "{js}");
+    assert!(js.contains(r#""Foo""#), "{js}");
+}
+
+#[test]
+fn unknown_op_with_args_lowers_to_dispatch() {
+    // Ops outside the builtin match route through
+    // `__handl_rt.dispatch("name", [args])` so a covering `handle` frame
+    // can intercept them (eval's `dispatch_op`).
+    let term = Term::op_native(
+        "HttpGet",
+        vec![Term::const_value(Value::String("u".to_string()))],
+    );
+    let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains(r#"__handl_rt.dispatch("HttpGet""#), "{js}");
+}
+
+#[test]
+fn perform_lowers_to_compile_error() {
+    // `perform`/`io.perform` are denylisted op spellings (P5a): eval's
+    // `perform_dispatch` needs the resume-journal/`acc` machinery the
+    // JS subset does not carry, so both the flat and qualified
+    // spellings — native *and* foreign — fail at compile time. The
+    // runtime `__handl_rt.perform` member remains for host/driver JS.
+    for term in [
+        Term::op_native(
+            "perform",
+            vec![
+                Term::const_value(Value::String("Foo".to_string())),
+                Term::const_value(Value::Number(Number::from(1))),
+            ],
+        ),
+        Term::op_native("io.perform", vec![]),
+        Term::Op {
+            dim: Term::default_dim(),
+            name: "perform".to_string(),
+            args: vec![Term::const_value(Value::String("Foo".to_string()))],
+            source: ArrSource::Foreign("io".to_string()),
+            lit: None,
+            attrs: None,
+        },
+    ] {
+        let result = compile_to_string(&input(term), &JsConfig::esm_deno());
+        assert!(result.is_err(), "perform spelling compiled: {result:?}");
+    }
+}
+
+#[test]
+fn denylisted_op_spellings_fail_to_compile() {
+    // `handle`/`handle_dyn`/`rewrite`/`path`/`equiv`/`perform`/
+    // `io.perform` must never reach `__handl_rt.<name>` or `__opRef` —
+    // both the applied and the bare 0-arg reference forms are compile
+    // errors.
+    for name in [
+        "handle",
+        "handle_dyn",
+        "rewrite",
+        "path",
+        "equiv",
+        "perform",
+        "io.perform",
+    ] {
+        for args in [
+            vec![],
+            vec![Term::const_value(Value::Number(Number::from(1)))],
+        ] {
+            let term = Term::op_native(name, args);
+            let result = compile_to_string(&input(term), &JsConfig::esm_deno());
+            assert!(result.is_err(), "op `{name}` compiled: {result:?}");
+            assert!(
+                format!("{:?}", result.unwrap_err()).contains(name),
+                "op `{name}` error should name the op"
+            );
+        }
     }
 }

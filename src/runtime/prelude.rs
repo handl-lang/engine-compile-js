@@ -32,10 +32,191 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   concat: (a, b) => (Array.isArray(a) ? a.concat(b) : String(a) + String(b)),
   projEnv: (env, name) => (env[name]),
   child: (input, role) => input[role],
-  handle: (body, target, impl) => (input) => (typeof impl === "function" ? impl(input) : impl),
-  rewrite: (source, target, witness) => source,
-  path: (from, to, witness) => from,
-  equiv: (a, b, path) => a,
+  // --- effect handlers (ADR-0076/0153/0158 subset) ----------------------
+  // `handle body with target = impl` (`Term::Handle`): the lowerer emits
+  // `await __handl_rt.handle(bodyFn, "target", () => implFn(input),
+  // input)`. `implFn` is the lowered impl *scheme* — an async arrow
+  // producing the handler value (a record `op: arrow` /
+  // `impls`-keyed `op: arrow`) — and the thunk evaluates it under the same
+  // incoming as the body, matching eval's impl-then-push-then-body
+  // order. `__handlers` is the dynamic-extent stack, innermost last.
+  __handlers: [],
+  // `native_ops::handler_impl`: `impls[op]` first, then the flat `op`
+  // key. Non-object handlers (arrow values, primitives) cover no ops —
+  // eval's `handler_impl` returns `None` for them too.
+  handlerImpl: (h, op) => ((h !== null && typeof h === "object")
+    ? (((h.impls !== null && typeof h.impls === "object") ? h.impls[op] : undefined) ?? h[op])
+    : undefined),
+  // Innermost-first covering impl for `op`, or `undefined` (the
+  // `dispatch_op` stack scan; `grades` coverage and carried-handler
+  // precedence are subset gaps — see `__apply`).
+  __handlerImplFor: (op) => {{
+    const hs = __handl_rt.__handlers;
+    for (let i = hs.length - 1; i >= 0; i--) {{
+      const impl = __handl_rt.handlerImpl(hs[i], op);
+      if (impl !== undefined) return impl;
+    }}
+    return undefined;
+  }},
+  // Apply an arrow value with deep-handler reinstall (subset of
+  // `attach_carried_handler` + the engines' carried-`handlers` scan):
+  // `fn.__carried__` collects the handler frames `handle` attached to
+  // arrow results; each application pushes them for the call's extent.
+  // Precedence gap vs eval: carried frames sit *on top of* the ambient
+  // stack here, while `dispatch_op` consults the stack before the
+  // incoming value's carried handlers.
+  __apply: async (fn, input) => {{
+    const carried = ((typeof fn === "function" || (fn !== null && typeof fn === "object"))
+      ? fn.__carried__ : undefined);
+    if (!Array.isArray(carried) || carried.length === 0) return await fn(input);
+    const n = carried.length;
+    for (const h of carried) __handl_rt.__handlers.push(h);
+    try {{
+      return await fn(input);
+    }} finally {{
+      __handl_rt.__handlers.length -= n;
+    }}
+  }},
+  // Apply a *handler impl* arrow: the eval `dispatch_op` arity rule —
+  // a bare ≥2-ary impl (no resume journal on this target) errors on
+  // arity rather than silently running with `undefined` params.
+  // `__apply` itself stays arity-agnostic for ordinary calls.
+  __applyHandler: async (impl, input) => {{
+    if (typeof impl === "function" && impl.length > 1) {{
+      throw new Error("handler impl is ≥2-ary: multi-shot `resume` is not supported by the JS backend");
+    }}
+    return await __handl_rt.__apply(impl, input);
+  }},
+  handle: async (body, target, implThunk, input) => {{
+    // `target` is retained for diagnostics, like eval — dispatch keys on
+    // the op name, not the handled capability.
+    void target;
+    const impl = await implThunk();
+    // ADR-0158 `acc`: eval seeds a `__acc__` slot on the pushed frame
+    // from the `handle` node's optional `acc` child. `Term::Handle`
+    // carries only body/target/impl — and the arrow lowerer drops the
+    // AST `acc` role before the `Term` exists — so the clause cannot
+    // arrive here; a handler *value* carrying the reserved `__acc__`
+    // key would silently lose the accumulator, so fail loudly instead.
+    if ((typeof impl === "object" || typeof impl === "function")
+        && impl !== null
+        && Object.prototype.hasOwnProperty.call(impl, "__acc__")) {{
+      throw new Error("handle: `acc` clause is not supported by the JS backend");
+    }}
+    __handl_rt.__handlers.push(impl);
+    try {{
+      // `body` is the lowered body scheme — an async arrow, or a bare
+      // value for constant bodies (eval evaluates the scheme on the
+      // incoming either way).
+      let v = (typeof body === "function") ? await body(input) : body;
+      // `IO(sig)` former post-pass (native_ops::interpret_io_former):
+      // covered sig fields dispatch through the still-installed handler;
+      // uncovered ops stay data.
+      v = await __handl_rt.__interpretIO(v);
+      // `return` clause postlude: `h["return"](r)`; without it the
+      // result passes through. (`acc` is unreachable — `Term::Handle`
+      // carries only body/target/impl_.)
+      const ret = __handl_rt.handlerImpl(impl, "return");
+      if (ret !== undefined) {{
+        if (typeof ret !== "function") {{
+          throw new Error("handle: `return` clause impl is not an arrow value");
+        }}
+        v = await __handl_rt.__applyHandler(ret, v);
+      }}
+      // Deep handler: arrow results collect the frame so later
+      // applications reinstall it via `__apply`.
+      if (typeof v === "function") {{
+        if (Array.isArray(v.__carried__)) v.__carried__.push(impl);
+        else v.__carried__ = [impl];
+      }}
+      return v;
+    }} finally {{
+      __handl_rt.__handlers.pop();
+    }}
+  }},
+  // `IO(sig)` former interpretation (ADR-0153 §4): an
+  // `__former__`/`indices` result carrying the `type.io` sym has each
+  // sig field read as an op name and dispatched to the covering handler;
+  // uncovered entries keep their original value. The sym check is
+  // name-based — the JS value model carries `__sym__` name/handle
+  // records, not seeded handles.
+  __interpretIO: async (v) => {{
+    if (!__handl_rt.is_obj(v)) return v;
+    const former = v.__former__;
+    const sym = (former !== null && typeof former === "object")
+      ? ((former.__sym__ !== null && typeof former.__sym__ === "object") ? former.__sym__
+        : ((former.sym !== null && typeof former.sym === "object" && former.sym.__sym__ !== null
+            && typeof former.sym.__sym__ === "object") ? former.sym.__sym__ : null))
+      : null;
+    if (sym === null || sym.name !== "type.io") return v;
+    const indices = Array.isArray(v.indices) ? v.indices.slice() : [];
+    const sig = indices[0];
+    if (sig === null || typeof sig !== "object" || Array.isArray(sig)) return v;
+    const outSig = {{}};
+    for (const k of Object.keys(sig)) {{
+      const impl = __handl_rt.__handlerImplFor(k);
+      if (impl === undefined) {{
+        outSig[k] = sig[k];
+        continue;
+      }}
+      if (typeof impl !== "function") {{
+        throw new Error("handler impl for op '" + k + "' is not an arrow value");
+      }}
+      outSig[k] = await __handl_rt.__applyHandler(impl, sig[k]);
+    }}
+    indices[0] = outSig;
+    return Object.assign({{}}, v, {{ indices: indices }});
+  }},
+  // Generic op dispatch (the `dispatch_op` fallback): covering handler
+  // impls apply as arrow values — `args` is the evaluated argument
+  // array; a lone arg feeds the impl bare, several pack into the array
+  // (the `app` arg-input convention). Uncovered ops fall back to the
+  // `__handl_rt.<name>` member (host ops/packages) and finally to the
+  // eval-faithful "unsupported op" error.
+  dispatch: async (name, args) => {{
+    const impl = __handl_rt.__handlerImplFor(name);
+    if (impl !== undefined) {{
+      if (typeof impl !== "function") {{
+        throw new Error("handler impl for op '" + name + "' is not an arrow value");
+      }}
+      const argInput = (args.length === 1) ? args[0] : args;
+      return await __handl_rt.__applyHandler(impl, argInput);
+    }}
+    const member = __handl_rt[name];
+    if (typeof member === "function") return await member(...args);
+    throw new Error("unsupported op: " + name);
+  }},
+  // `perform(op, arg)` — the in-flight dispatch half of the io module's
+  // perform builtin (`native_ops::perform_dispatch`): a covered op
+  // applies its handler impl to `arg`; an uncovered op mints the
+  // residual `IO` former (`__former__`/`indices` wire) that an
+  // enclosing `handle`'s `__interpretIO` pass interprets. The `perform`
+  // / `io.perform` *op spellings* are compile-denied (P5a) — compiled
+  // code cannot reach this member — but it stays as the runtime half
+  // for host/driver JS and the follow-up that lands `perform`/`IO`.
+  // `op` arrives as a string or a `__sym__` name record.
+  perform: async (op, arg) => {{
+    const name = (typeof op === "string") ? op
+      : ((op !== null && typeof op === "object" && op.__sym__ !== null
+          && typeof op.__sym__ === "object" && typeof op.__sym__.name === "string")
+        ? op.__sym__.name : null);
+    if (name === null) {{
+      throw new Error("perform: op operand must be a string or sym");
+    }}
+    const impl = __handl_rt.__handlerImplFor(name);
+    if (impl !== undefined) {{
+      if (typeof impl !== "function") {{
+        throw new Error("handler impl for op '" + name + "' is not an arrow value");
+      }}
+      return await __handl_rt.__applyHandler(impl, (arg === undefined ? null : arg));
+    }}
+    return {{
+      __former__: {{ __sym__: {{ name: "type.io", handle: 0 }} }},
+      indices: [Object.assign({{}}, {{ [name]: (arg === undefined ? null : arg) }})],
+    }};
+  }},
+  // Qualified spelling (`io.perform`) resolves to the same builtin.
+  "io.perform": (op, arg) => __handl_rt.perform(op, arg),
   // --- arrow-lower op shims -------------------------------------------
   // Names match the op spellings the lowerer emits verbatim.
   truthy: (v) => !!v,
@@ -161,12 +342,14 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   flow: (a, b) => {{
     const isArrow = (v) => (typeof v === "function");
     if (isArrow(a) && isArrow(b)) {{
+      // `__apply` reinstates `__carried__` handler frames around each
+      // stage — the `attach_carried_handler` deep-dispatch channel.
       return Object.assign(
-        async (v) => await b(await a(v)),
+        async (v) => await __handl_rt.__apply(b, await __handl_rt.__apply(a, v)),
         {{__tag__: "Arrow", first: a, second: b}},
       );
     }}
-    if (isArrow(b)) return b(a);
+    if (isArrow(b)) return __handl_rt.__apply(b, a);
     throw new Error("flow: right operand is not an arrow value");
   }},
   // `ctor_name`/`ctor_fields` — ctor-object pattern introspection
@@ -202,6 +385,16 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   // JS host attached to `__handl_rt`) and throws the eval diagnostic
   // otherwise.
   __opRef: (name) => {{
+    // Under a live handler an op *reference* (`arr <op>`) is the
+    // dispatch object: a thunk that routes through `dispatch` at
+    // application time, so `handle arr read with Clock` binds a
+    // reusable handled arrow. `Array` input is read as the packed
+    // `app` arg tuple (subset gap: a lone array argument is
+    // indistinguishable from a multi-arg tuple on this target).
+    if (__handl_rt.__handlers.length > 0) {{
+      return async (input) => __handl_rt.dispatch(
+        name, Array.isArray(input) ? input : [input]);
+    }}
     if (Object.prototype.hasOwnProperty.call(__handl_rt, name)) return __handl_rt[name];
     throw new Error("unsupported op: " + name);
   }},

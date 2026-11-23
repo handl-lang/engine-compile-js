@@ -264,6 +264,22 @@ fn lower_op_body(
     }
 
     if let ArrSource::Foreign(module) = &source {
+        // `perform`/`io.perform` are reserved builtin spellings — eval's
+        // `is_perform_callee` intercepts them before host dispatch, so
+        // they are denied for foreign ops too rather than emitted as a
+        // `jsCall`. The qualified spelling is `module.name` (a lone
+        // `op_foreign("perform")` has module == name).
+        let qualified = if module.as_str() == name {
+            name.to_string()
+        } else {
+            format!("{module}.{name}")
+        };
+        if qualified == "perform" || qualified == "io.perform" {
+            return Err(CompileError::Lower(format!(
+                "op `{qualified}` is not supported by the JS backend \
+                 (effect operations have no runtime semantics here)"
+            )));
+        }
         return lower_foreign_op_body(name, args, module, lit, param);
     }
 
@@ -519,10 +535,26 @@ fn lower_op_body(
             }
         }
         _ => {
-            let callee = JsAst::Member {
-                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                prop: name.to_string(),
-            };
+            // Effect/proof op spellings that must never reach
+            // `__handl_rt.<name>` or `__opRef`: `handle`/`handle_dyn`
+            // belong to `Term::Handle` (the runtime `handle` member has
+            // a different signature), `rewrite`/`path`/`equiv` have no
+            // eval semantics to dispatch to (`Term::Rewrite` errors in
+            // `proof.rs`; `path`/`equiv` are `Term::Opaque` data), and
+            // `perform`/`io.perform` are the io module's perform
+            // builtin — eval's `perform_dispatch` needs the resume
+            // journal/`acc` machinery this subset does not carry, so
+            // the spellings fail honestly (the runtime `perform` member
+            // remains for host/driver JS and the follow-up).
+            if matches!(
+                name,
+                "handle" | "handle_dyn" | "rewrite" | "path" | "equiv" | "perform" | "io.perform"
+            ) {
+                return Err(CompileError::Lower(format!(
+                    "op `{name}` is not supported by the JS backend \
+                     (effect/proof operations have no runtime semantics here)"
+                )));
+            }
             if args.is_empty() {
                 // A 0-arg op term is the op referenced *as a value* (e.g.
                 // `var tag` for the ambient `tag` host package). Route
@@ -545,9 +577,32 @@ fn lower_op_body(
                     .iter()
                     .map(|a| lower_sub(a, param))
                     .collect::<Result<_, _>>()?;
-                JsAst::Call {
-                    callee: Box::new(callee),
-                    args: lowered_args,
+                if matches!(source, ArrSource::Native) {
+                    // Unknown/native op *call*: route through
+                    // `__handl_rt.dispatch` so a covering `handle` frame
+                    // can intercept it (eval's `dispatch_op` consults
+                    // the handler stack for `Native`/`Foreign` ops —
+                    // `Foreign` was diverted above, and `Judgment`/
+                    // `DynamicForeign` keep the direct member call);
+                    // uncovered ops fall back to the `__handl_rt.<name>`
+                    // member inside `dispatch`, then "unsupported op".
+                    // `args` evaluates once into the array `dispatch`
+                    // unpacks.
+                    JsAst::Call {
+                        callee: Box::new(JsAst::Member {
+                            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                            prop: "dispatch".to_string(),
+                        }),
+                        args: vec![JsAst::Str(name.to_string()), JsAst::Array(lowered_args)],
+                    }
+                } else {
+                    JsAst::Call {
+                        callee: Box::new(JsAst::Member {
+                            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                            prop: name.to_string(),
+                        }),
+                        args: lowered_args,
+                    }
                 }
             }
         }
@@ -587,6 +642,8 @@ fn lower_bound_op_body(
             } else {
                 // `app` arg-input: one argument stays bare, several pack
                 // into the tuple array the callee's `__in` expects.
+                // `__apply` reinstates `__carried__` handler frames a
+                // `handle` attached to the arrow value (deep dispatch).
                 let mut applied = applied;
                 let arg_input = if applied.len() == 1 {
                     applied.pop().unwrap()
@@ -594,8 +651,11 @@ fn lower_bound_op_body(
                     JsAst::Array(applied)
                 };
                 JsAst::Await(Box::new(JsAst::Call {
-                    callee: Box::new(callee),
-                    args: vec![arg_input],
+                    callee: Box::new(JsAst::Member {
+                        obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                        prop: "__apply".to_string(),
+                    }),
+                    args: vec![callee, arg_input],
                 }))
             }
         }
@@ -678,17 +738,25 @@ fn lower_bound_arrow_record(
                 JsAst::Return(Box::new(JsAst::ArrowFn {
                     params: vec!["__args".to_string()],
                     body: Box::new(JsAst::Await(Box::new(JsAst::Call {
-                        callee: Box::new(term_expr),
-                        args: vec![JsAst::Call {
-                            callee: Box::new(JsAst::Member {
-                                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                                prop: "__appInput".to_string(),
-                            }),
-                            args: vec![
-                                JsAst::Ident("__b".to_string()),
-                                JsAst::Ident("__args".to_string()),
-                            ],
-                        }],
+                        // `__apply` reinstates `__carried__` handler
+                        // frames on the bound arrow value.
+                        callee: Box::new(JsAst::Member {
+                            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                            prop: "__apply".to_string(),
+                        }),
+                        args: vec![
+                            term_expr,
+                            JsAst::Call {
+                                callee: Box::new(JsAst::Member {
+                                    obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                                    prop: "__appInput".to_string(),
+                                }),
+                                args: vec![
+                                    JsAst::Ident("__b".to_string()),
+                                    JsAst::Ident("__args".to_string()),
+                                ],
+                            },
+                        ],
                     }))),
                 })),
             ])),

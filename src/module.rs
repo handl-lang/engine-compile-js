@@ -28,6 +28,7 @@ use hnl_engine_parse_pratt::PrattEngine;
 use serde_json::Value;
 
 use crate::config::JsConfig;
+use crate::emit::{JsEmitter, SecurityScanner};
 use crate::lower::{self, BoundRef, JsAst};
 
 /// The `js` contract package (`handl-packages/js`): bare-name imports
@@ -458,6 +459,154 @@ impl<'e> ModuleCtx<'e> {
             }
         }
     }
+}
+
+/// Emit a module's statement list for a non-ESM output format
+/// (`commonjs`/`iife`/`inline`).
+///
+/// The ESM surface (`import`/`export` declarations) has no meaning in a
+/// classic script or a CommonJS file, so it is lowered here:
+///
+/// - `export const/let` → the plain declaration plus a `"name"` entry in
+///   the returned namespace object;
+/// - `export { a as b }` → a `"b": a` namespace entry (live-binding
+///   parity is approximate: the object is built once, at the end, so it
+///   reads each binding's final value — the same snapshot
+///   `module.exports = {…}` gives);
+/// - `export default e` → a `"default": e` namespace entry;
+/// - top-level `await`s (inlined dep consts, applied trailing
+///   expressions) are illegal outside an async context, so the whole
+///   body runs inside `(async () => { …; return <ns>; })()`.
+///
+/// The produced value is a `Promise` of the namespace record
+/// `{ name: value, …, "default": <default export> }` — the analogue of
+/// `import * as ns` / `ns.default`. Per-format shape:
+///
+/// - `commonjs`: `module.exports = (async () => { … })();` — `require()`
+///   yields the promise (`await require("./x.cjs")`). Surviving ES
+///   `import`s lower to real `require()` calls — specifiers resolve
+///   relative to the emitted file, the same contract ESM imports have —
+///   so `node:` builtins and driver-resolved paths both work.
+/// - `iife`: `(async function () { … })();` — the script evaluates to
+///   the promise (e.g. `eval(src)` or `<script>` + global capture).
+/// - `inline`: `prelude` + `(async () => { … })();` — a bare classic
+///   script; its completion value (`eval`, `new Function` body) is the
+///   promise.
+///
+/// `iife`/`inline` have no module loader at all: any surviving ES
+/// `import` — a specifier the driver did not resolve to a `.hnl` file —
+/// is a hard compile error rather than a silent global. `commonjs`
+/// keeps them as `require()` calls. `prelude` is placed per format:
+/// inside the wrapper for `iife` (self-contained), top-level for
+/// `commonjs`/`inline` (matching each format's `wrap()` contract).
+pub(crate) fn emit_module_surface(
+    stmts: &[JsAst],
+    format_name: &str,
+    prelude: &str,
+) -> Result<String, CompileError> {
+    if !matches!(format_name, "commonjs" | "iife" | "inline") {
+        return Err(CompileError::InvalidInput(format!(
+            "emit_module_surface: unsupported format {format_name:?}"
+        )));
+    }
+    let emitter = JsEmitter;
+    let mut plain: Vec<JsAst> = Vec::new();
+    let mut named: Vec<(String, JsAst)> = Vec::new();
+    let mut default: Option<JsAst> = None;
+    for stmt in stmts {
+        match stmt {
+            JsAst::Import {
+                spec,
+                named: imports,
+                namespace,
+            } => match format_name {
+                "commonjs" => plain.push(require_import(spec, imports, namespace.as_deref())),
+                _ => {
+                    return Err(CompileError::InvalidInput(format!(
+                        "{format_name}: `import … from {spec:?}` cannot be expressed — \
+                         the format has no module loader; resolve it to a `.hnl` module \
+                         via `JsConfig::modules`/`entry_imports` so it inlines"
+                    )));
+                }
+            },
+            JsAst::ExportDecl(inner) => {
+                if let JsAst::ConstDecl { name, .. } | JsAst::Let { name, .. } = inner.as_ref() {
+                    push_named(&mut named, name.clone(), JsAst::Ident(name.clone()));
+                }
+                plain.push(inner.as_ref().clone());
+            }
+            JsAst::ExportNames(pairs) => {
+                for (local, exported) in pairs {
+                    push_named(&mut named, exported.clone(), JsAst::Ident(local.clone()));
+                }
+            }
+            JsAst::ExportDefault(expr) => default = Some(expr.as_ref().clone()),
+            other => plain.push(other.clone()),
+        }
+    }
+    if let Some(d) = default {
+        push_named(&mut named, "default".to_string(), d);
+    }
+    let surface = JsAst::Object(named);
+    let body = emitter.emit_module(&plain)?;
+    let surface_js = emitter.emit_expr(&surface)?;
+    SecurityScanner::new().scan(&body)?;
+    SecurityScanner::new().scan(&surface_js)?;
+    let full = match format_name {
+        "commonjs" => format!(
+            "{prelude}module.exports = (async () => {{\n{body}  return {surface_js};\n}})();\n"
+        ),
+        "iife" => format!("(async function() {{\n{prelude}{body}  return {surface_js};\n}})();\n"),
+        // `inline`: prelude + a bare async-IIFE expression statement —
+        // the script's completion value is the namespace promise.
+        _ => format!("{prelude}(async () => {{\n{body}  return {surface_js};\n}})();\n"),
+    };
+    Ok(full)
+}
+
+/// Record `(exported name, value expr)` in the namespace object,
+/// replacing an earlier entry of the same name (last binding wins,
+/// matching eval's record projection).
+fn push_named(named: &mut Vec<(String, JsAst)>, name: String, value: JsAst) {
+    if let Some(slot) = named.iter_mut().find(|(n, _)| *n == name) {
+        slot.1 = value;
+    } else {
+        named.push((name, value));
+    }
+}
+
+/// Lower an ES `import` declaration to a CommonJS `require` binding:
+/// `import * as ns` → `const ns = require(spec)`, named imports →
+/// `const { "a": x } = require(spec)`, a bare `import "spec"` →
+/// `require(spec);` (side effects only).
+fn require_import(spec: &str, named: &[(String, String)], namespace: Option<&str>) -> JsAst {
+    let call = || JsAst::Call {
+        callee: Box::new(JsAst::Ident("require".to_string())),
+        args: vec![JsAst::Str(spec.to_string())],
+    };
+    if let Some(ns) = namespace {
+        return JsAst::ConstDecl {
+            name: ns.to_string(),
+            value: Box::new(call()),
+        };
+    }
+    if named.is_empty() {
+        return call();
+    }
+    // Destructuring needs no `JsAst` pattern node — emit the decl as a
+    // raw snippet (quoted keys keep non-identifier import names legal).
+    let props = named
+        .iter()
+        .map(|(imported, local)| {
+            let key = serde_json::to_string(&Value::String(imported.clone()))
+                .unwrap_or_else(|_| "\"_\"".to_string());
+            format!("{key}: {local}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let spec_lit = serde_json::to_string(&Value::String(spec.to_string()))
+        .unwrap_or_else(|_| "\"_\"".to_string());
+    JsAst::Raw(format!("const {{ {props} }} = require({spec_lit})"))
 }
 
 /// Lex + parse + desugar one statement chunk. Returns the (possibly

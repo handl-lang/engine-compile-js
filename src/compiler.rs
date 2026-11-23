@@ -24,33 +24,47 @@ impl Compiler for JsCompiler {
             .downcast_ref::<JsConfig>()
             .ok_or_else(|| CompileError::InvalidInput("expected JsConfig".to_string()))?;
 
+        let format_name = js_config.format.name();
+
         // `worker_entry` is a bundle contract on top of the module emit:
-        // ESM only (inlined deps use top-level `await`), a real `.hnl`
-        // module source only, and no ES `import` may survive that a
-        // blob/object-URL worker cannot resolve.
-        if js_config.worker_entry && js_config.format.name() != "esm" {
-            return Err(CompileError::InvalidInput(
-                "worker_entry requires the `esm` output format — a worker \
-                 bundle is an ES module (load it with `{ type: \"module\" }`)"
-                    .to_string(),
-            ));
+        // a real `.hnl` module source only, no ES `import` may survive
+        // that the worker cannot resolve, and the format must load as a
+        // worker — `esm` for module workers (`{ type: "module" }`),
+        // `iife`/`inline` for classic workers (a self-contained script:
+        // `new Worker(url)`, `importScripts`, or a Blob URL without
+        // `type`). `commonjs` is rejected: `module.exports` does not
+        // exist in a worker global scope.
+        if js_config.worker_entry && !matches!(format_name, "esm" | "iife" | "inline") {
+            return Err(CompileError::InvalidInput(format!(
+                "worker_entry requires the `esm` (module worker, loaded with \
+                 `{{ type: \"module\" }}`) or `iife`/`inline` (classic worker \
+                 script) output format — `{format_name}` cannot load as a \
+                 worker"
+            )));
         }
 
-        // File-level emit (ESM): a `.hnl` file is a sequence of top-level
+        // File-level emit: a `.hnl` file is a sequence of top-level
         // statements — walk them and emit `import`/`export`/`const`
-        // declarations. Inputs without a real `Language` (tests' synthetic
-        // `CompilerInput`s) fall through to the single-term path.
-        if js_config.format.name() == "esm" {
+        // declarations, lowered per format by `emit_module_surface` for
+        // the non-ESM targets. Inputs without a real `Language` (tests'
+        // synthetic `CompilerInput`s) fall through to the single-term
+        // path, as do unrecognized custom formats.
+        if matches!(format_name, "esm" | "commonjs" | "iife" | "inline") {
             match crate::module::try_compile_module(input, js_config)? {
                 Some(stmts) => {
                     if js_config.worker_entry {
                         check_worker_entry_imports(&stmts)?;
                     }
                     let emitter = JsEmitter;
-                    let body = emitter.emit_module(&stmts)?;
-                    SecurityScanner::new().scan(&body)?;
-                    let prelude = runtime_prelude(js_config.format.as_ref());
-                    let full = format!("{prelude}{body}");
+                    let full = if format_name == "esm" {
+                        let body = emitter.emit_module(&stmts)?;
+                        SecurityScanner::new().scan(&body)?;
+                        let prelude = runtime_prelude(js_config.format.as_ref());
+                        format!("{prelude}{body}")
+                    } else {
+                        let prelude = runtime_prelude(js_config.format.as_ref());
+                        crate::module::emit_module_surface(&stmts, format_name, &prelude)?
+                    };
                     return Ok(Box::new(JsOutput::new(full)));
                 }
                 None => {

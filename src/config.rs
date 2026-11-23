@@ -75,6 +75,13 @@ impl JsOutputFormat for Esm {
 }
 
 /// CommonJS module output.
+///
+/// Single-term inputs wrap as `module.exports = <expr>;`. `.hnl`
+/// module sources go through the file-level emit: the body runs inside
+/// `module.exports = (async () => { …; return <namespace>; })();`, so
+/// `require()` yields a `Promise` of the export namespace (`{ name:
+/// value, …, default: <default export> }`), and surviving ES `import`s
+/// lower to `require()` calls.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CommonJs;
 
@@ -89,6 +96,13 @@ impl JsOutputFormat for CommonJs {
 }
 
 /// IIFE output, bundling the runtime prelude and returning the expression.
+///
+/// Single-term inputs produce `(function () { …; return <expr>; })();`.
+/// `.hnl` module sources produce an *async* IIFE —
+/// `(async function () { …; return <namespace>; })();` — because
+/// inlined deps and applied expressions use `await`; the script
+/// evaluates to a `Promise` of the export namespace, and any ES
+/// `import` is a compile error (a classic script has no module loader).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Iife;
 
@@ -109,6 +123,11 @@ impl JsOutputFormat for Iife {
 }
 
 /// Inline output, no module header; ideal for `<script>` or `eval`.
+///
+/// Single-term inputs emit `prelude + <expr>`. `.hnl` module sources
+/// emit `prelude + (async () => { …; return <namespace>; })();` — a
+/// bare classic script whose completion value (e.g. under `eval`) is a
+/// `Promise` of the export namespace; ES `import`s are a compile error.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Inline;
 
@@ -170,8 +189,8 @@ pub struct JsConfig {
     /// path of its own).
     pub entry_imports: Vec<(String, String)>,
     /// Compile the input as a **worker entry bundle**: one self-contained
-    /// ES module — runtime prelude + the inlined `.hnl` dep graph —
-    /// loadable via `new Worker(url_or_blob, { type: "module" })`.
+    /// file — runtime prelude + the inlined `.hnl` dep graph — loadable
+    /// via `new Worker(url_or_blob)` / `importScripts` / a Blob URL.
     ///
     /// The flag is a *bundle contract*, not a code convention: the
     /// worker's message wiring lives in the `.hnl` source itself,
@@ -186,20 +205,26 @@ pub struct JsConfig {
     ///
     /// Constraints enforced at compile time:
     ///
-    /// - the output format must be `esm` (inlined deps use top-level
-    ///   `await`; a worker bundle is always an ES module — load it with
-    ///   `{ type: "module" }`, classic-script `importScripts` workers
-    ///   are not supported yet);
+    /// - the output format must be `esm`, `iife`, or `inline` —
+    ///   `esm` produces a module worker (load it with
+    ///   `{ type: "module" }`); `iife`/`inline` produce a classic
+    ///   worker script (no `type` option, `importScripts`-style).
+    ///   `commonjs` is rejected: `module.exports` does not exist in a
+    ///   worker global scope;
     /// - the input must go through the file-level module emit (a
     ///   `.hnl` module source — the single-term path has no module
     ///   surface to wire);
-    /// - every surviving ES `import` must be self-contained-resolvable:
-    ///   builtin schemes (`node:`, `bun:`, `deno:`) and absolute URLs
-    ///   (`https://…`) are kept; relative or filesystem-absolute
-    ///   specifiers cannot resolve inside a blob/object-URL worker and
-    ///   are a compile error — resolve them to `.hnl` files via
-    ///   [`JsConfig::modules`]/[`JsConfig::entry_imports`] so they inline
-    ///   instead.
+    /// - no surviving ES `import` may be unresolvable inside the
+    ///   bundle: builtin schemes (`node:`, `bun:`, `deno:`) and
+    ///   absolute URLs (`https://…`) are kept under `esm`; relative or
+    ///   filesystem-absolute specifiers cannot resolve inside a
+    ///   blob/object-URL worker and are a compile error — resolve them
+    ///   to `.hnl` files via [`JsConfig::modules`]/
+    ///   [`JsConfig::entry_imports`] so they inline instead. Under
+    ///   `iife`/`inline` *every* ES `import` is a compile error (a
+    ///   classic script has no module loader — not even `node:`
+    ///   builtins), so worker entries in those formats must fully
+    ///   inline their `.hnl` dep graph.
     pub worker_entry: bool,
 }
 

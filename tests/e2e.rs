@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 
 use handl_language::{Ast, AstNode, Language};
 use handl_plugin_compile::CompilerInput;
-use handl_plugin_compile_js::{JsConfig, JsModule, Node, compile_to_string};
+use handl_plugin_compile_js::{Iife, Inline, JsConfig, JsModule, Node, compile_to_string};
 use hnl_engine::{ArrSource, Term};
 use hnl_engine_typecheck::TypecheckReport;
 use serde_json::Value;
@@ -711,6 +711,190 @@ console.log("self-ok");
 }
 
 // ---------------------------------------------------------------------------
+// T-005: non-ESM module formats — `commonjs`/`iife`/`inline` module emit,
+// exercised under real `node`.
+// ---------------------------------------------------------------------------
+
+/// `commonjs` output on the Node target.
+fn cjs_node() -> JsConfig {
+    JsConfig::cjs_node()
+}
+
+/// A script format (`iife`/`inline`) on the Node target — the format,
+/// not the target, decides the module shape; Node is where drivers run.
+fn script_format<F: handl_plugin_compile_js::JsOutputFormat + 'static>(format: F) -> JsConfig {
+    let mut config = JsConfig::esm_deno();
+    config.target = Box::new(Node);
+    config.format = Box::new(format);
+    config
+}
+
+#[test]
+fn e2e_commonjs_module_namespace_via_require() {
+    require_node!();
+    // A `.hnl` module with a resolved dep compiles to CJS: dep inlining
+    // is unchanged, `export`s collect into the namespace object, and
+    // `module.exports` is the async-IIFE promise — `await require()`
+    // yields `{ double, quad, default }`.
+    let mut config = cjs_node();
+    config.modules = vec![JsModule {
+        path: "/pkgs/dep/dep.hnl".to_string(),
+        source: "export double := (x) ~> x * 2\n".to_string(),
+        imports: Vec::new(),
+    }];
+    config.entry_imports = vec![("dep".to_string(), "/pkgs/dep/dep.hnl".to_string())];
+    let js = compile_to_string(
+        &module_input(
+            "from \"dep\" import { double }\n\
+             export quad := (x) ~> double(double(x))\n\
+             quad(5)\n",
+        ),
+        &config,
+    )
+    .expect("compile cjs fixture");
+    let driver = r#"
+const ns = require("./prog.cjs");
+Promise.resolve(ns).then(async (m) => {
+  const q = await m.quad(5);
+  // `double` was imported for `quad`'s body, not re-exported — the
+  // namespace carries the entry's own exports only.
+  console.log(JSON.stringify({ quad: q, def: m.default,
+    hasQuad: typeof m.quad === "function", hasDouble: "double" in m }));
+}).catch((e) => { console.error(e); process.exit(1); });
+"#;
+    let run = run_node(
+        "cjs-module",
+        &[("prog.cjs", js.as_str()), ("driver.cjs", driver)],
+        "driver.cjs",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // quad(5) = double(double(5)) = 20 through the inlined dep; the
+    // trailing `quad(5)` is the default export.
+    assert_eq!(
+        run.stdout.trim(),
+        r#"{"quad":20,"def":20,"hasQuad":true,"hasDouble":false}"#
+    );
+}
+
+#[test]
+fn e2e_iife_module_namespace_via_eval() {
+    require_node!();
+    // IIFE: `(async function () { … })();` — `eval` yields the
+    // completion value, the namespace promise.
+    let js = compile_to_string(
+        &module_input("export plus := (a, b) ~> a + b\nplus(20, 22)\n"),
+        &script_format(Iife),
+    )
+    .expect("compile iife fixture");
+    assert!(js.starts_with("(async function()"), "{js}");
+    let driver = r#"
+import { readFileSync } from "node:fs";
+const src = readFileSync("./prog.js", "utf8");
+const p = eval(src);
+const ns = await p;
+// Arrow call convention: one arg is fed bare, several pack into an
+// array — `plus(20, 22)` is `ns.plus([20, 22])`.
+const total = await ns.plus([20, 22]);
+console.log(JSON.stringify({ def: ns.default, total: total,
+  hasPlus: typeof ns.plus === "function" }));
+"#;
+    let run = run_node(
+        "iife-module",
+        &[("prog.js", js.as_str()), ("driver.mjs", driver)],
+        "driver.mjs",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // plus(20,22) = 42 both as the default export and via the named
+    // export — proving the export-surface mapping, not just eval.
+    assert_eq!(run.stdout.trim(), r#"{"def":42,"total":42,"hasPlus":true}"#);
+}
+
+#[test]
+fn e2e_inline_module_namespace_via_eval() {
+    require_node!();
+    // Inline: `var __handl_rt = …; (async () => { … })();` — a bare
+    // classic script whose eval completion value is the promise.
+    let js = compile_to_string(
+        &module_input("export dbl := (x) ~> x * 2\ndbl(21)\n"),
+        &script_format(Inline),
+    )
+    .expect("compile inline fixture");
+    assert!(js.contains("(async () => {"), "{js}");
+    let driver = r#"
+import { readFileSync } from "node:fs";
+const src = readFileSync("./prog.js", "utf8");
+const p = eval(src);
+const ns = await p;
+const v = await ns.dbl(21);
+console.log(JSON.stringify({ def: ns.default, dbl: v }));
+"#;
+    let run = run_node(
+        "inline-module",
+        &[("prog.js", js.as_str()), ("driver.mjs", driver)],
+        "driver.mjs",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(run.stdout.trim(), r#"{"def":42,"dbl":42}"#);
+}
+
+#[test]
+fn e2e_worker_entry_iife_classic_script_roundtrip() {
+    require_node!();
+    // `worker_entry` + `iife`: the bundle is a classic worker script —
+    // no ES module syntax — that registers `js.on("self", "message")`
+    // exactly like the ESM worker fixture. Node has no real worker
+    // `self`, so the driver installs the same minimal fake and evals
+    // the script (the classic-script load path a Blob/`importScripts`
+    // worker takes).
+    let mut config = script_format(Iife);
+    config.worker_entry = true;
+    let worker_js = compile_to_string(
+        &module_input(
+            r#"
+from "js" import { on as js_on }
+
+js_on("self", "message", (msg) ~> { echo: msg.n, pong: "yes" })
+"#,
+        ),
+        &config,
+    )
+    .expect("compile iife worker entry");
+    assert!(worker_js.starts_with("(async function()"), "{worker_js}");
+    assert!(!worker_js.contains("export"), "{worker_js}");
+    assert!(!worker_js.contains("import { "), "{worker_js}");
+    assert!(!worker_js.contains("module.exports"), "{worker_js}");
+    let driver = r#"
+import { readFileSync } from "node:fs";
+const listeners = new Map();
+const sent = [];
+globalThis.self = {
+  addEventListener: (name, fn) => listeners.set(name, fn),
+  removeEventListener: (name) => listeners.delete(name),
+  postMessage: (m) => sent.push(m),
+  importScripts: () => {},
+  close: () => {},
+};
+const src = readFileSync("./worker.js", "utf8");
+eval(src);
+const listener = listeners.get("message");
+if (typeof listener !== "function") throw new Error("worker did not register a message listener");
+listener({ data: { n: 7 } });
+await new Promise((r) => setTimeout(r, 100));
+if (sent.length !== 1) throw new Error("expected 1 reply, got " + sent.length);
+const m = sent[0];
+if (m.echo !== 7 || m.pong !== "yes") throw new Error("bad reply: " + JSON.stringify(m));
+console.log("iife-worker-ok");
+"#;
+    let run = run_node(
+        "worker-iife",
+        &[("worker.js", worker_js.as_str()), ("driver.mjs", driver)],
+        "driver.mjs",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(run.stdout.trim(), "iife-worker-ok");
+}
+
+// ---------------------------------------------------------------------------
 // Security surface (compile-time; no node needed)
 // ---------------------------------------------------------------------------
 
@@ -745,4 +929,171 @@ fn e2e_dangerous_foreign_op_rejected() {
         TypecheckReport::default(),
     );
     assert!(compile_to_string(&input, &JsConfig::esm_deno()).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// T-006 (P5a/P5b): effect semantics — `handle`/`arr <op>` dispatch, the
+// `return` clause, carried handlers, residual `IO` formers, and
+// compile-error fixtures for the denied spellings (`perform`/`io.perform`
+// included — eval's `perform_dispatch` needs machinery outside the
+// subset, so only the runtime `__handl_rt.perform` member remains, for
+// host/driver JS).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_handle_arr_op_dispatch_and_carried_handlers() {
+    require_node!();
+    // `handle (arr Foo)(21) with {Foo: impl}` performs `Foo` through the
+    // handler stack; `handle arr Foo with h` binds a *reusable* handled
+    // arrow — the carried handler reinstalls on `f(5)` outside the
+    // `handle`.
+    let run = run_program(
+        "handle-dispatch",
+        r#"
+f := handle arr Foo with { Foo: (x) ~> x + 1 }
+{
+  arr_op: handle (arr Foo)(21) with { Foo: (x) ~> x + 1 },
+  carried: f(5)
+}
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(run.stdout.trim(), r#"{"arr_op":22,"carried":6}"#);
+}
+
+#[test]
+fn e2e_handle_nested_handlers_and_return_clause() {
+    require_node!();
+    // Innermost-first handler resolution and the `return` clause
+    // postlude (`h["return"](r)`).
+    let run = run_program(
+        "handle-nested",
+        r#"
+with_ret := handle (arr Foo)(5) with { Foo: (x) ~> x + 1, "return": (v) ~> v * 10 }
+nested := handle { a: handle (arr Foo)(1) with { Foo: (x) ~> x + 10 }, b: (arr Foo)(3) } with { Foo: (x) ~> x - 1 }
+{ ret: with_ret, nested: nested }
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // (5+1)*10 = 60; inner handle → 11, outer body op → 3-1 = 2.
+    assert_eq!(run.stdout.trim(), r#"{"ret":60,"nested":{"a":11,"b":2}}"#);
+}
+
+#[test]
+fn e2e_handle_interpret_io_former_and_runtime_perform() {
+    require_node!();
+    // The `perform`/`io.perform` op spellings are compile-denied, but
+    // the runtime halves remain for host/driver JS: `handle`'s
+    // `__interpretIO` post-pass interprets a `type.io` former record —
+    // covered sig fields dispatch through the still-installed handler,
+    // uncovered entries stay data — and `__handl_rt.perform` does the
+    // in-flight dispatch / residual-former mint when called directly.
+    let run = run_program(
+        "handle-io",
+        "x := 1\n",
+        r#"
+await import("./prog.mjs");
+const rt = globalThis.__handl_rt;
+const former = {__former__: {__sym__: {name: "type.io", handle: 0}},
+                indices: [{Bar: 7, Foo: 3}]};
+const impl = async () => ({Foo: async (x) => x + 1});
+const interpreted = await rt.handle(async () => former, "T", impl, null);
+console.log("io:" + JSON.stringify(interpreted.indices[0]));
+const dispatched = await rt.handle(async () => rt.perform("Foo", 5), "T", impl, null);
+console.log("perform:" + dispatched);
+const residual = await rt.perform("Baz", 9);
+console.log("residual:" + JSON.stringify(residual.indices[0]));
+// Negative: an `acc`-carrying handler value and a ≥2-ary impl (the
+// multi-shot `resume` shape) fail loudly, not silently.
+try {
+  await rt.handle(async () => 1, "T", async () => ({__acc__: 0}), null);
+  console.log("acc:no-throw");
+} catch (e) { console.log("acc:" + e.message); }
+try {
+  await rt.handle(async () => rt.perform("Foo", 1), "T",
+    async () => ({Foo: async (a, b) => a}), null);
+  console.log("resume:no-throw");
+} catch (e) { console.log("resume:" + e.message); }
+"#,
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // `Foo` covered → 3+1 = 4; `Bar` uncovered → stays 7. In-flight
+    // `perform("Foo", 5)` dispatches → 6. Uncovered `perform` mints
+    // the residual former. `__acc__` and ≥2-ary impls throw the
+    // documented subset errors.
+    assert_eq!(
+        run.stdout.trim(),
+        r#"io:{"Bar":7,"Foo":4}
+perform:6
+residual:{"Baz":9}
+acc:handle: `acc` clause is not supported by the JS backend
+resume:handler impl is ≥2-ary: multi-shot `resume` is not supported by the JS backend"#
+    );
+}
+
+#[test]
+fn e2e_handle_pop_on_throw_and_unsupported_op() {
+    require_node!();
+    // A body whose op no handler covers throws "unsupported op" inside
+    // the dynamic extent; `handle`'s `finally` still pops the frame, so
+    // `__handlers` is empty after the rejected module eval — and the
+    // error is the eval-faithful diagnostic, not a TypeError.
+    let run = run_program(
+        "handle-throw",
+        r#"
+bad := handle (arr Bar)(1) with { Foo: (x) ~> x + 1 }
+"#,
+        "try { await import(\"./prog.mjs\"); } catch (e) { console.log(\"threw:\" + e.message); }\n\
+         console.log(\"handlers:\" + globalThis.__handl_rt.__handlers.length);\n",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert!(
+        run.stdout.contains("threw:unsupported op: Bar"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("handlers:0"), "{}", run.stdout);
+}
+
+#[test]
+fn e2e_denylisted_effect_op_spellings_fail_to_compile() {
+    // P5a: `handle`/`handle_dyn`/`rewrite`/`path`/`equiv`/`perform`/
+    // `io.perform` op spellings are compile errors — they must never
+    // reach `__handl_rt.<name>` or `__opRef` (the old stubs fabricated
+    // results, and `perform` needs resume-journal machinery the subset
+    // does not carry).
+    for name in [
+        "handle",
+        "handle_dyn",
+        "rewrite",
+        "path",
+        "equiv",
+        "perform",
+        "io.perform",
+    ] {
+        for args in [
+            vec![],
+            vec![Term::const_value(Value::Number(serde_json::Number::from(
+                1,
+            )))],
+        ] {
+            let term = Term::op_native(name, args);
+            let mut ast = Ast::new();
+            let root = ast.push(AstNode::new("module"));
+            let input = CompilerInput::new(
+                "test".to_string(),
+                ast,
+                root,
+                Language::new(),
+                term,
+                TypecheckReport::default(),
+            );
+            assert!(
+                compile_to_string(&input, &esm_node()).is_err(),
+                "op `{name}` unexpectedly compiled"
+            );
+        }
+    }
 }

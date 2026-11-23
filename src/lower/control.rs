@@ -387,10 +387,15 @@ fn lower_app_applied(callee: &Term, args: &[Term], input: &JsAst) -> Result<JsAs
         JsAst::Array(arg_exprs)
     };
     // Applying an arrow yields a Promise on this target (all emitted
-    // arrows are async), so the call is awaited.
+    // arrows are async), so the call is awaited. `__apply` reinstates
+    // `__carried__` handler frames a `handle` attached to the callee
+    // value (deep dispatch, `attach_carried_handler` subset).
     Ok(JsAst::Await(Box::new(JsAst::Call {
-        callee: Box::new(callee_expr),
-        args: vec![arg_input],
+        callee: Box::new(JsAst::Member {
+            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+            prop: "__apply".to_string(),
+        }),
+        args: vec![callee_expr, arg_input],
     })))
 }
 
