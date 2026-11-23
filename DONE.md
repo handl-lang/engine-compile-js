@@ -24,3 +24,4 @@
 - T-022 UPSTREAM host: 'acc' needs contextual keyword in parser/lexer (lexer\_rules.yaml:226-230 reserved-word breakage); then perform\_acc\_state\_threading goes green · pri:high · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
 - T-024 ADOPT kernel@e2e8e93 acc field — engine-compile-js: lower/higher.rs Term::Handle arms + prelude acc path (unpin .cargo kernel patch first); e2e handle+acc fixture · pri:high · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
 - T-023 UPSTREAM lib-loader: src/index.hnl lacks export data handling (bootstrap fallback covers); loader.rs bootstrap mirror diverges — update for parity · pri:high · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
+- T-011 GAP: untested surface — https: imports in real browser worker, real-browser (non-shim) worker e2e, auto-reply transfer suppression docs · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
