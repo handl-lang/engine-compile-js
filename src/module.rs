@@ -25,7 +25,6 @@ use hnl_engine::Term;
 use hnl_engine_lex_pattern::lex;
 use hnl_engine_parse::{ParserEngine, ParserRequest};
 use hnl_engine_parse_pratt::PrattEngine;
-use hnl_engine_transform_rewrite::RewriteEngine;
 use serde_json::Value;
 
 use crate::config::JsConfig;
@@ -49,11 +48,12 @@ const PRELUDE_OWNED: &[&str] = &["tag"];
 const CIRCULAR_IMPORT: &str = "circular import detected";
 
 /// Node kinds that are compile-time declarations with no runtime value —
-/// they emit a comment, not a statement. `data` is listed too: its
-/// desugared `block` binds constructors in a private env the per-statement
-/// lowering cannot lift to module scope yet (stub, see report).
+/// they emit a comment, not a statement. `data` is deliberately absent:
+/// the desugar pass rewrites it to a `__splice__`d `block` of former /
+/// constructor / recursor `assign`s (handled in `emit_splice_block`); a
+/// `data` node that survives to emit is a hard error, not a silent skip.
 const DECL_ONLY_KINDS: &[&str] = &[
-    "cap", "handle", "trait", "impl", "type", "law", "data", "sort", "grade", "rewrite", "infer",
+    "cap", "handle", "trait", "impl", "type", "law", "sort", "grade", "rewrite", "infer",
 ];
 
 /// Try to compile `input` as a whole `.hnl` module.
@@ -168,7 +168,7 @@ impl<'a> Bundle<'a> {
         edges: HashMap<String, String>,
         dep: bool,
     ) -> Result<BodyEmit, CompileError> {
-        let mut ctx = ModuleCtx::new(&edges, dep);
+        let mut ctx = ModuleCtx::new(lang, &edges, dep);
         let chunks = split_statements(source);
         let last = chunks.len().saturating_sub(1);
         for (i, chunk) in chunks.iter().enumerate() {
@@ -307,6 +307,26 @@ struct ModuleCtx<'e> {
     /// (`module_prep` parity).
     bound_order: Vec<String>,
     stmts: Vec<JsAst>,
+    /// The base `Language` (roles/globals for parsing and lowering).
+    lang: &'e Language,
+    /// A lazily-cloned `Language` carrying ctor globals injected by
+    /// `data` declarations (`F := { C : … }` lowers nullary constructors
+    /// to literal values so `match`'s ctor-value patterns see them —
+    /// `lower_ast`'s env is per-statement and cannot carry module
+    /// bindings, but `lang.globals` is consulted by `var` resolution).
+    /// `None` until the first `data` decl; `lang()` prefers it.
+    augmented_lang: Option<Language>,
+    /// Names bound by signature decls (`x : T`, `export x : T`) — `let`
+    /// bindings initialised to `null` (module_prep's type-only erasure),
+    /// reassignable when a later `:=` supplies the implementation.
+    signature_names: HashSet<String>,
+    /// `export <name>` / `export <name> : <sig>` decls whose target may
+    /// be bound later in the file — resolved in `finish` once every
+    /// binding is known (also fixes `export { f }` before `f := …`).
+    pending_exports: Vec<String>,
+    /// JS names already emitted as exports — guards `export { f }`
+    /// duplicates when a pending export resolves to an `export const`.
+    exported_names: HashSet<String>,
     /// The importing module's resolved edges (spec → canonical path).
     edges: &'e HashMap<String, String>,
     /// Dep mode: collect exports for the `__handl_rt` record and route
@@ -320,7 +340,7 @@ struct ModuleCtx<'e> {
 }
 
 impl<'e> ModuleCtx<'e> {
-    fn new(edges: &'e HashMap<String, String>, dep: bool) -> Self {
+    fn new(lang: &'e Language, edges: &'e HashMap<String, String>, dep: bool) -> Self {
         let mut bound = HashMap::new();
         // Ambient host packages visible without an import (the canonical
         // module chain — wire names resolve in every eval context): `var
@@ -334,11 +354,22 @@ impl<'e> ModuleCtx<'e> {
             bound,
             bound_order: Vec::new(),
             stmts: Vec::new(),
+            lang,
+            augmented_lang: None,
+            signature_names: HashSet::new(),
+            pending_exports: Vec::new(),
+            exported_names: HashSet::new(),
             edges,
             dep,
             exports: Vec::new(),
             tail: None,
         }
+    }
+
+    /// The `Language` handed to `lower_ast` — the augmented clone once a
+    /// `data` decl has injected ctor globals, else the base language.
+    fn lang(&self) -> &Language {
+        self.augmented_lang.as_ref().unwrap_or(self.lang)
     }
 
     /// Bind a module-scope name; in dep mode the name joins the
@@ -350,12 +381,42 @@ impl<'e> ModuleCtx<'e> {
         self.bound.insert(name, r);
     }
 
-    fn finish(self) -> BodyEmit {
+    fn finish(mut self) -> BodyEmit {
+        // Resolve deferred `export <name>` decls now that every binding
+        // is known — a name bound anywhere in the module exports its
+        // final value; a never-bound name is a type-only signature
+        // (`module_prep` erases those to `null` in the module record,
+        // and ESM has no runtime binding to export).
+        for name in std::mem::take(&mut self.pending_exports) {
+            match self.bound.get(&name) {
+                Some(r) => {
+                    let r = r.clone();
+                    if self.dep {
+                        self.exports.push((name.clone(), bound_expr(&r)));
+                    } else {
+                        self.emit_entry_export(&name, &r);
+                    }
+                }
+                None => {
+                    if self.dep {
+                        self.exports.push((name.clone(), JsAst::Null));
+                    } else {
+                        self.stmts.push(JsAst::Comment(format!(
+                            "compile-js: `export {name}` has no runtime binding \
+                             (type-only/signature export — nothing emitted)"
+                        )));
+                    }
+                }
+            }
+        }
         let exports = if self.exports.is_empty() && self.dep {
             // No `export` declarations: the module record projects every
-            // top-level bound name (`module_prep` parity).
+            // top-level bound name (`module_prep` parity). Dotted names
+            // (`F.rec` recursor binds) are not valid Handl export names —
+            // `module_prep`'s `is_valid_ident` skips them too.
             self.bound_order
                 .iter()
+                .filter(|n| !n.contains('.'))
                 .filter_map(|n| self.bound.get(n).map(|r| (n.clone(), bound_expr(r))))
                 .collect()
         } else {
@@ -365,6 +426,36 @@ impl<'e> ModuleCtx<'e> {
             stmts: self.stmts,
             exports,
             tail: self.tail,
+        }
+    }
+
+    /// Emit the ESM surface for `export <name>` once `name` is known to
+    /// be bound: `export { js }` when the binding already is a real JS
+    /// name (`const`/import), otherwise a `const` alias of the bound
+    /// expression first (dep member paths, `__handl_rt` shims).
+    fn emit_entry_export(&mut self, name: &str, r: &BoundRef) {
+        let js = match r {
+            BoundRef::Arrow(js) | BoundRef::Ident(js) => js.clone(),
+            _ => js_ident(name),
+        };
+        if !self.exported_names.insert(js.clone()) {
+            return;
+        }
+        match r {
+            BoundRef::Arrow(_) | BoundRef::Ident(_) => {
+                self.stmts.push(JsAst::ExportNames(vec![(js.clone(), js)]));
+            }
+            _ => {
+                // Alias the bound expression to a local `const` so the
+                // `export { … }` has a real binding; the module's own
+                // uses keep resolving through the original `BoundRef`
+                // (call conventions differ per variant).
+                self.stmts.push(JsAst::ConstDecl {
+                    name: js.clone(),
+                    value: Box::new(bound_expr(r)),
+                });
+                self.stmts.push(JsAst::ExportNames(vec![(js.clone(), js)]));
+            }
         }
     }
 }
@@ -383,15 +474,14 @@ fn parse_statement(lang: &Language, text: &str) -> Result<(Ast, AstRef), String>
     if ast.is_empty() {
         return Ok((ast, AstRef::new(0)));
     }
-    // Mirror `Runtime::parse`: the "desugar" transform pass runs between
-    // parse and lowering so `for`/`do-while`/`opt-chain`/`data` reach the
-    // lowerer in desugared form.
-    let root = AstRef::new(ast.len() - 1);
-    let out = RewriteEngine::new()
-        .with_desugar_natives()
-        .run_pass(lang, &ast, root, "desugar")
+    // Mirror `Runtime::parse`: the canonical `apply_desugar` driver runs
+    // between parse and lowering — `normalize_family_records` (both
+    // `data F :: …` and the `F := { … }` surface spellings become `data`
+    // nodes), the `desugar` transform pass, and `splice_decl_blocks`
+    // (a root-level `__splice__` block stays flagged — `emit_statement`
+    // walks its children as module-scope bindings).
+    let ast = handl_runtime::desugar_pass::apply_desugar(lang, &ast)
         .map_err(|e| format!("desugar: {e}"))?;
-    let ast = out.ast;
     if ast.is_empty() {
         return Ok((ast, AstRef::new(0)));
     }
@@ -581,11 +671,51 @@ impl ModuleCtx<'_> {
         match node.kind.as_str() {
             "stmt.import" => self.emit_import(g, lang, ast, node, text),
             "stmt.export" => self.emit_export(lang, ast, node),
+            // A `data` node that survived the desugar pass (unparseable
+            // payload — `desugar_data` declines via `pass_through`) has
+            // no runtime lowering; fail loudly rather than emit a comment
+            // and silently drop the declaration's constructors.
+            "data" => Err(CompileError::InvalidInput(
+                "`data` declaration could not be desugared — its payload is \
+                 not a supported family/constructor shape"
+                    .to_string(),
+            )),
             kind if DECL_ONLY_KINDS.contains(&kind) => {
                 self.stmts.push(JsAst::Comment(format!(
                     "compile-js: `{kind}` declaration has no runtime emit (skipped)"
                 )));
                 Ok(())
+            }
+            // `x : T` — a bare type-annot statement is a signature
+            // declaration (module_prep binds it to `null`).
+            "type-annot" => self.emit_signature(lang, ast, root, node, is_last, false),
+            // `data F := { … }` / `data F :: …` desugar to a declaration
+            // group of former/ctor/recursor `assign`s. Two root shapes
+            // reach emit: the `__splice__`-flagged `block` itself (no
+            // enclosing statement list to splice into), or — because
+            // `apply_desugar`'s `splice_decl_blocks` flattens flagged
+            // blocks into *any* parent with a `statements` role — the
+            // unflagged surface `block` the assigns were spliced into.
+            _ if is_splice_block(node) => self.emit_splice_block(lang, ast, node).map(|_| ()),
+            _ if self.is_flattened_decl_group(lang, ast, node) => {
+                self.emit_splice_block(lang, ast, node).map(|_| ())
+            }
+            // `export data F :: …` parses as `export <var data>` spliced
+            // into the family decl group — there is no `export data`
+            // form; the block would lower to a nonsense `export(data)`
+            // call. Fail loudly: export the family by name instead
+            // (`data F :: …` then `export F`).
+            _ if node.kind == "block"
+                && children_of(node).iter().any(|&c| {
+                    ast.get(AstRef::new(c))
+                        .is_some_and(|n| n.kind == "stmt.export")
+                }) =>
+            {
+                Err(CompileError::InvalidInput(
+                    "`export data …` is not a supported declaration form — \
+                     declare the family, then `export F` (or the ctor names)"
+                        .to_string(),
+                ))
             }
             _ => {
                 if let Some((name, value_idx)) = self.binding_parts(lang, ast, node) {
@@ -654,23 +784,41 @@ impl ModuleCtx<'_> {
         // name is in scope once the arrow runs).
         self.bind(name.to_string(), BoundRef::Arrow(js_name.clone()));
         let value = self.lower_value(lang, ast, root, value_idx)?;
-        let decl = JsAst::ConstDecl {
-            name: js_name.clone(),
-            value: Box::new(value),
-        };
-        if self.dep {
-            // Inlined module: plain `const`, and the name joins the
-            // export record when declared `export`.
-            self.stmts.push(decl);
-            if export {
-                self.exports.push((name.to_string(), JsAst::Ident(js_name)));
+        // A name previously bound by a signature decl (`x : T` → `let x =
+        // null`) is reassigned, not redeclared — `const` would be a
+        // duplicate-declaration SyntaxError and `let` is what the
+        // signature binding emitted.
+        let reassign = self.signature_names.contains(name);
+        let decl = if reassign {
+            JsAst::Assign {
+                name: js_name.clone(),
+                value: Box::new(value),
             }
         } else {
-            self.stmts.push(if export {
-                JsAst::ExportDecl(Box::new(decl))
+            JsAst::ConstDecl {
+                name: js_name.clone(),
+                value: Box::new(value),
+            }
+        };
+        if self.dep {
+            // Inlined module: plain binding, and the name joins the
+            // export record when declared `export` (and not already
+            // recorded by an earlier signature export).
+            self.stmts.push(decl);
+            if export && !self.exports.iter().any(|(n, _)| n == name) {
+                self.exports.push((name.to_string(), JsAst::Ident(js_name)));
+            }
+        } else if export {
+            if reassign {
+                // `export x : T` already emitted `export let x = null` —
+                // the assignment keeps the live export binding current.
+                self.stmts.push(decl);
             } else {
-                decl
-            });
+                self.exported_names.insert(js_name.clone());
+                self.stmts.push(JsAst::ExportDecl(Box::new(decl)));
+            }
+        } else {
+            self.stmts.push(decl);
         }
         Ok(())
     }
@@ -681,12 +829,12 @@ impl ModuleCtx<'_> {
     /// awaited (top-level `await` is legal in ESM).
     fn lower_value(
         &mut self,
-        lang: &Language,
+        _lang: &Language,
         ast: &Ast,
         _root: AstRef,
         value_idx: usize,
     ) -> Result<JsAst, CompileError> {
-        let term = self.lower_term(lang, ast, AstRef::new(value_idx))?;
+        let term = self.lower_term(ast, AstRef::new(value_idx))?;
         match &term {
             Term::Arr { value, .. } => {
                 if let Ok(inner) = serde_json::from_value::<Term>(value.clone()) {
@@ -706,12 +854,12 @@ impl ModuleCtx<'_> {
     /// module).
     fn emit_expr_statement(
         &mut self,
-        lang: &Language,
+        _lang: &Language,
         ast: &Ast,
         root: AstRef,
         is_last: bool,
     ) -> Result<(), CompileError> {
-        let term = self.lower_term(lang, ast, root)?;
+        let term = self.lower_term(ast, root)?;
         let applied = self.with_env(|| lower::lower_applied(&term, &JsAst::Null))?;
         if is_last {
             // A quoted arrow exports the function itself rather than
@@ -765,7 +913,31 @@ impl ModuleCtx<'_> {
                 true,
             );
         }
-        // `export name` / `export name: T` — re-export the bound name.
+        // `export data F := { … }` / `export data F :: …` — the desugared
+        // declaration group exports the family name (module_prep
+        // projects the bound `F`, not the constructors).
+        if is_splice_block(child) || self.is_flattened_decl_group(lang, ast, child) {
+            let family = self.emit_splice_block(lang, ast, child)?;
+            if let Some(name) = family
+                && let Some(r) = self.bound.get(&name).cloned()
+            {
+                if self.dep {
+                    self.exports.push((name, bound_expr(&r)));
+                } else {
+                    self.emit_entry_export(&name, &r);
+                }
+            }
+            return Ok(());
+        }
+        // `export x : T` — a signature export: binds `x` to `null` and
+        // exports that binding (module_prep's type-only erasure).
+        if child.kind == "type-annot" {
+            return self.emit_signature(lang, ast, AstRef::new(child_idx), child, false, true);
+        }
+        // `export name` — re-export the bound name. Deferred to `finish`:
+        // the name may be bound later in the file, and an unbound name is
+        // a type-only signature export (`null` in dep records, a comment
+        // in ESM — `export { f }` with no `f` binding is a SyntaxError).
         let name = match child.kind.as_str() {
             "var" => child.payload.as_str().map(String::from),
             _ => child
@@ -781,22 +953,203 @@ impl ModuleCtx<'_> {
         };
         match name {
             Some(n) => {
-                if self.dep {
-                    // Inlined module: the name joins the export record —
-                    // its bound value when one exists, `null` for a
-                    // type-only export (`module_prep` parity).
-                    let expr = self.bound.get(&n).map(bound_expr).unwrap_or(JsAst::Null);
-                    self.exports.push((n, expr));
-                    return Ok(());
-                }
-                let js = js_ident(&n);
-                self.bind(n, BoundRef::Arrow(js.clone()));
-                self.stmts.push(JsAst::ExportNames(vec![(js.clone(), js)]));
+                self.pending_exports.push(n);
                 Ok(())
             }
             None => Err(CompileError::InvalidInput(
                 "export: cannot resolve the exported name".to_string(),
             )),
+        }
+    }
+
+    /// `x : T` — a bare `type-annot` statement is a *signature*
+    /// declaration, not an annotated expression: `module_prep` binds the
+    /// name to `null` (type-only erasure), so emit `let x = null` and
+    /// record the name in `signature_names` — a later `x := impl`
+    /// reassigns it (`emit_binding`'s `Assign` arm) keeping any `export`
+    /// live, matching eval's "last binding wins" record projection.
+    ///
+    /// A non-`var` subject (`(f x) : T`) is an annotated *expression* —
+    /// lower it as an ordinary statement instead.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_signature(
+        &mut self,
+        lang: &Language,
+        ast: &Ast,
+        root: AstRef,
+        node: &AstNode,
+        is_last: bool,
+        export: bool,
+    ) -> Result<(), CompileError> {
+        let name = children_of(node)
+            .first()
+            .and_then(|&i| ast.get(AstRef::new(i)))
+            .filter(|n| n.kind == "var")
+            .and_then(|n| n.payload.as_str().map(String::from));
+        let Some(name) = name else {
+            return self.emit_expr_statement(lang, ast, root, is_last);
+        };
+        let js = js_ident(&name);
+        if self.bound.contains_key(&name) {
+            if self.signature_names.contains(&name) {
+                // Re-signature of a signature binding — eval rebinds
+                // `null`; mirror it so the live export tracks.
+                self.stmts.push(JsAst::Assign {
+                    name: js,
+                    value: Box::new(JsAst::Null),
+                });
+            } else if export {
+                // Signature over an implemented name — the impl stands;
+                // `export x : T` still re-exports the bound value.
+                self.pending_exports.push(name);
+            } else {
+                self.stmts.push(JsAst::Comment(format!(
+                    "compile-js: signature re-declaration of `{name}` skipped \
+                     (already bound)"
+                )));
+            }
+            return Ok(());
+        }
+        self.bind(name.clone(), BoundRef::Arrow(js.clone()));
+        self.signature_names.insert(name.clone());
+        let decl = JsAst::Let {
+            name: js.clone(),
+            value: Box::new(JsAst::Null),
+        };
+        if self.dep {
+            self.stmts.push(decl);
+            if export {
+                // The record reads the `let` at return time — a later
+                // `x := impl` reassignment is what eval's `{x: x}` sees.
+                self.exports.push((name, JsAst::Ident(js)));
+            }
+        } else {
+            if export {
+                self.exported_names.insert(js.clone());
+                self.stmts.push(JsAst::ExportDecl(Box::new(decl)));
+            } else {
+                self.stmts.push(decl);
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit the statements of a desugared `data` declaration — the
+    /// `__splice__`d `block` `desugar_data` mints (former, one `assign`
+    /// per constructor, and the `F.rec` recursor). Each child binds at
+    /// module scope exactly like a top-level statement; dotted targets
+    /// (`F.rec`) become member assignments on the family binding.
+    ///
+    /// Returns the first bound name (the family/former) for
+    /// `export data` handling, and injects nullary constructors into
+    /// `lang.globals` so `match`'s ctor-value patterns (`Zero:`) see
+    /// them as literals — `lower_ast`'s env is per-statement and cannot
+    /// carry module bindings into `compile_pattern`'s `pat_env`.
+    fn emit_splice_block(
+        &mut self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+    ) -> Result<Option<String>, CompileError> {
+        let children = node
+            .payload
+            .get("children")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut family: Option<String> = None;
+        let mut ctor_globals: Vec<(String, Value)> = Vec::new();
+        for entry in children {
+            let Some(idx) = entry.as_u64().map(|n| n as usize) else {
+                continue;
+            };
+            let Some(child) = ast.get(AstRef::new(idx)) else {
+                continue;
+            };
+            let child_ref = AstRef::new(idx);
+            if let Some((name, value_idx)) = self.binding_parts(lang, ast, child) {
+                if family.is_none() {
+                    family = Some(name.clone());
+                }
+                if name.contains('.') {
+                    self.emit_member_binding(lang, ast, child_ref, &name, value_idx)?;
+                } else {
+                    self.emit_binding(lang, ast, child_ref, child, &name, value_idx, false)?;
+                    if let Some(v) = ctor_global_value(ast, value_idx) {
+                        ctor_globals.push((name, v));
+                    }
+                }
+            } else {
+                self.emit_expr_statement(lang, ast, child_ref, false)?;
+            }
+        }
+        self.inject_ctor_globals(ctor_globals);
+        Ok(family)
+    }
+
+    /// Whether `node` is the *flattened* form of a `data` declaration
+    /// group: `apply_desugar`'s `splice_decl_blocks` splices the
+    /// `__splice__`-flagged block `desugar_data` mints into any parent
+    /// carrying a `statements` role — including the surface `block`
+    /// `data F :: …` parses to — leaving an ordinary unflagged `block`
+    /// whose children are the former/ctor/recursor `assign`s. The
+    /// reliable marker is the dotted `F.rec` target `desugar_data`
+    /// always mints last; a user block cannot produce one (dotted names
+    /// are not bindable surface syntax), and requiring *every* child to
+    /// be a binding keeps ordinary block expressions out.
+    fn is_flattened_decl_group(&self, lang: &Language, ast: &Ast, node: &AstNode) -> bool {
+        if node.kind != "block" || is_splice_block(node) {
+            return false;
+        }
+        let children = children_of(node);
+        if children.len() < 2 {
+            return false;
+        }
+        let mut saw_dotted = false;
+        for &c in &children {
+            let Some(child) = ast.get(AstRef::new(c)) else {
+                return false;
+            };
+            match self.binding_parts(lang, ast, child) {
+                Some((name, _)) => saw_dotted |= name.contains('.'),
+                None => return false,
+            }
+        }
+        saw_dotted
+    }
+
+    /// `F.rec = <value>` — a dotted binding target minted by
+    /// `desugar_data` for the family recursor. Emits a member assignment
+    /// on the (already-bound) family name and binds `F.rec` to the
+    /// member path so dep export records and `Op` refs resolve it.
+    fn emit_member_binding(
+        &mut self,
+        lang: &Language,
+        ast: &Ast,
+        root: AstRef,
+        name: &str,
+        value_idx: usize,
+    ) -> Result<(), CompileError> {
+        let path = name.split('.').map(js_ident).collect::<Vec<_>>().join(".");
+        self.bind(name.to_string(), BoundRef::Member(path.clone()));
+        let value = self.lower_value(lang, ast, root, value_idx)?;
+        self.stmts.push(JsAst::Assign {
+            name: path,
+            value: Box::new(value),
+        });
+        Ok(())
+    }
+
+    /// Register nullary ctor values as `lang.globals` entries — see
+    /// `emit_splice_block`. Lazily clones the base `Language` on first
+    /// use so modules without `data` decls pay nothing.
+    fn inject_ctor_globals(&mut self, ctors: Vec<(String, Value)>) {
+        if ctors.is_empty() {
+            return;
+        }
+        let lang = self.augmented_lang.get_or_insert_with(|| self.lang.clone());
+        for (name, value) in ctors {
+            lang.globals.insert(name, value);
         }
     }
 
@@ -971,12 +1324,76 @@ impl ModuleCtx<'_> {
         Ok(())
     }
 
-    fn lower_term(&self, lang: &Language, ast: &Ast, root: AstRef) -> Result<Term, CompileError> {
-        lower_ast(ast, lang, root).map_err(CompileError::Lower)
+    /// Lower an AST subtree to a `Term` — via `lower_ast` on the
+    /// (possibly ctor-global-augmented) module `Language`.
+    fn lower_term(&self, ast: &Ast, root: AstRef) -> Result<Term, CompileError> {
+        lower_ast(ast, self.lang(), root).map_err(CompileError::Lower)
     }
 
     /// Run `f` with the module-bound name table visible to the lowerer.
     fn with_env<T>(&self, f: impl FnOnce() -> T) -> T {
         lower::with_module_env(self.bound.clone(), f)
     }
+}
+
+/// Whether `node` is a desugar-minted *declaration group* — the
+/// `__splice__`-flagged `block` `desugar_data` (and the `.hnl` desugar
+/// overlay) produces for `data F := { … }`: former/constructor/recursor
+/// `assign`s that must bind in the enclosing statement list, not inside
+/// a nested scope (mirrors `handl-runtime`'s `splice_decl_blocks`, which
+/// this per-statement walk cannot run — it re-parses each chunk).
+fn is_splice_block(node: &AstNode) -> bool {
+    node.kind == "block" && node.payload.get("__splice__").and_then(Value::as_bool) == Some(true)
+}
+
+/// Evaluate an AST subtree as a JSON literal — the restricted shape a
+/// nullary data constructor's value takes (`object`/`entry`/`array` over
+/// `lit`/`value` leaves, including the `{"__sym__": …}`/`{"__ctor__": …}`
+/// marker records, which are plain objects on this target). `None` on
+/// anything non-literal (vars, calls, field accesses) so the caller can
+/// skip the `globals` injection rather than mint a wrong value.
+fn ast_literal_json(ast: &Ast, idx: usize) -> Option<Value> {
+    let node = ast.get(AstRef::new(idx))?;
+    match node.kind.as_str() {
+        "lit" | "value" => Some(node.payload.clone()),
+        "array" => {
+            let items = children_of(node)
+                .iter()
+                .map(|&c| ast_literal_json(ast, c))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Value::Array(items))
+        }
+        "object" => {
+            let mut map = serde_json::Map::new();
+            for &e in &children_of(node) {
+                let entry = ast.get(AstRef::new(e))?;
+                if entry.kind != "entry" {
+                    return None;
+                }
+                let ek = children_of(entry);
+                let (Some(&k), Some(&v)) = (ek.first(), ek.get(1)) else {
+                    return None;
+                };
+                let key_node = ast.get(AstRef::new(k))?;
+                let key = match key_node.kind.as_str() {
+                    "var" | "lit" | "value" => key_node.payload.as_str()?.to_string(),
+                    _ => return None,
+                };
+                map.insert(key, ast_literal_json(ast, v)?);
+            }
+            Some(Value::Object(map))
+        }
+        _ => None,
+    }
+}
+
+/// The `lang.globals` value for a nullary constructor binding — `Some`
+/// only when the assign's value is a literal ctor object (an `object`
+/// carrying `__ctor__`; the family *former* carries `__former__` and is
+/// skipped). Arity-carrying constructors lower to `function` nodes and
+/// never reach this — their `match` patterns dispatch on `ctor_name`,
+/// which needs no env entry.
+fn ctor_global_value(ast: &Ast, value_idx: usize) -> Option<Value> {
+    let v = ast_literal_json(ast, value_idx)?;
+    v.as_object()?.contains_key("__ctor__").then_some(v)
 }

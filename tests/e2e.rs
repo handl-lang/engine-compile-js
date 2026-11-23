@@ -504,6 +504,90 @@ gety := (r) ~> match r { {x: y}: y, _: -1 }
 }
 
 // ---------------------------------------------------------------------------
+// T-003: contract/signature decls and `data` families.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_signature_export_emits_valid_esm() {
+    require_node!();
+    // `export f: T ~> U` is a *signature* — no runtime implementation.
+    // module_prep erases it to `null`; the emit must still produce valid
+    // ESM (`export let f = null`), not `export { f }` with no binding
+    // (a parse-time SyntaxError under node).
+    let run = run_program(
+        "sig-export",
+        r#"
+export f: Nat ~> Nat
+export g : (x : Nat) ~> Nat = n ~> n
+g(21)
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(run.stdout.trim(), "21");
+}
+
+#[test]
+fn e2e_signature_decl_then_impl_reassigns() {
+    require_node!();
+    // `f : T` binds `f` to `null` (type-only erasure); the later
+    // `f := impl` reassigns the same `let` — no duplicate `const`.
+    let run = run_program(
+        "sig-impl",
+        r#"
+f : Nat ~> Number
+f := (n) ~> n + 1
+f(1)
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(run.stdout.trim(), "2");
+}
+
+#[test]
+fn e2e_data_decl_constructors_and_match() {
+    require_node!();
+    // `Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }` desugars to
+    // former/ctor/recursor assigns; `Succ(Succ(Zero))` builds a tagged
+    // ctor object and `match` dispatches on `__ctor__` — `Zero:` hits
+    // the ctor-value pattern (globals-literal `eq`), `Succ(p)` the
+    // `ctor_name`/`ctor_fields` path.
+    let run = run_program(
+        "data-match",
+        r#"
+Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }
+to_num : Nat ~> Number = n ~> match n { Zero: 0, Succ(p): 1 + to_num(p) }
+two : Nat = Succ(Succ(Zero))
+to_num(two)
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // to_num(Succ(Succ(Zero))) = 2.
+    assert_eq!(run.stdout.trim(), "2");
+}
+
+#[test]
+fn e2e_data_decl_parameterized_family() {
+    require_node!();
+    // `Opt<a>` — a parameterized family: `Some(41)` builds
+    // `{__ctor__, x, type}`; `Some(x)` binds `x` through
+    // `ctor_fields`; `None` matches the nullary ctor-value pattern.
+    let run = run_program(
+        "data-param",
+        r#"
+Opt<a : Type> := { None : Opt, Some : (x : a) ~> Opt }
+get_or : Opt ~> Number ~> Number = o ~> d ~> match o { None: d, Some(x): x }
+{ some: get_or(Some(41))(0), none: get_or(None)(7) }
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(run.stdout.trim(), r#"{"some":41,"none":7}"#);
+}
+
+// ---------------------------------------------------------------------------
 // Security surface (compile-time; no node needed)
 // ---------------------------------------------------------------------------
 

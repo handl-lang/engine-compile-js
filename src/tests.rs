@@ -782,6 +782,90 @@ fn module_unbound_names_fall_back_to_runtime_members() {
     assert!(js.contains("__handl_rt.unknown_host"), "{js}");
 }
 
+#[test]
+fn module_signature_export_binds_null_instead_of_dangling_export() {
+    // `export f: T ~> U` is a signature — module_prep erases it to
+    // `null`; the emit must produce a real binding (`export let f =
+    // null`), never `export { f }` with no `f` in scope (a parse-time
+    // SyntaxError under node).
+    let js = compile_to_string(
+        &module_input("export f: Nat ~> Nat\n"),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("export let f = null;"), "{js}");
+    assert!(!js.contains("export { f }"), "{js}");
+}
+
+#[test]
+fn module_signature_then_impl_reassigns_the_let() {
+    // `f : T` binds `let f = null`; the later `f := impl` reassigns it
+    // (no duplicate `const`) and calls see the implementation.
+    let js = compile_to_string(
+        &module_input("f : Nat ~> Number\nf := (n) ~> n + 1\nf(1)\n"),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("let f = null;"), "{js}");
+    assert!(js.contains("f = async"), "{js}");
+    assert!(!js.contains("const f ="), "{js}");
+}
+
+#[test]
+fn module_export_name_resolves_a_later_binding() {
+    // `export f` before `f := …` — the deferred export resolves once
+    // every statement is walked.
+    let js = compile_to_string(
+        &module_input("export f\nf := (x) ~> x + 1\n"),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("const f ="), "{js}");
+    assert!(js.contains("export { f };"), "{js}");
+}
+
+#[test]
+fn module_data_decl_emits_constructor_bindings() {
+    // `Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }` desugars to a
+    // `__splice__`d block of former/ctor assigns — every name must bind
+    // at module scope (`const Zero`, `const Succ`, the `Nat` former and
+    // `Nat.rec` member), not vanish into a comment.
+    let js = compile_to_string(
+        &module_input(
+            "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }\ntwo := Succ(Succ(Zero))\n",
+        ),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("const Zero ="), "{js}");
+    assert!(js.contains("const Succ ="), "{js}");
+    assert!(js.contains("Nat.rec ="), "{js}");
+    assert!(!js.contains("`data` declaration"), "{js}");
+}
+
+#[test]
+fn module_unsupported_data_shape_errors() {
+    // A `data` declaration the pipeline cannot lower must fail loudly —
+    // never degrade to a comment that silently drops the constructors.
+    // `C(Bad ~> Nat)` is not a supported constructor shape (the family
+    // occurs in a function domain); the compile rejects it.
+    compile_to_string(
+        &module_input("data Bad :: C(Bad ~> Nat)\n"),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap_err();
+    // `export data F :: …` parses as `export <var data>` spliced into
+    // the decl group — no such form exists; it must error, not emit a
+    // nonsense `export(data)` call. Export the family by name after
+    // the declaration instead.
+    let err = compile_to_string(
+        &module_input("export data Nat :: Zero | Succ(Nat)\n"),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("export data"), "{err}");
+}
+
 // ---------------------------------------------------------------------------
 // Runtime-op coverage: `record_merge`, `flow`, `ctor_name`, `ctor_fields`,
 // `assert`/`runtime_assert`, and the `__opRef` unbound-reference guard.
