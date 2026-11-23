@@ -7,3 +7,4 @@
 - T-005 P4: non-ESM module formats — module compile for iife/inline/cjs; external imports hard-error; export mapping · pri:high · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
 - T-006 P5: effect semantics parity — handle/rewrite/path/equiv stubs; ADR first: port eval semantics vs honest hard-error subset · pri:high · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
 - T-016 CONFIG: audit hardcoded lowering choices → JsConfig knobs (op strategy, async policy, data encoding, formats, worker\_entry, sourcemaps, security, target) · pri:high · owner:devin · created:2026-11-23 · links:P-002 · epic:compile-js-prod · done:2026-11-23
+- T-014 GAP: real-browser e2e via Playwright — worker\_entry bundle in Chromium/Firefox WebWorker, js.on message round-trip, transfer list, https: import smoke · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23

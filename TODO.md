@@ -9,4 +9,3 @@
 - [ ] T-017 EVAL: strategy experiments per P-002 — bench harness, metrics vs eval baseline, docs/strategy-evaluation.md, defaults from data · pri:high · owner:devin · created:2026-11-23 · links:P-002 · epic:compile-js-prod
 - [ ] T-010 GAP: data decls nested in expression position (inside do {}) — splice\_decl\_blocks flattening works but not e2e-covered; add fixture · status:in-progress · owner:devin · created:2026-11-23 · epic:compile-js-prod
 - [ ] T-013 GAP: hardening — SecurityScanner hostile-input corpus expansion, source-map e2e assertion, fuzz/property fixtures for emitted JS · status:in-progress · owner:devin · created:2026-11-23 · epic:compile-js-prod
-- [ ] T-014 GAP: real-browser e2e via Playwright — worker\_entry bundle in Chromium/Firefox WebWorker, js.on message round-trip, transfer list, https: import smoke · status:in-progress · owner:devin · created:2026-11-23 · epic:compile-js-prod
