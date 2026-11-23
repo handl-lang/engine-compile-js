@@ -696,6 +696,26 @@ fn module_js_construct_on_off_bind_to_shims() {
 }
 
 #[test]
+fn module_js_get_set_bind_to_shims() {
+    // `get`/`set` are `js` contract ops too: the import binds
+    // `__handl_rt.get`/`__handl_rt.set` — the prelude members do the
+    // property read/write (dotted-path walk, `__lastError` convention,
+    // promise-boxed reads).
+    let js = compile_to_string(
+        &module_input(
+            "from \"js\" import { get as js_get, set as js_set }\nexport run := (o, k, v) ~> do {\n  js_set(o, k, v)\n  js_get(o, k)\n}\n",
+        ),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("__handl_rt.set("), "{js}");
+    assert!(js.contains("__handl_rt.get("), "{js}");
+    // The prelude members themselves ship in the output.
+    assert!(js.contains("__handl_promise__"), "{js}");
+    assert!(js.contains("__lastError"), "{js}");
+}
+
+#[test]
 fn module_effect_statements_and_default_export() {
     let js = compile_to_string(
         &module_input("x := (a) ~> a + 1\nx(2)\n"),

@@ -740,6 +740,80 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
       return null;
     }}
   }},
+  // `get`/`set` — direct JS property read/write (the `js` contract
+  // package). `target` is the object value itself or a string naming a
+  // global (`"self"`, `"window"`, `"process"`, `"globalThis"` — the
+  // `on`/`off` resolution); `key` is a property name or a dotted path
+  // walked from the resolved object — the same walk `construct`
+  // applies to `method`, so `get(o, "gpu.requestAdapter")` reaches
+  // `o.gpu.requestAdapter`. `set` assigns the last segment and returns
+  // the assigned value for chaining. Both record failures in
+  // `__lastError` exactly like `call`/`invoke`: an unresolvable
+  // receiver (null, or a name with no global) yields `null`; a `get`
+  // whose final segment is absent yields JS `undefined`, normalized
+  // to `null` since Handl data has no `undefined`. A `get` result that
+  // is thenable goes through `__promiseBox` — same as `call`/`invoke` —
+  // so `js.await` (`__handl_rt.await`) is the settle point and an
+  // unawaited boxed promise stays an observed rejection, never a host
+  // fatal. `set` never boxes: the assigned value is stored verbatim.
+  get: (target, key) => {{
+    const host = globalThis.js;
+    if (host && typeof host.get === "function") {{
+      const v = host.get(target, key);
+      return __handl_rt.__promiseBox(v === undefined ? null : v);
+    }}
+    const t = (typeof target === "string") ? globalThis[target] : target;
+    if (t == null) {{
+      __handl_rt.__lastError = new Error("unsafe or missing property target");
+      return null;
+    }}
+    try {{
+      __handl_rt.__lastError = null;
+      const path = String(key).split(".");
+      let node = t;
+      for (const seg of path) {{
+        if (node == null) break;
+        node = node[seg];
+      }}
+      const v = (node === undefined) ? null : node;
+      return __handl_rt.__promiseBox(v);
+    }} catch (e) {{
+      __handl_rt.__lastError = e;
+      return null;
+    }}
+  }},
+  set: (target, key, value) => {{
+    const host = globalThis.js;
+    if (host && typeof host.set === "function") {{
+      return host.set(target, key, value);
+    }}
+    const t = (typeof target === "string") ? globalThis[target] : target;
+    if (t == null) {{
+      __handl_rt.__lastError = new Error("unsafe or missing property target");
+      return null;
+    }}
+    try {{
+      __handl_rt.__lastError = null;
+      const path = String(key).split(".");
+      let node = t;
+      for (let i = 0; i + 1 < path.length; i++) {{
+        if (node == null) {{
+          __handl_rt.__lastError = new Error("unsafe or missing property path");
+          return null;
+        }}
+        node = node[path[i]];
+      }}
+      if (node == null) {{
+        __handl_rt.__lastError = new Error("unsafe or missing property path");
+        return null;
+      }}
+      node[path[path.length - 1]] = value;
+      return value;
+    }} catch (e) {{
+      __handl_rt.__lastError = e;
+      return null;
+    }}
+  }},
   // `on`/`off` — the JS→handl event trampoline (the `js` contract
   // package). `on(target, event, arrow)` wraps a compiled handl arrow —
   // an async `__in => …` JS function — in a listener and registers it

@@ -345,6 +345,159 @@ js_off(et, "ping", h)
 }
 
 #[test]
+fn e2e_js_get_set_property_roundtrip() {
+    require_node!();
+    // `js.get`/`js.set` — direct property read/write on a plain Handl
+    // record (a JS object): single keys, dotted paths in both
+    // directions, the `undefined`→`null` missing-property mapping, the
+    // assigned-value return, and the `js.error()` failure convention.
+    // (`err_now` reads `js.error` through `>>>` scheme position: a
+    // zero-arg `js_error()` in value position lowers to the bare
+    // `__handl_rt.error` member — the referent, not a call — so the
+    // pipeline spelling is what actually invokes the shim.)
+    let run = run_program(
+        "js-get-set",
+        r#"
+from "js" import { get as js_get, set as js_set, error as js_error }
+
+err_now := (u) ~> u >>> js_error
+
+o := { a: 1, nested: { k: 0 }, deep: { deeper: 0 } }
+w := js_set(o, "b", 41)
+g1 := js_get(o, "b")
+js_set(o, "nested.k", 7)
+g2 := js_get(o, "nested.k")
+g3 := js_get(o, "nested")
+miss := js_get(o, "nope")
+err_ok := err_now(0) == null
+bad := js_get("no_such_global_xyz", "x")
+err_bad := err_now(0) != null
+setret := js_set(o, "deep.deeper", 9)
+g4 := js_get(o, "deep.deeper")
+{
+  w: w, g1: g1, g2: g2, g3: g3, miss: miss,
+  err_ok: err_ok, bad: bad, err_bad: err_bad,
+  setret: setret, g4: g4
+}
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // `set` returns the assigned value; `get` reads back single and
+    // dotted keys; a missing property is `null` *without* tripping
+    // `error()`; an unresolvable global name records the error; a
+    // dotted `set` walks to the parent and assigns the last segment.
+    assert_eq!(
+        run.stdout.trim(),
+        r#"{"w":41,"g1":41,"g2":7,"g3":{"k":7},"miss":null,"err_ok":true,"bad":null,"err_bad":true,"setret":9,"g4":9}"#
+    );
+}
+
+#[test]
+fn e2e_js_get_set_global_shim_no_eval() {
+    require_node!();
+    // The motivating case: install/read a `globalThis` property with no
+    // `eval` string — the Node `globalThis.Worker` shim shape. The
+    // driver-side `setup.mjs` (imported first, so it runs before the
+    // compiled module) seeds a promise the program reads back through
+    // `js.get` and settles through `js.await` — proving a thenable
+    // property read is promise-boxed like a `call` result.
+    let run = run_node(
+        "js-global-shim",
+        &[
+            (
+                "prog.mjs",
+                compile_to_string(
+                    &module_input(
+                        r#"
+from "js" import { get as js_get, set as js_set, await as js_await }
+
+ctor := js_get("globalThis", "Promise")
+_ := js_set("globalThis", "__handl_probe_ctor__", ctor)
+back := js_get("globalThis", "__handl_probe_ctor__")
+p := js_get("globalThis", "__handl_probe_promise__")
+r := js_await(p)
+{ same: back == ctor, val: js_get(r, "value") }
+"#,
+                    ),
+                    &esm_node(),
+                )
+                .expect("compile fixture")
+                .as_str(),
+            ),
+            (
+                "setup.mjs",
+                "globalThis.__handl_probe_promise__ = Promise.resolve(42);\n",
+            ),
+            (
+                "driver.mjs",
+                "import \"./setup.mjs\";\nimport v from \"./prog.mjs\";\nconsole.log(JSON.stringify(v));\n",
+            ),
+        ],
+        "driver.mjs",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // `set`/`get` round-trip the `Promise` constructor identity through
+    // `globalThis`; the boxed promise read settles via `js.await` to
+    // the `ok` record whose `.value` is 42.
+    assert_eq!(run.stdout.trim(), r#"{"same":true,"val":42}"#);
+}
+
+#[test]
+fn e2e_js_get_set_dom_element_onmessage_property() {
+    require_node!();
+    // DOM-ish property access plus the `worker.onmessage = fn` style:
+    // a fake element on `globalThis` gets `.value` written/read and an
+    // `.onmessage` *property* assigned a Handl arrow — no
+    // `addEventListener`, no eval. The driver invokes the stored
+    // property directly and awaits the arrow's result.
+    let run = run_node(
+        "js-dom-props",
+        &[
+            (
+                "prog.mjs",
+                compile_to_string(
+                    &module_input(
+                        r#"
+from "js" import { get as js_get, set as js_set }
+
+el := js_get("globalThis", "fakeEl")
+typed := js_set(el, "value", "hello")
+_ := js_set(el, "onmessage", (m) ~> do {
+  d := m.data
+  { echo: d.n, tag: "fn" }
+})
+read := js_get(el, "value")
+{ typed: typed, read: read, isFn: js_get(el, "onmessage") != null }
+"#,
+                    ),
+                    &esm_node(),
+                )
+                .expect("compile fixture")
+                .as_str(),
+            ),
+            ("setup.mjs", "globalThis.fakeEl = { value: \"\" };\n"),
+            (
+                "driver.mjs",
+                "import \"./setup.mjs\";\n\
+                 import v from \"./prog.mjs\";\n\
+                 const r = await globalThis.fakeEl.onmessage({ data: { n: 9 } });\n\
+                 console.log(JSON.stringify({ def: v, handler: r }));\n",
+            ),
+        ],
+        "driver.mjs",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // `.value` round-trips through `set`/`get`; `onmessage` holds the
+    // compiled arrow (non-null read) and calling it as a plain JS
+    // property yields the arrow's record result.
+    assert_eq!(
+        run.stdout.trim(),
+        r#"{"def":{"typed":"hello","read":"hello","isFn":true},"handler":{"echo":9,"tag":"fn"}}"#
+    );
+}
+
+#[test]
 fn e2e_term_level_arithmetic_through_public_api() {
     require_node!();
     // The single-term path (synthetic `CompilerInput`, no real
