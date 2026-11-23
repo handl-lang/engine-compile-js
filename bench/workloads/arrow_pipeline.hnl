@@ -1,0 +1,27 @@
+--- P-002/T-017 bench workload: arrow-pipeline chains.
+---
+--- `bench(seed)` runs a bounded `while` loop whose state update flows
+--- through a four-arrow pipeline of nested applications — arrow-call
+--- heavy (four async arrow invocations per iteration), scalar-op
+--- light. (`>>>` flow composition is deliberately not used: its
+--- value/arrow dispatch is subtle in the current subset — see
+--- docs/strategy-evaluation.md findings.)
+from "math" import { mod }
+
+step1 := (x) ~> x + 3
+step2 := (x) ~> x * 2
+step3 := (x) ~> mod(x, 1009)
+step4 := (x) ~> x - 7
+
+pipe := (x) ~> step4(step3(step2(step1(x))))
+
+bench := (seed) ~> do {
+  while { i: 0, acc: mod(seed, 100) + 1 } {
+    s ~> if s.i >= 4000 {
+      { out: s.acc }
+    } else {
+      { state: { i: s.i + 1, acc: pipe(s.acc) } }
+    }
+  }
+}
+bench

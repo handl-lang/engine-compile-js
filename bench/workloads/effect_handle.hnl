@@ -1,0 +1,19 @@
+--- P-002/T-017 bench workload: effect-handler program.
+---
+--- `bench(seed)` performs `(arr Foo)` inside a `handle … with` block
+--- every iteration — exercises the `__handl_rt.handle`/`perform`
+--- dispatch machinery (handler stack push/pop per op).
+from "math" import { mod }
+
+foo_impl := { Foo: (x) ~> mod(x * 7 + 3, 100003) }
+
+bench := (seed) ~> do {
+  while { i: 0, acc: mod(seed, 1000) + 1 } {
+    s ~> if s.i >= 3000 {
+      { out: s.acc }
+    } else {
+      { state: { i: s.i + 1, acc: handle (arr Foo)(s.acc) with foo_impl } }
+    }
+  }
+}
+bench

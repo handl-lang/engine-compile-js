@@ -33,3 +33,9 @@ serde_json = "1"
 rand = "0.9"
 handl-kit-data-prelude = { git = "https://github.com/handl-lang/host", branch = "main" }
 
+# P-002/T-017 strategy-evaluation harness — lives under bench/ so the
+# whole experiment is self-contained; `cargo run --example bench`.
+[[example]]
+name = "bench"
+path = "bench/bench.rs"
+

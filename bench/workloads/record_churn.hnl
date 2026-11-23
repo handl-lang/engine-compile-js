@@ -1,0 +1,17 @@
+--- P-002/T-017 bench workload: record/object churn.
+---
+--- `bench(seed)` rebuilds a fresh record literal every iteration and
+--- reads nested fields back out — exercises `record` construction,
+--- `field_access`, and state threading through the `while` protocol.
+from "math" import { mod }
+
+bench := (seed) ~> do {
+  while { i: 0, r: { a: seed, b: 1, c: 2 } } {
+    s ~> if s.i >= 4000 {
+      { out: s.r.a + s.r.b + s.r.c }
+    } else {
+      { state: { i: s.i + 1, r: { a: s.r.a + 1, b: mod(s.r.b * 3 + s.i, 509), c: mod(s.r.c + s.i, 1009), d: s.i } } }
+    }
+  }
+}
+bench

@@ -1,0 +1,17 @@
+--- P-002/T-017 bench workload: loop iteration (scalar-op heavy).
+---
+--- `bench(seed)` is a tight numeric `while` — the workload most
+--- sensitive to `OpLowering` (raw JS operators vs `__handl_rt`
+--- member calls) since every step is add/mul/mod/comparison.
+from "math" import { mod }
+
+bench := (seed) ~> do {
+  while { i: 0, acc: seed } {
+    s ~> if s.i >= 5000 {
+      { out: s.acc }
+    } else {
+      { state: { i: s.i + 1, acc: mod(s.acc + s.i * 3 + 1, 1000003) } }
+    }
+  }
+}
+bench

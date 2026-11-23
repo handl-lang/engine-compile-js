@@ -1,0 +1,24 @@
+--- P-002/T-017 bench workload: match dispatch.
+---
+--- `bench(seed)` dispatches on `mod(i, 6)` every iteration through a
+--- six-arm `match` whose arms update numeric state — exercises the
+--- match lowering/dispatch path plus scalar ops in every arm.
+from "math" import { mod }
+
+bench := (seed) ~> do {
+  while { i: 0, acc: seed } {
+    s ~> if s.i >= 3000 {
+      { out: s.acc }
+    } else {
+      { state: { i: s.i + 1, acc: match mod(s.i, 6) {
+        0: s.acc + 1,
+        1: s.acc * 2,
+        2: s.acc - 3,
+        3: mod(s.acc + 7, 1009),
+        4: s.acc + s.i,
+        _: mod(s.acc * 5 + 1, 7919)
+      } } }
+    }
+  }
+}
+bench

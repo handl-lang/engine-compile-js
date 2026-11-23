@@ -1,0 +1,23 @@
+--- P-002/T-017 bench workload: worker-style message handling.
+---
+--- Compiled with `JsConfig::worker_entry`: a self-contained bundle
+--- that registers `js.on(parentPort, "message", arrow)` — each
+--- message runs a small `while` compute and the reply convention
+--- posts the result record back. The driver measures round-trip
+--- latency over `node:worker_threads`.
+from "node:worker_threads" import { parentPort }
+from "js" import { on as js_on }
+from "math" import { mod }
+
+work := (n) ~> do {
+  while { i: 0, acc: n } {
+    s ~> if s.i >= 500 {
+      { out: s.acc }
+    } else {
+      { state: { i: s.i + 1, acc: mod(s.acc * 3 + s.i, 1000003) } }
+    }
+  }
+}
+
+js_on(parentPort, "message", (msg) ~> { echo: msg.n, sum: work(msg.n) })
+0
