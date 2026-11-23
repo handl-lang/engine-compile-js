@@ -716,6 +716,37 @@ fn module_js_get_set_bind_to_shims() {
 }
 
 #[test]
+fn module_js_zero_arg_shim_value_position_calls() {
+    // I-001: `e := js_error()` in value position must *invoke* the shim —
+    // a bare `__handl_rt.error` member reads as the function object, so
+    // `e == null` never holds and `lib-js`'s `spawn_code` returned null
+    // unconditionally. Scheme position (`u >>> js_error`) keeps the
+    // referent + `__appOrValue` reading.
+    let js = compile_to_string(
+        &module_input(
+            "from \"js\" import { error as js_error }\nexport run := () ~> do {\n  e := js_error()\n  e == null\n}\n",
+        ),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    // The value-position read is a call, not the bare member.
+    assert!(js.contains("__handl_rt.error()"), "{js}");
+    assert!(!js.contains("(await __handl_rt.error),"), "{js}");
+    // `x >>> js_error` still applies the referent to the incoming.
+    let js2 = compile_to_string(
+        &module_input(
+            "from \"js\" import { error as js_error }\nerr_now := (u) ~> u >>> js_error\n",
+        ),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(
+        js2.contains("__handl_rt.__appOrValue(__handl_rt.error,"),
+        "{js2}"
+    );
+}
+
+#[test]
 fn module_effect_statements_and_default_export() {
     let js = compile_to_string(
         &module_input("x := (a) ~> a + 1\nx(2)\n"),

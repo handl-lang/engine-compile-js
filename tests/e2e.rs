@@ -351,10 +351,9 @@ fn e2e_js_get_set_property_roundtrip() {
     // record (a JS object): single keys, dotted paths in both
     // directions, the `undefined`→`null` missing-property mapping, the
     // assigned-value return, and the `js.error()` failure convention.
-    // (`err_now` reads `js.error` through `>>>` scheme position: a
-    // zero-arg `js_error()` in value position lowers to the bare
-    // `__handl_rt.error` member — the referent, not a call — so the
-    // pipeline spelling is what actually invokes the shim.)
+    // (`err_now` reads `js.error` through `>>>` scheme position — the
+    // pipeline spelling applies the shim referent to the incoming;
+    // `js_error()` in value position calls it directly, I-001.)
     let run = run_program(
         "js-get-set",
         r#"
@@ -390,6 +389,38 @@ g4 := js_get(o, "deep.deeper")
     assert_eq!(
         run.stdout.trim(),
         r#"{"w":41,"g1":41,"g2":7,"g3":{"k":7},"miss":null,"err_ok":true,"bad":null,"err_bad":true,"setret":9,"g4":9}"#
+    );
+}
+
+#[test]
+fn e2e_js_error_zero_arg_value_position_calls() {
+    require_node!();
+    // I-001: `e := js_error()` in value position must *invoke* the shim —
+    // `js.error` records `__lastError` and returns it (`null` when clean).
+    // The `lib-js` worker `spawn_code` shape: check `e == null` after a
+    // fallible call. Before the fix the bare `__handl_rt.error` member
+    // read as the function object, so `e == null` was never true.
+    let run = run_program(
+        "js-error-call",
+        r#"
+from "js" import { call as js_call, error as js_error, get as js_get }
+
+e1 := js_error()
+clean := e1 == null
+bad := js_call("no_such_global_xyz", "nope", [], [], "js_object", false)
+e2 := js_error()
+msg := js_get(e2, "message")
+{ clean: clean, has_err: e2 != null, msg: msg }
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // No prior failure → `error()` is `null` (`clean`); the failed
+    // `js.call` recorded `__lastError` → `error()` returns the Error
+    // (`has_err`), whose `message` is the shim's diagnostic.
+    assert_eq!(
+        run.stdout.trim(),
+        r#"{"clean":true,"has_err":true,"msg":"unsafe or missing foreign call"}"#
     );
 }
 

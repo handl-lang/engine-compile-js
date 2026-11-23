@@ -392,8 +392,9 @@ fn lower_op_body(
     if let ArrSource::Foreign(module) = &source {
         // `perform`/`io.perform` are reserved builtin spellings — eval's
         // `is_perform_callee` intercepts them before host dispatch, so
-        // they are denied for foreign ops too rather than emitted as a
-        // `jsCall`. The qualified spelling is `module.name` (a lone
+        // they lower to `__handl_rt.perform` (in-flight dispatch +
+        // residual `IO` mint) rather than emitting a `jsCall`. The
+        // qualified spelling is `module.name` (a lone
         // `op_foreign("perform")` has module == name).
         let qualified = if module.as_str() == name {
             name.to_string()
@@ -401,10 +402,7 @@ fn lower_op_body(
             format!("{module}.{name}")
         };
         if qualified == "perform" || qualified == "io.perform" {
-            return Err(CompileError::Lower(format!(
-                "op `{qualified}` is not supported by the JS backend \
-                 (effect operations have no runtime semantics here)"
-            )));
+            return lower_perform_body(args, param, scheme);
         }
         return lower_foreign_op_body(name, args, module, lit, dim_label, param);
     }
@@ -692,22 +690,20 @@ fn lower_op_body(
                 args: vec![env, JsAst::Str(field.to_string())],
             }
         }
+        // `perform`/`io.perform` — the io module's `PerformFn` builtin
+        // (ADR-0153 §4 residual `IO` mint + ADR-0158 in-flight
+        // dispatch). Emits `__handl_rt.perform(op, arg)`, the runtime
+        // mirror of `native_ops::perform_dispatch`; multi-shot `resume`
+        // stays the `__applyHandler` honest throw.
+        "perform" | "io.perform" => lower_perform_body(args, param, scheme)?,
         _ => {
             // Effect/proof op spellings that must never reach
             // `__handl_rt.<name>` or `__opRef`: `handle`/`handle_dyn`
             // belong to `Term::Handle` (the runtime `handle` member has
             // a different signature), `rewrite`/`path`/`equiv` have no
             // eval semantics to dispatch to (`Term::Rewrite` errors in
-            // `proof.rs`; `path`/`equiv` are `Term::Opaque` data), and
-            // `perform`/`io.perform` are the io module's perform
-            // builtin — eval's `perform_dispatch` needs the resume
-            // journal/`acc` machinery this subset does not carry, so
-            // the spellings fail honestly (the runtime `perform` member
-            // remains for host/driver JS and the follow-up).
-            if matches!(
-                name,
-                "handle" | "handle_dyn" | "rewrite" | "path" | "equiv" | "perform" | "io.perform"
-            ) {
+            // `proof.rs`; `path`/`equiv` are `Term::Opaque` data).
+            if matches!(name, "handle" | "handle_dyn" | "rewrite" | "path" | "equiv") {
                 return Err(CompileError::Lower(format!(
                     "op `{name}` is not supported by the JS backend \
                      (effect/proof operations have no runtime semantics here)"
@@ -783,7 +779,9 @@ fn lower_op_body(
 /// bare `Op{name, []}` in scheme position applies the bound referent
 /// to `param` via `__handl_rt.__appOrValue` (arrow bindings run,
 /// non-callable values read back); in value position it stays the
-/// referent itself.
+/// referent itself — except [`BoundRef::Shim`], whose js-contract
+/// members are host *functions*: a 0-arg value-position op is the
+/// `js_error()` call spelling and invokes the member (I-001).
 fn lower_bound_op_body(
     bound: &BoundRef,
     args: &[Term],
@@ -859,19 +857,36 @@ fn lower_bound_op_body(
             }
         }
         BoundRef::Shim(member) => {
+            let callee = JsAst::Member {
+                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                prop: member.clone(),
+            };
             if applied.is_empty() {
-                // The referent is the `__handl_rt` member itself (a
-                // host function), not a `member()` call.
-                app_or_value(JsAst::Member {
-                    obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                    prop: member.clone(),
-                })
+                if scheme {
+                    // Scheme position (`x >>> js_error`): the referent is
+                    // the `__handl_rt` member itself (a host function),
+                    // applied to the incoming via `__appOrValue`.
+                    app_or_value(callee)
+                } else {
+                    // Value position: `js_error()` is a *call* — the js
+                    // contract shims are host functions, never Handl
+                    // arrow values, so the 0-arg `Op{name, []}` invokes
+                    // the member (`__handl_rt.error()`), matching eval
+                    // where the foreign op runs with zero args. Arrow-
+                    // lower collapses `f()` and bare `f` to the same
+                    // term; the call reading is the one real code uses
+                    // (`e1 := js_error()`), and the bare member would
+                    // read as the function object — `eq(·, null)` never
+                    // holds, `__apply` would feed it a Handl `__in`
+                    // instead of the spread-args convention (I-001).
+                    JsAst::Call {
+                        callee: Box::new(callee),
+                        args: Vec::new(),
+                    }
+                }
             } else {
                 JsAst::Call {
-                    callee: Box::new(JsAst::Member {
-                        obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                        prop: member.clone(),
-                    }),
+                    callee: Box::new(callee),
                     args: applied,
                 }
             }
