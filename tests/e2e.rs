@@ -587,6 +587,84 @@ get_or : Opt ~> Number ~> Number = o ~> d ~> match o { None: d, Some(x): x }
     assert_eq!(run.stdout.trim(), r#"{"some":41,"none":7}"#);
 }
 
+#[test]
+fn e2e_export_data_record_form_with_plain_export() {
+    require_node!();
+    // `export data F := { … }` (the record spelling) alongside a plain
+    // `export x := …` — both surface as real ESM named exports while
+    // the ctors keep matching in-module: `Zero:` hits the ctor-value
+    // pattern (the decl's own ctor literal in `lang.globals`),
+    // `Succ(p)` the `ctor_name`/`ctor_fields` dispatch.
+    let run = run_program(
+        "export-data-record",
+        r#"
+export data F := { Zero : F, Succ : (pred : F) ~> F }
+export x := 40
+size := n ~> match n { Zero: 0, Succ(p): 1 + size(p), _: 9 }
+{ f: size(Succ(Zero)), x: x }
+"#,
+        "import def, { F, Zero, Succ, x } from \"./prog.mjs\";\n\
+         const two = await Succ(await Succ(Zero));\n\
+         console.log(JSON.stringify({ def: def, x: x,\n\
+           ctor: two.__ctor__.__sym__.name,\n\
+           hasF: typeof F === \"object\" && F.__former__ != null }));\n",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // size(Succ(Zero)) = 1; x = 40; `two` is a Succ ctor object; F is
+    // the exported family former.
+    assert_eq!(
+        run.stdout.trim(),
+        r#"{"def":{"f":1,"x":40},"x":40,"ctor":"Succ","hasF":true}"#
+    );
+}
+
+#[test]
+fn e2e_export_data_family_and_ctors_importable() {
+    require_node!();
+    // `export data Nat :: …` inside an inlined dep exports the family
+    // and each constructor (`module_prep`'s export-record projection —
+    // `F.rec` is dotted and stays off the record). The consumer imports
+    // them and `match`es: `Zero:` resolves through the ctor literal the
+    // dep propagated into the importer's `lang.globals` (eval's
+    // scope-value parity), `Succ(p)` through `ctor_name` dispatch.
+    let mut config = esm_node();
+    config.modules = vec![JsModule {
+        path: "/pkgs/nat/nat.hnl".to_string(),
+        source: "export data Nat :: Zero | Succ(pred)\n\
+                 export to_num := n ~> match n { Zero: 0, Succ(p): 1 + to_num(p) }\n\
+                 export one := Succ(Zero)\n"
+            .to_string(),
+        imports: Vec::new(),
+    }];
+    config.entry_imports = vec![("nat".to_string(), "/pkgs/nat/nat.hnl".to_string())];
+    let run = run_program_with(
+        "export-data-dep",
+        r#"
+from "nat" import { Nat, Zero, Succ, to_num, one }
+kind := n ~> match n { Zero: "zero", Succ(p): "succ", _: "other" }
+{
+  ka: kind(Zero),
+  kb: kind(one),
+  kc: to_num(one),
+  kd: to_num(Succ(Zero)),
+  kn: Nat.__former__ == null
+}
+"#,
+        config,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // kind(Zero) = "zero" (ctor-value pattern on the imported literal),
+    // kind(one) = "succ" (`one` is the dep's Succ(Zero) ctor object);
+    // to_num counts through both the dep's recursor-free match and a
+    // locally built `Succ(Zero)`; `Nat.__former__` is a real object
+    // (not null) — the family former exported.
+    assert_eq!(
+        run.stdout.trim(),
+        r#"{"ka":"zero","kb":"succ","kc":1,"kd":1,"kn":false}"#
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T-004: worker-entry bundles — a `.hnl` worker module compiles to ONE
 // self-contained ESM file (prelude + inlined deps) that a real

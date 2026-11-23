@@ -36,7 +36,8 @@ pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
             body,
             target,
             impl_,
-        } => lower_handle(body, target, impl_),
+            acc,
+        } => lower_handle(body, target, impl_, acc.as_deref()),
         _ => Err(CompileError::Lower(format!(
             "higher lowerer received non-higher term: {term:?}"
         ))),
@@ -51,7 +52,8 @@ pub fn lower_applied(term: &Term, input: &JsAst) -> Result<JsAst, CompileError> 
             body,
             target,
             impl_,
-        } => lower_handle_applied(body, target, impl_, input),
+            acc,
+        } => lower_handle_applied(body, target, impl_, acc.as_deref(), input),
         _ => Err(CompileError::Lower(format!(
             "higher lowerer received non-higher term: {term:?}"
         ))),
@@ -66,11 +68,17 @@ fn lower_child_applied(role: &str, input: &JsAst) -> JsAst {
     rt_call("child", vec![input.clone(), JsAst::Str(role.to_string())])
 }
 
-fn lower_handle(body: &Term, target: &str, impl_: &Term) -> Result<JsAst, CompileError> {
+fn lower_handle(
+    body: &Term,
+    target: &str,
+    impl_: &Term,
+    acc: Option<&Term>,
+) -> Result<JsAst, CompileError> {
     Ok(arrow_fn(lower_handle_applied(
         body,
         target,
         impl_,
+        acc,
         &input_ident(),
     )?))
 }
@@ -105,8 +113,19 @@ fn lower_handle_applied(
     body: &Term,
     target: &str,
     impl_: &Term,
+    acc: Option<&Term>,
     input: &JsAst,
 ) -> Result<JsAst, CompileError> {
+    // The `acc` accumulator child has no runtime slot in the JS
+    // `__handl_rt.handle` — decline rather than silently drop it
+    // (mirrors `handl-kit-arrow-lower`'s `lower_handle`; surface `acc`
+    // syntax is unreachable today, so this only guards hand-built
+    // `Term`s).
+    if acc.is_some() {
+        return Err(CompileError::Lower(
+            "handle `acc` accumulator is not supported by the JS backend".to_string(),
+        ));
+    }
     let body_fn = handle_scheme(body)?;
     let impl_fn = handle_scheme(impl_)?;
     // `impl_` is a *scheme* evaluated under the same incoming as the

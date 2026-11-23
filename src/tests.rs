@@ -888,16 +888,21 @@ fn module_unsupported_data_shape_errors() {
         &JsConfig::esm_deno(),
     )
     .unwrap_err();
-    // `export data F :: …` parses as `export <var data>` spliced into
-    // the decl group — no such form exists; it must error, not emit a
-    // nonsense `export(data)` call. Export the family by name after
-    // the declaration instead.
-    let err = compile_to_string(
+    // `export data F :: …` desugars to the family decl group spliced
+    // with the `export data` marker — it compiles and exports the
+    // family plus each constructor name (`module_prep` parity; `F.rec`
+    // is dotted and stays off the export surface).
+    let js = compile_to_string(
         &module_input("export data Nat :: Zero | Succ(Nat)\n"),
         &JsConfig::esm_deno(),
     )
-    .unwrap_err();
-    assert!(err.to_string().contains("export data"), "{err}");
+    .expect("export data compiles");
+    for name in ["Nat", "Zero", "Succ"] {
+        assert!(
+            js.contains(&format!("export {{ {name} }}")),
+            "{name}:\n{js}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

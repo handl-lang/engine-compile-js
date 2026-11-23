@@ -109,6 +109,24 @@ struct DepModule<'a> {
     edges: HashMap<String, String>,
 }
 
+/// What [`Bundle::ensure_module`] hands back to the importer: the dep's
+/// export `(name, expr)` pairs for splice imports plus its nullary-ctor
+/// literals (for `match` ctor-value patterns in the importer).
+struct DepSurface {
+    /// Export record entries `(exported name, value expr)`.
+    exports: Vec<(String, JsAst)>,
+    /// Nullary-ctor literals the dep bound, keyed by export name.
+    ctors: HashMap<String, Value>,
+}
+
+/// An emitted dep module held in `Bundle::emitted`.
+struct EmittedModule {
+    /// JS identifier evaluating to the namespace object.
+    ns: String,
+    /// The dep's export surface.
+    surface: DepSurface,
+}
+
 /// The result of emitting one module's statement list.
 struct BodyEmit {
     /// The module's emitted statements (bindings, effects, comments).
@@ -120,6 +138,12 @@ struct BodyEmit {
     /// A trailing bare-expression value (`Some` = the module record is
     /// that value, not a name projection — `module_prep` parity).
     tail: Option<JsAst>,
+    /// Nullary-constructor literals this module bound (`data` decls and
+    /// ctor names imported from deps), keyed by binding name — carried
+    /// into `Bundle::dep_ctors` so importers can seed `lang.globals`
+    /// for `match`'s ctor-value patterns (`Zero:`), mirroring eval's
+    /// scope-value resolution across the import edge.
+    ctor_literals: HashMap<String, Value>,
 }
 
 /// Bundle-level emit state shared by the entry module and every inlined
@@ -131,8 +155,9 @@ struct Bundle<'a> {
     modules: HashMap<String, DepModule<'a>>,
     /// Emitted modules: canon path → (JS expr evaluating to the
     /// namespace object, export `(name, value-expr)` pairs — consumed by
-    /// `import "spec"` / `from "spec" import *` splices).
-    emitted: HashMap<String, (String, Vec<(String, JsAst)>)>,
+    /// `import "spec"` / `from "spec" import *` splices —, ctor literals
+    /// for `match` ctor-value patterns in importers).
+    emitted: HashMap<String, EmittedModule>,
     /// Paths on the active emit stack — a hit is a circular import
     /// (mirrors `ModuleLoader`'s `loading` set, which errors the same
     /// way at eval time).
@@ -204,21 +229,26 @@ impl<'a> Bundle<'a> {
     /// ```
     ///
     /// Returns the module's export `(name, expr)` pairs for splice
-    /// imports. A dep that fails to emit degrades to an empty namespace
-    /// plus a marker comment — preserving the old dead-member-path
-    /// semantics — rather than failing the whole compile; a circular
-    /// import errors (the same error `ModuleLoader` reports at eval
-    /// time).
+    /// imports plus its nullary-ctor literals (for `match` ctor-value
+    /// patterns in the importer). A dep that fails to emit degrades to
+    /// an empty namespace plus a marker comment — preserving the old
+    /// dead-member-path semantics — rather than failing the whole
+    /// compile; a circular import errors (the same error
+    /// `ModuleLoader` reports at eval time).
     fn ensure_module(
         &mut self,
         lang: &Language,
         spec: &str,
         path: &str,
-    ) -> Result<Vec<(String, JsAst)>, CompileError> {
-        if let Some((ns, exports)) = self.emitted.get(path) {
-            let (ns, exports) = (ns.clone(), exports.clone());
+    ) -> Result<DepSurface, CompileError> {
+        if let Some(emitted) = self.emitted.get(path) {
+            let ns = emitted.ns.clone();
+            let surface = DepSurface {
+                exports: emitted.surface.exports.clone(),
+                ctors: emitted.surface.ctors.clone(),
+            };
             self.bind_spec(spec, &ns);
-            return Ok(exports);
+            return Ok(surface);
         }
         if self.in_progress.contains(path) {
             return Err(CompileError::InvalidInput(format!(
@@ -238,14 +268,20 @@ impl<'a> Bundle<'a> {
         let body = self.emit_module_body(lang, &source, edges, true);
         self.in_progress.remove(path);
         let ident = self.fresh_ident(path);
-        let (stmts, exports) = match body {
+        let (stmts, surface) = match body {
             Ok(emit) => {
                 let mut stmts = emit.stmts;
                 stmts.push(JsAst::Return(Box::new(
                     emit.tail
                         .unwrap_or_else(|| JsAst::Object(emit.exports.clone())),
                 )));
-                (stmts, emit.exports)
+                (
+                    stmts,
+                    DepSurface {
+                        exports: emit.exports,
+                        ctors: emit.ctor_literals,
+                    },
+                )
             }
             Err(e) => {
                 // A circular import found inside the dep body is a hard
@@ -260,7 +296,13 @@ impl<'a> Bundle<'a> {
                 self.out.push(JsAst::Comment(format!(
                     "compile-js: dep `{spec}` ({path}) not inlined: {e}"
                 )));
-                (Vec::new(), Vec::new())
+                (
+                    Vec::new(),
+                    DepSurface {
+                        exports: Vec::new(),
+                        ctors: HashMap::new(),
+                    },
+                )
             }
         };
         self.out.push(JsAst::ConstDecl {
@@ -273,10 +315,18 @@ impl<'a> Bundle<'a> {
                 args: Vec::new(),
             }))),
         });
-        self.emitted
-            .insert(path.to_string(), (ident.clone(), exports.clone()));
+        self.emitted.insert(
+            path.to_string(),
+            EmittedModule {
+                ns: ident.clone(),
+                surface: DepSurface {
+                    exports: surface.exports.clone(),
+                    ctors: surface.ctors.clone(),
+                },
+            },
+        );
         self.bind_spec(spec, &ident);
-        Ok(exports)
+        Ok(surface)
     }
 
     /// `__handl_rt[<spec>] = <ns>;` — once per spec text (the same file
@@ -350,6 +400,11 @@ struct ModuleCtx<'e> {
     exports: Vec<(String, JsAst)>,
     /// Dep-mode trailing bare-expression value (the module record).
     tail: Option<JsAst>,
+    /// Nullary-ctor literals bound in this module — own `data` decls
+    /// plus ctor literals propagated through imports (re-exportable).
+    /// Surfaced on `BodyEmit` so `Bundle::emitted` can hand them to
+    /// importers' `lang.globals`.
+    ctor_literals: HashMap<String, Value>,
 }
 
 impl<'e> ModuleCtx<'e> {
@@ -376,6 +431,7 @@ impl<'e> ModuleCtx<'e> {
             dep,
             exports: Vec::new(),
             tail: None,
+            ctor_literals: HashMap::new(),
         }
     }
 
@@ -439,6 +495,7 @@ impl<'e> ModuleCtx<'e> {
             stmts: self.stmts,
             exports,
             tail: self.tail,
+            ctor_literals: self.ctor_literals,
         }
     }
 
@@ -903,6 +960,42 @@ fn is_from_export(text: &str) -> bool {
             .is_some_and(|r| r.starts_with(' ') || r.starts_with('\t') || r.starts_with('{'))
 }
 
+/// Whether `text` opens an `export data F …` family declaration —
+/// `export` followed by the `data` keyword and a family name. The
+/// word-boundary checks mirror `module_prep::is_data_decl_rest`:
+/// `export data_transfer := …` is an ordinary binding (`data_transfer`
+/// is one identifier) and `export data := …` binds the name `data`;
+/// neither is a declaration.
+fn is_export_data_decl(text: &str) -> bool {
+    let t = text.trim_start();
+    let Some(rest) = t.strip_prefix("export") else {
+        return false;
+    };
+    if !(rest.is_empty()
+        || rest.starts_with(' ')
+        || rest.starts_with('\t')
+        || rest.starts_with('\n')
+        || rest.starts_with('\r'))
+    {
+        return false;
+    }
+    let rest = rest.trim_start();
+    let Some(after) = rest.strip_prefix("data") else {
+        return false;
+    };
+    // `data` must end at a word boundary …
+    match after.chars().next() {
+        Some(c) if c.is_alphanumeric() || c == '_' => return false,
+        _ => {}
+    }
+    // … and be followed by the family name (an identifier).
+    after
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_')
+}
+
 /// Whether a module specifier is a bare host-module name (e.g. `"js"`,
 /// `"tag"`) rather than a path — a single identifier/kebab segment.
 fn is_bare_module_name(spec: &str) -> bool {
@@ -1038,22 +1131,27 @@ impl ModuleCtx<'_> {
             _ if self.is_flattened_decl_group(lang, ast, node) && !is_user_block(node, text) => {
                 self.emit_splice_block(lang, ast, node).map(|_| ())
             }
-            // `export data F :: …` parses as `export <var data>` spliced
-            // into the family decl group — there is no `export data`
-            // form; the block would lower to a nonsense `export(data)`
-            // call. Fail loudly: export the family by name instead
-            // (`data F :: …` then `export F`).
+            // `export data F :: …` / `export data F := { … }` parses as
+            // `export <var data>` spliced into the family decl group —
+            // a surface `block` of `[stmt.export(residue), …assigns]`.
+            // Emit the decl group and export the family + constructor
+            // names (`module_prep` parity); any other `export` inside a
+            // block is still unsupported — fail loudly.
             _ if node.kind == "block"
                 && children_of(node).iter().any(|&c| {
                     ast.get(AstRef::new(c))
                         .is_some_and(|n| n.kind == "stmt.export")
                 }) =>
             {
-                Err(CompileError::InvalidInput(
-                    "`export data …` is not a supported declaration form — \
-                     declare the family, then `export F` (or the ctor names)"
-                        .to_string(),
-                ))
+                if is_export_data_decl(text) {
+                    self.emit_export_data_block(lang, ast, node)
+                } else {
+                    Err(CompileError::InvalidInput(
+                        "`export` inside a declaration group is not a \
+                         supported form — only `export data F …` is"
+                            .to_string(),
+                    ))
+                }
             }
             _ => {
                 if let Some((name, value_idx)) = self.binding_parts(lang, ast, node) {
@@ -1252,15 +1350,19 @@ impl ModuleCtx<'_> {
             );
         }
         // `export data F := { … }` / `export data F :: …` — the desugared
-        // declaration group exports the family name (module_prep
-        // projects the bound `F`, not the constructors).
+        // declaration group exports the family name and each constructor
+        // (`module_prep` projects every non-dotted name the decl binds;
+        // `F.rec` is dotted and cannot be a record field).
         if is_splice_block(child) || self.is_flattened_decl_group(lang, ast, child) {
-            let family = self.emit_splice_block(lang, ast, child)?;
-            if let Some(name) = family
-                && let Some(r) = self.bound.get(&name).cloned()
-            {
+            let names = self.emit_splice_block(lang, ast, child)?;
+            for name in names {
+                let Some(r) = self.bound.get(&name).cloned() else {
+                    continue;
+                };
                 if self.dep {
-                    self.exports.push((name, bound_expr(&r)));
+                    if !self.exports.iter().any(|(n, _)| *n == name) {
+                        self.exports.push((name, bound_expr(&r)));
+                    }
                 } else {
                     self.emit_entry_export(&name, &r);
                 }
@@ -1378,8 +1480,9 @@ impl ModuleCtx<'_> {
     /// module scope exactly like a top-level statement; dotted targets
     /// (`F.rec`) become member assignments on the family binding.
     ///
-    /// Returns the first bound name (the family/former) for
-    /// `export data` handling, and injects nullary constructors into
+    /// Returns the non-dotted bound names in order (the family/former
+    /// first, then each constructor) — the set `export data` projects
+    /// into the module record — and injects nullary constructors into
     /// `lang.globals` so `match`'s ctor-value patterns (`Zero:`) see
     /// them as literals — `lower_ast`'s env is per-statement and cannot
     /// carry module bindings into `compile_pattern`'s `pat_env`.
@@ -1388,14 +1491,14 @@ impl ModuleCtx<'_> {
         lang: &Language,
         ast: &Ast,
         node: &AstNode,
-    ) -> Result<Option<String>, CompileError> {
+    ) -> Result<Vec<String>, CompileError> {
         let children = node
             .payload
             .get("children")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let mut family: Option<String> = None;
+        let mut names: Vec<String> = Vec::new();
         let mut ctor_globals: Vec<(String, Value)> = Vec::new();
         for entry in children {
             let Some(idx) = entry.as_u64().map(|n| n as usize) else {
@@ -1404,25 +1507,109 @@ impl ModuleCtx<'_> {
             let Some(child) = ast.get(AstRef::new(idx)) else {
                 continue;
             };
-            let child_ref = AstRef::new(idx);
-            if let Some((name, value_idx)) = self.binding_parts(lang, ast, child) {
-                if family.is_none() {
-                    family = Some(name.clone());
-                }
-                if name.contains('.') {
-                    self.emit_member_binding(lang, ast, child_ref, &name, value_idx)?;
-                } else {
-                    self.emit_binding(lang, ast, child_ref, child, &name, value_idx, false)?;
-                    if let Some(v) = ctor_global_value(ast, value_idx) {
-                        ctor_globals.push((name, v));
-                    }
-                }
-            } else {
-                self.emit_expr_statement(lang, ast, child_ref, false)?;
-            }
+            self.emit_decl_group_child(
+                lang,
+                ast,
+                AstRef::new(idx),
+                child,
+                &mut names,
+                &mut ctor_globals,
+            )?;
         }
         self.inject_ctor_globals(ctor_globals);
-        Ok(family)
+        Ok(names)
+    }
+
+    /// Emit one child of a desugared `data` declaration group — a
+    /// former/ctor/`F.rec` `assign` (or, defensively, an expression
+    /// statement). Non-dotted binding names join `names` (the export
+    /// projection set); nullary ctor literals join `ctor_globals`.
+    fn emit_decl_group_child(
+        &mut self,
+        lang: &Language,
+        ast: &Ast,
+        child_ref: AstRef,
+        child: &AstNode,
+        names: &mut Vec<String>,
+        ctor_globals: &mut Vec<(String, Value)>,
+    ) -> Result<(), CompileError> {
+        if let Some((name, value_idx)) = self.binding_parts(lang, ast, child) {
+            if name.contains('.') {
+                self.emit_member_binding(lang, ast, child_ref, &name, value_idx)?;
+            } else {
+                self.emit_binding(lang, ast, child_ref, child, &name, value_idx, false)?;
+                if let Some(v) = ctor_global_value(ast, value_idx) {
+                    ctor_globals.push((name.clone(), v));
+                }
+                names.push(name);
+            }
+        } else {
+            self.emit_expr_statement(lang, ast, child_ref, false)?;
+        }
+        Ok(())
+    }
+
+    /// `export data F :: …` / `export data F := { … }` — the desugared
+    /// declaration group reaches emit as a surface `block` whose
+    /// children are the `export data` marker (`stmt.export` over the
+    /// `var "data"` residue `strip_data_keyword_residue` removed — it
+    /// binds nothing) followed by the family former/constructor/`F.rec`
+    /// `assign`s (`splice_decl_blocks` flattened the `__splice__` group
+    /// into the surface block, which also carries the `statements`
+    /// role). Emit the assigns at module scope like
+    /// [`Self::emit_splice_block`], then export every non-dotted bound
+    /// name — the family and each constructor, mirroring
+    /// `module_prep`'s export-record projection (`F.rec` is dotted and
+    /// cannot be a record field).
+    fn emit_export_data_block(
+        &mut self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+    ) -> Result<(), CompileError> {
+        let children = node
+            .payload
+            .get("children")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut names: Vec<String> = Vec::new();
+        let mut ctor_globals: Vec<(String, Value)> = Vec::new();
+        for entry in children {
+            let Some(idx) = entry.as_u64().map(|n| n as usize) else {
+                continue;
+            };
+            let Some(child) = ast.get(AstRef::new(idx)) else {
+                continue;
+            };
+            // The `export data` marker itself: no runtime binding (its
+            // only child was the stripped `var "data"` residue).
+            if child.kind == "stmt.export" {
+                continue;
+            }
+            self.emit_decl_group_child(
+                lang,
+                ast,
+                AstRef::new(idx),
+                child,
+                &mut names,
+                &mut ctor_globals,
+            )?;
+        }
+        self.inject_ctor_globals(ctor_globals);
+        for name in names {
+            let Some(r) = self.bound.get(&name).cloned() else {
+                continue;
+            };
+            if self.dep {
+                if !self.exports.iter().any(|(n, _)| *n == name) {
+                    self.exports.push((name, bound_expr(&r)));
+                }
+            } else {
+                self.emit_entry_export(&name, &r);
+            }
+        }
+        Ok(())
     }
 
     /// Whether `node` is the *flattened* form of a `data` declaration
@@ -1480,25 +1667,69 @@ impl ModuleCtx<'_> {
 
     /// Register nullary ctor values as `lang.globals` entries — see
     /// `emit_splice_block`. Lazily clones the base `Language` on first
-    /// use so modules without `data` decls pay nothing.
+    /// use so modules without `data` decls pay nothing. Also records
+    /// each literal in `ctor_literals` so dep modules can hand them to
+    /// importers (and re-export them transitively).
     fn inject_ctor_globals(&mut self, ctors: Vec<(String, Value)>) {
         if ctors.is_empty() {
             return;
         }
         let lang = self.augmented_lang.get_or_insert_with(|| self.lang.clone());
         for (name, value) in ctors {
+            self.ctor_literals.insert(name.clone(), value.clone());
             lang.globals.insert(name, value);
         }
     }
 
     /// Splice a resolved dep's export names into scope —
     /// `import "spec"` / `from "spec" import *` bind the module record's
-    /// fields as arrow-convention member paths.
-    fn splice_exports(&mut self, spec: &str, exports: &[(String, JsAst)]) {
+    /// fields as arrow-convention member paths. Nullary-ctor literals
+    /// the dep bound ride along into `lang.globals` so `match`'s
+    /// ctor-value patterns (`Zero:`) see imported constructors as the
+    /// same literals eval's scope resolution would hand them.
+    fn splice_exports(
+        &mut self,
+        spec: &str,
+        exports: &[(String, JsAst)],
+        ctors: &HashMap<String, Value>,
+    ) {
+        let mut injected = Vec::new();
         for (name, _) in exports {
             let local = js_ident(name);
-            self.bind(local, BoundRef::DepArrow(rt_member_path(&[spec, name])));
+            self.bind(
+                local.clone(),
+                BoundRef::DepArrow(rt_member_path(&[spec, name])),
+            );
+            if let Some(v) = ctors.get(name) {
+                injected.push((local, v.clone()));
+            }
         }
+        self.inject_ctor_globals(injected);
+    }
+
+    /// Seed `lang.globals` with a resolved dep's nullary-ctor literals
+    /// for the `(exported name, local bound name)` pairs this import
+    /// binds. Only *exported* names propagate — an unexported ctor
+    /// literal is not importable, and injecting it would let a
+    /// `Zero:`-style pattern match a value the import cannot produce
+    /// (eval resolves the name through scope to the ctor value and
+    /// `eq`-matches it — the same outcome for exported ctors).
+    fn inject_dep_ctors(
+        &mut self,
+        exports: &[(String, JsAst)],
+        ctors: &HashMap<String, Value>,
+        pairs: &[(String, String)],
+    ) {
+        let mut injected = Vec::new();
+        for (imported, local) in pairs {
+            if !exports.iter().any(|(n, _)| n == imported) {
+                continue;
+            }
+            if let Some(v) = ctors.get(imported) {
+                injected.push((local.clone(), v.clone()));
+            }
+        }
+        self.inject_ctor_globals(injected);
     }
 
     fn emit_import(
@@ -1591,8 +1822,14 @@ impl ModuleCtx<'_> {
         if !PRELUDE_OWNED.contains(&spec.as_str())
             && let Some(dep_path) = self.edges.get(&spec).cloned()
         {
-            let exports = g.ensure_module(lang, &spec, &dep_path)?;
+            let DepSurface { exports, ctors } = g.ensure_module(lang, &spec, &dep_path)?;
             if reexport {
+                let pairs: Vec<(String, String)> = names
+                    .iter()
+                    .filter(|(i, _)| i != "*")
+                    .map(|(i, _)| (i.clone(), js_ident(i)))
+                    .collect();
+                self.inject_dep_ctors(&exports, &ctors, &pairs);
                 for (imported, _) in names.iter().filter(|(i, _)| i != "*") {
                     let path = rt_member_path(&[&spec, imported]);
                     self.bind(js_ident(imported), BoundRef::DepArrow(path.clone()));
@@ -1608,9 +1845,14 @@ impl ModuleCtx<'_> {
             let star = spec.ends_with('*') || names.iter().any(|(i, _)| i == "*");
             if star {
                 if ns_alias.is_none() {
-                    self.splice_exports(&spec, &exports);
+                    self.splice_exports(&spec, &exports, &ctors);
                 }
             } else {
+                let pairs: Vec<(String, String)> = names
+                    .iter()
+                    .map(|(imported, local)| (imported.clone(), local_of(imported, local)))
+                    .collect();
+                self.inject_dep_ctors(&exports, &ctors, &pairs);
                 for (imported, local) in &names {
                     self.bind(
                         local_of(imported, local),
@@ -1620,7 +1862,7 @@ impl ModuleCtx<'_> {
                 // `import "spec"` — the splice form.
                 if names.is_empty() && ns_alias.is_none() && !text.trim_start().starts_with("from")
                 {
-                    self.splice_exports(&spec, &exports);
+                    self.splice_exports(&spec, &exports, &ctors);
                 }
             }
             return Ok(());
