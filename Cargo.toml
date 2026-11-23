@@ -28,9 +28,9 @@ handl-plugin-ext-diag = { git = "https://github.com/handl-lang/host", branch = "
 hnl-engine = { git = "https://github.com/handl-lang/engine", branch = "main" }
 hnl-engine-typecheck = { git = "https://github.com/handl-lang/engine-typecheck", branch = "main" }
 serde_json = "1"
-# PL-004 T-092: desired-state codegen kernel. Path dep — engine-codegen
-# has no git remote; the sibling checkout is the resolution.
-hnl-engine-codegen = { path = "../engine-codegen" }
+# PL-004 T-092: desired-state codegen kernel — git dep; the sibling
+# checkout wins via `[patch]`.
+hnl-engine-codegen = { git = "https://github.com/handl-lang/engine-codegen", branch = "main" }
 
 [dev-dependencies]
 rand = "0.9"
@@ -42,3 +42,8 @@ handl-kit-data-prelude = { git = "https://github.com/handl-lang/host", branch = 
 name = "bench"
 path = "bench/bench.rs"
 
+
+# ADR-0128 §Resolution: the sibling checkout wins locally; CI resolves
+# the `branch = "main"` git deps.
+[patch."https://github.com/handl-lang/engine-codegen"]
+hnl-engine-codegen = { path = "../engine-codegen" }
