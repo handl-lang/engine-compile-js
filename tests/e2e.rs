@@ -1432,3 +1432,34 @@ graded:{"s":102,"t":20}
 incoming:1002"#
     );
 }
+
+#[test]
+fn e2e_flow_chain_in_arrow_body_applies_stages() {
+    require_node!();
+    // T-019 regression: `x >>> s1 >>> s2` inside an arrow body lowers
+    // to `Seq` stages whose `snd` are bare `Op{name, []}` lazy
+    // references — they must *apply* the named arrows to the stage
+    // input (`s2(s1(x))`), not yield the arrow values. `comp` exercises
+    // the `Op{flow}` dispatch + quoted-arrow rhs path.
+    let run = run_program(
+        "flow_seq",
+        r#"
+s1 := (x) ~> x + 1
+s2 := (x) ~> x * 10
+pipe := (x) ~> x >>> s1 >>> s2
+comp := s1 >>> s2
+apply2 := (g, x) ~> g(x)
+five := 5
+read5 := (a) ~> five
+{ piped: pipe(5), composed: comp(5), passed: apply2(s1, 5), read: read5(9) }
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // pipe(5) = s2(s1(5)) = 60; comp(5) = 60; apply2(s1,5) = 6;
+    // read5(9) reads the non-arrow binding `five` = 5.
+    assert_eq!(
+        run.stdout.trim(),
+        r#"{"piped":60,"composed":60,"passed":6,"read":5}"#
+    );
+}

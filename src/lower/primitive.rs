@@ -82,6 +82,17 @@ const DISPATCHABLE_OPS: &[&str] = &[
     "or", "pow", "concat",
 ];
 
+/// Whether a bare `Op{name, []}` resolves as a lazy *reference* — a
+/// module-bound name or a non-builtin op name (the
+/// [`lower_bound_op_body`]/`__opRef` outcomes) — rather than one of the
+/// dedicated input-reading op arms (`id`, `tag`, `elem`, `add`, …).
+/// Mirrors arrow-lower's `is_lazy_op_ref` minus its `id`/`elem`/`flow`
+/// exclusions: those names have dedicated arms here that already read
+/// `param`, so they are never lazy references on this target.
+pub fn is_lazy_op_ref(name: &str) -> bool {
+    super::module_bound(name).is_some() || !BUILTIN_OPS.contains(&name)
+}
+
 /// `__handl_rt.dispatch("name", [args], dim, incoming)` — eval's
 /// `dispatch_op` fallback for `Native` ops: covering handler impls
 /// (grades-filtered stack scan, then the incoming value's own `impls`)
@@ -212,6 +223,7 @@ pub fn lower_applied(term: &Term, _input: &JsAst) -> Result<JsAst, CompileError>
             lit.as_ref(),
             dim_label(dim).as_deref(),
             _input,
+            false,
         )?))),
         Term::Seq { axis, fst, snd } => {
             check_sequential(axis, fst)?;
@@ -257,10 +269,10 @@ fn lower_seq_body(fst: &Term, snd: &Term, input: &JsAst) -> Result<JsAst, Compil
         fst_js,
         JsAst::Ident(_) | JsAst::Null | JsAst::Bool(_) | JsAst::Num(_) | JsAst::Str(_)
     ) {
-        return lower_sub(snd, &fst_js);
+        return lower_sub_scheme(snd, &fst_js);
     }
     let name = super::next_tmp();
-    let body = lower_sub(snd, &JsAst::Ident(name.clone()))?;
+    let body = lower_sub_scheme(snd, &JsAst::Ident(name.clone()))?;
     Ok(JsAst::Await(Box::new(JsAst::Call {
         callee: Box::new(JsAst::ArrowFn {
             params: Vec::new(),
@@ -276,6 +288,44 @@ fn lower_seq_body(fst: &Term, snd: &Term, input: &JsAst) -> Result<JsAst, Compil
     })))
 }
 
+/// `lower_applied` with the *scheme* reading for `Term::Op`: a bare
+/// `Op{name, []}` lazy reference is a body arrow here — `Seq.snd` is
+/// the stage the pipeline feeds the `fst` result to, so the named
+/// binding/op applies to it (`x >>> s1` runs `s1(x)`, not the `s1`
+/// arrow value). Other term kinds delegate to [`lower_applied`] —
+/// their own subterm positions keep the referent reading (a `Choice`
+/// arm or `App` arg naming an arrow yields the arrow, matching eval).
+pub fn lower_sub_scheme(term: &Term, input: &JsAst) -> Result<JsAst, CompileError> {
+    match term {
+        Term::Op { .. } => lower_applied_scheme(term, input),
+        _ => lower_sub(term, input),
+    }
+}
+
+/// `lower_applied` for a `Term::Op` with `scheme = true` — see
+/// [`lower_op_body`]. Awaited like the value-reading path.
+pub fn lower_applied_scheme(term: &Term, input: &JsAst) -> Result<JsAst, CompileError> {
+    match term {
+        Term::Op {
+            name,
+            args,
+            source,
+            lit,
+            dim,
+            ..
+        } => Ok(JsAst::Await(Box::new(lower_op_body(
+            name,
+            args,
+            source.clone(),
+            lit.as_ref(),
+            dim_label(dim).as_deref(),
+            input,
+            true,
+        )?))),
+        _ => lower_sub(term, input),
+    }
+}
+
 fn lower_op(
     name: &str,
     args: &[Term],
@@ -284,7 +334,11 @@ fn lower_op(
     dim_label: Option<&str>,
 ) -> Result<JsAst, CompileError> {
     let param = JsAst::Ident(INPUT_NAME.to_string());
-    let body = lower_op_body(name, args, source, lit, dim_label, &param)?;
+    // `lower` produces the term's *arrow*: a bare `Op{name, []}` lazy
+    // reference is a body scheme — it applies the named binding to the
+    // incoming (`in ↦ s1(in)`), not a constant arrow returning the
+    // reference.
+    let body = lower_op_body(name, args, source, lit, dim_label, &param, true)?;
     Ok(JsAst::ArrowFn {
         params: vec![INPUT_NAME.to_string()],
         body: Box::new(body),
@@ -296,6 +350,15 @@ fn lower_op(
 /// passes the concrete input expression instead. `dim_label` is the
 /// op's named-dimension label (`Term::Op::dim` resolved to a literal
 /// string) forwarded to handler dispatch for `grades` coverage.
+///
+/// `scheme` selects the *application* reading of a bare `Op{name, []}`
+/// lazy reference: in scheme position (`Seq.snd`, quoted-arrow bodies —
+/// anywhere the term is consumed as an arrow applied to `param`) the
+/// named binding/op is applied to the incoming via
+/// `__handl_rt.__appOrValue`; in value position (op/app/record args —
+/// anywhere the term is read as data) it stays the referent itself.
+/// `lower_op` passes `true` (it builds the term's arrow); `lower_applied`
+/// passes `false` (argument positions want the referent).
 fn lower_op_body(
     name: &str,
     args: &[Term],
@@ -303,6 +366,7 @@ fn lower_op_body(
     lit: Option<&Value>,
     dim_label: Option<&str>,
     param: &JsAst,
+    scheme: bool,
 ) -> Result<JsAst, CompileError> {
     // `await` is the `js.await` promise bridge (`handl-packages/js`): it
     // lowers to a real JS `await` inside the (async) arrow body, handing
@@ -322,7 +386,7 @@ fn lower_op_body(
     if let Some(bound) = module_bound(name)
         && (args.is_empty() || !BUILTIN_OPS.contains(&name))
     {
-        return lower_bound_op_body(&bound, args, source, lit, dim_label, param);
+        return lower_bound_op_body(&bound, args, source, lit, dim_label, param, scheme);
     }
 
     if let ArrSource::Foreign(module) = &source {
@@ -658,14 +722,27 @@ fn lower_op_body(
                 // `__handl_rt.<name>` member would silently evaluate to
                 // `undefined` for unknown names (e.g. an unbound pattern
                 // variable left over from a `{x}` shorthand object
-                // pattern, which binds nothing).
-                JsAst::Call {
+                // pattern, which binds nothing). In *scheme* position the
+                // reference is a body arrow — apply the resolved
+                // referent to the incoming (`__appOrValue` keeps a
+                // non-callable referent honest).
+                let referent = JsAst::Call {
                     callee: Box::new(JsAst::Member {
                         obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
                         prop: "__opRef".to_string(),
                     }),
                     args: vec![JsAst::Str(name.to_string())],
+                };
+                if scheme {
+                    return Ok(JsAst::Await(Box::new(JsAst::Call {
+                        callee: Box::new(JsAst::Member {
+                            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                            prop: "__appOrValue".to_string(),
+                        }),
+                        args: vec![JsAst::Await(Box::new(referent)), param.clone()],
+                    })));
                 }
+                referent
             } else {
                 let lowered_args: Vec<JsAst> = args
                     .iter()
@@ -702,6 +779,11 @@ fn lower_op_body(
 
 /// Emit an `Op { name, args }` body whose name resolves to a
 /// module-scope binding ([`BoundRef`]) — an import or top-level `const`.
+/// `scheme` is `lower_op_body`'s application-vs-referent switch: a
+/// bare `Op{name, []}` in scheme position applies the bound referent
+/// to `param` via `__handl_rt.__appOrValue` (arrow bindings run,
+/// non-callable values read back); in value position it stays the
+/// referent itself.
 fn lower_bound_op_body(
     bound: &BoundRef,
     args: &[Term],
@@ -709,14 +791,30 @@ fn lower_bound_op_body(
     lit: Option<&Value>,
     dim_label: Option<&str>,
     param: &JsAst,
+    scheme: bool,
 ) -> Result<JsAst, CompileError> {
     if let BoundRef::Op(real) = bound {
-        return lower_op_body(real, args, source, lit, dim_label, param);
+        return lower_op_body(real, args, source, lit, dim_label, param, scheme);
     }
     let applied = args
         .iter()
         .map(|a| lower_sub(a, param))
         .collect::<Result<Vec<_>, _>>()?;
+    // The referent expression for a bare `Op{name, []}` — what value
+    // position emits today. In scheme position it feeds
+    // `__appOrValue(referent, param)` instead.
+    let app_or_value = |referent: JsAst| -> JsAst {
+        if !scheme {
+            return referent;
+        }
+        JsAst::Await(Box::new(JsAst::Call {
+            callee: Box::new(JsAst::Member {
+                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                prop: "__appOrValue".to_string(),
+            }),
+            args: vec![referent, param.clone()],
+        }))
+    };
     let body = match bound {
         // `Arrow` is a top-level `const` name, `DepArrow` a member path
         // into an inlined dep module (`__handl_rt[spec].name`) — both are
@@ -727,8 +825,9 @@ fn lower_bound_op_body(
                 _ => JsAst::Ident(js_name.clone()),
             };
             if applied.is_empty() {
-                // Value position: the arrow yields the binding itself.
-                callee
+                // Value position: the arrow yields the binding itself;
+                // scheme position: apply it to the incoming.
+                app_or_value(callee)
             } else {
                 // `app` arg-input: one argument stays bare, several pack
                 // into the tuple array the callee's `__in` expects.
@@ -751,7 +850,7 @@ fn lower_bound_op_body(
         }
         BoundRef::Ident(js_name) => {
             if applied.is_empty() {
-                JsAst::Ident(js_name.clone())
+                app_or_value(JsAst::Ident(js_name.clone()))
             } else {
                 JsAst::Call {
                     callee: Box::new(JsAst::Ident(js_name.clone())),
@@ -759,19 +858,30 @@ fn lower_bound_op_body(
                 }
             }
         }
-        BoundRef::Shim(member) => JsAst::Call {
-            callee: Box::new(JsAst::Member {
-                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                prop: member.clone(),
-            }),
-            args: applied,
-        },
+        BoundRef::Shim(member) => {
+            if applied.is_empty() {
+                // The referent is the `__handl_rt` member itself (a
+                // host function), not a `member()` call.
+                app_or_value(JsAst::Member {
+                    obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                    prop: member.clone(),
+                })
+            } else {
+                JsAst::Call {
+                    callee: Box::new(JsAst::Member {
+                        obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                        prop: member.clone(),
+                    }),
+                    args: applied,
+                }
+            }
+        }
         // `Member` is a host member path (comma/spread args), `Ns` a dep
         // module's namespace record — both are plain values; a direct
         // `Op`-spelled call applies the member spread convention.
         BoundRef::Member(path) | BoundRef::Ns(path) => {
             if applied.is_empty() {
-                JsAst::Raw(path.clone())
+                app_or_value(JsAst::Raw(path.clone()))
             } else {
                 JsAst::Call {
                     callee: Box::new(JsAst::Raw(path.clone())),

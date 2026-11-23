@@ -1777,3 +1777,59 @@ fn op_dim_label_reaches_handler_dispatch() {
         "{js}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T-019: `>>>` (`flow`/`Seq`) lazy-reference application — `Seq.snd` and
+// quoted-arrow bodies must *apply* a bare `Op{name, []}` to the stage
+// input (`__appOrValue`), while argument positions keep the referent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn seq_lazy_op_ref_applies_via_app_or_value() {
+    // `Seq[id, Op{s1, []}]` — the snd is a body-arrow position: the
+    // named binding applies to the stage input. With no module env the
+    // name is unbound, so the referent resolves through `__opRef` and
+    // `__appOrValue` applies it (or reads it back when non-callable).
+    let term = Term::seq(Term::op_native("id", vec![]), Term::op_native("s1", vec![]));
+    let js = compile_to_string(&input(term), &JsConfig::esm_deno()).unwrap();
+    assert!(js.contains("__appOrValue"), "{js}");
+    assert!(js.contains(r#"__opRef("s1")"#), "{js}");
+}
+
+#[test]
+fn seq_lazy_op_ref_bound_arrow_applies_binding() {
+    // Module scope: `s1` binds an arrow `const`, so the scheme-position
+    // reference applies the binding itself — `__appOrValue(s1, …)`.
+    let js = compile_to_string(
+        &module_input("s1 := (x) ~> x + 1\npipe := (x) ~> x >>> s1\npipe(5)\n"),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("__appOrValue(s1"), "{js}");
+}
+
+#[test]
+fn quoted_lazy_op_ref_arrow_body_applies_binding() {
+    // `comp := s1 >>> s2` lowers to `Op{flow, [Op{s1, []}, Arr{Op{s2, []}}]}`
+    // — the quoted rhs is an arrow *body*, so its `Op{s2, []}` must
+    // apply `s2` to the incoming (`__in => s2(__in)`), not return the
+    // `s2` binding. Pin the `__appOrValue` emit inside the arrow.
+    let js = compile_to_string(
+        &module_input("s1 := (x) ~> x + 1\ns2 := (x) ~> x * 10\ncomp := s1 >>> s2\ncomp(5)\n"),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("__appOrValue(s2, __in)"), "{js}");
+}
+
+#[test]
+fn op_arg_positions_keep_the_referent_reading() {
+    // `apply2(s1, 5)` — `s1` in argument position is a *value* read:
+    // the arrow itself is passed, never applied to the ambient input.
+    let js = compile_to_string(
+        &module_input("s1 := (x) ~> x + 1\napply2 := (g, x) ~> g(x)\napply2(s1, 5)\n"),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(!js.contains("__appOrValue(s1"), "{js}");
+}

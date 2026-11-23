@@ -115,6 +115,15 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
       __handl_rt.__handlers.length -= n;
     }}
   }},
+  // Apply-or-read: the lazy `Op{{name, []}}` reference in *scheme*
+  // position (`Seq.snd`, quoted-arrow bodies). The referent is applied
+  // to the incoming when it is callable (arrow values, bound-arrow
+  // records, host functions — `__apply` reinstates `__carried__`
+  // frames); a non-callable referent (a `x := 5` binding read inside an
+  // arrow body) yields itself, matching the referent reading the same
+  // term has in argument position.
+  __appOrValue: async (fn, input) =>
+    (typeof fn === "function" ? __handl_rt.__apply(fn, input) : fn),
   // Apply a *handler impl* arrow: the eval `dispatch_op` arity rule —
   // a bare ≥2-ary impl (no resume journal on this target) errors on
   // arity rather than silently running with `undefined` params.

@@ -75,14 +75,40 @@ fn lower_handle(body: &Term, target: &str, impl_: &Term) -> Result<JsAst, Compil
     )?))
 }
 
+/// The arrow a `handle` body/impl scheme lowers to. A bare lazy op
+/// reference (`Op{name, []}` — `handle arr Foo with h`'s `arr Foo`)
+/// is the exception: eval yields the op-*reference* arrow value, and
+/// `handle` calls `body(input)` expecting that arrow back (it attaches
+/// the carried handler and returns it). The scheme reading would
+/// *perform* the op instead, so the referent is emitted as a const
+/// arrow `__in => <referent>` — the same shape `lower_op` produced
+/// before lazy refs gained the apply reading.
+fn handle_scheme(term: &Term) -> Result<JsAst, CompileError> {
+    if let Term::Op {
+        name, args, lit, ..
+    } = term
+        && args.is_empty()
+        && lit.is_none()
+        && super::primitive::is_lazy_op_ref(name)
+    {
+        let param = JsAst::Ident(INPUT_NAME.to_string());
+        let referent = super::primitive::lower_applied(term, &param)?;
+        return Ok(JsAst::ArrowFn {
+            params: vec![INPUT_NAME.to_string()],
+            body: Box::new(referent),
+        });
+    }
+    crate::lower::lower(term)
+}
+
 fn lower_handle_applied(
     body: &Term,
     target: &str,
     impl_: &Term,
     input: &JsAst,
 ) -> Result<JsAst, CompileError> {
-    let body_fn = crate::lower::lower(body)?;
-    let impl_fn = crate::lower::lower(impl_)?;
+    let body_fn = handle_scheme(body)?;
+    let impl_fn = handle_scheme(impl_)?;
     // `impl_` is a *scheme* evaluated under the same incoming as the
     // body (eval order: impl value first, then push, then body). The
     // lowered impl is an async arrow for scheme terms; a constant term
