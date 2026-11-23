@@ -913,6 +913,22 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
     t.removeEventListener(String(event), listener);
     return null;
   }},
+  // `import_module` — the `js` contract's dynamic `import(spec)` (the
+  // `js` contract package). `import()` is syntax, not a member call,
+  // so `call`/`invoke`/`construct` cannot reach it — this shim is the
+  // `.hnl`-reachable named import of the `js` contract package. The
+  // namespace promise goes through `__promiseBox` exactly like
+  // `call`/`invoke` results: `js.await` is the only settle point and
+  // an unawaited rejection stays observed data, never a host fatal.
+  // A host-provided `globalThis.js.import_module` wins, matching the
+  // other contract shims.
+  import_module: (spec) => {{
+    const host = globalThis.js;
+    if (host && typeof host.import_module === "function") {{
+      return __handl_rt.__promiseBox(host.import_module(spec));
+    }}
+    return __handl_rt.__promiseBox(import(spec));
+  }},
   // Bound-arrow record application input (`{{__term__, __bound__}}`,
   // ADR-0120 Phase 1): `bound ++ call-args` — a lone call arg stays a
   // singleton, a tuple spreads; a non-array `bound` packs as one element

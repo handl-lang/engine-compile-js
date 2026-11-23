@@ -716,6 +716,28 @@ fn module_js_get_set_bind_to_shims() {
 }
 
 #[test]
+fn module_js_import_module_binds_to_shim() {
+    // `import_module` is the `js` contract's dynamic `import(spec)` op —
+    // `import()` is syntax, not a member call, so `call`/`invoke` cannot
+    // reach it. The import binds `__handl_rt.import_module`, the prelude
+    // member that emits a real `import(spec)` promise-boxed for
+    // `js.await` (the `.hnl`-reachable spelling `lib-js`'s worker shim
+    // uses for `worker_threads` instead of `eval`).
+    let js = compile_to_string(
+        &module_input(
+            "from \"js\" import { import_module as js_import_module, await as js_await }\nexport run := (spec) ~> js_await(js_import_module(spec))\n",
+        ),
+        &JsConfig::esm_deno(),
+    )
+    .unwrap();
+    assert!(js.contains("__handl_rt.import_module("), "{js}");
+    // The prelude shim ships `import(spec)` wrapped in `__promiseBox`.
+    assert!(js.contains("__promiseBox(import(spec))"), "{js}");
+    // No ES import is emitted for the `js` contract package.
+    assert!(!js.contains("from \"js\""), "{js}");
+}
+
+#[test]
 fn module_js_zero_arg_shim_value_position_calls() {
     // I-001: `e := js_error()` in value position must *invoke* the shim —
     // a bare `__handl_rt.error` member reads as the function object, so

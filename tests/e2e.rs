@@ -529,6 +529,42 @@ read := js_get(el, "value")
 }
 
 #[test]
+fn e2e_js_import_module_dynamic_import() {
+    require_node!();
+    // `js.import_module` — the contract's dynamic `import(spec)` op:
+    // `js.import_module("node:worker_threads")` returns the
+    // promise-boxed namespace promise and `js.await` settles it into
+    // the `ok` Result whose `value` is the module namespace — read
+    // `Worker` off it with `js.get`. A bogus specifier settles `err`,
+    // proving rejections travel the `js.await` channel instead of
+    // throwing (the `eval("import(…)")` spelling this replaces could
+    // not distinguish the two).
+    let run = run_program(
+        "js-import-module",
+        r#"
+from "js" import { import_module as js_import_module, await as js_await, get as js_get }
+
+p := js_import_module("node:worker_threads")
+r := js_await(p)
+kind := js_get(r, "__tag__")
+ns := js_get(r, "value")
+w := js_get(ns, "Worker")
+wname := js_get(w, "name")
+bad := js_import_module("handl-definitely-missing-spec-xyz")
+rb := js_await(bad)
+bkind := js_get(rb, "__tag__")
+{ kind: kind, wname: wname, has_worker: w != null, bad_kind: bkind }
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(
+        run.stdout.trim(),
+        r#"{"kind":"ok","wname":"Worker","has_worker":true,"bad_kind":"err"}"#
+    );
+}
+
+#[test]
 fn e2e_term_level_arithmetic_through_public_api() {
     require_node!();
     // The single-term path (synthetic `CompilerInput`, no real
