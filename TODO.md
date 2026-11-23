@@ -1,6 +1,5 @@
 # TODO — compile-js
 
-- [ ] T-006 P5: effect semantics parity — handle/rewrite/path/equiv stubs; ADR first: port eval semantics vs honest hard-error subset · status:in-progress · pri:high · owner:devin · created:2026-11-23 · epic:compile-js-prod
 - [ ] T-007 GAP: upstream handl-kit-arrow-lower divergences — >>> Seq-vs-compose (comp(5)=10 vs eval 12), {x} field-pun unsupported; fix in host repo or canonical AST normalization · owner:devin · created:2026-11-23 · epic:compile-js-prod
 - [ ] T-008 GAP: effect parity remainder — acc clause, multi-shot resume, carried-handler reinstall, serialized-Term impls (P5b leftovers; verify acc reachability first) · owner:devin · created:2026-11-23 · epic:compile-js-prod
 - [ ] T-009 GAP: 'export data …' surface form — parser/module\_prep produces 'export \<var data>' residue; needs upstream parse fix then emit support · owner:devin · created:2026-11-23 · epic:compile-js-prod
