@@ -349,7 +349,74 @@ fn host_member_receiver(recv: &Term) -> Option<String> {
     }
 }
 
+/// `io.perform(op, arg)` — eval's `is_perform_callee` intercepts the
+/// qualified callee at the host-function seam, so the qualified
+/// spelling gets the same `__handl_rt.perform` emit as the flat
+/// `perform` op (in-flight dispatch + residual `IO` mint). The
+/// arrow-lowered surface form is an `App` chain whose innermost callee
+/// is `field_access(<io>, "perform")`; `<io>` resolves to the io
+/// module namespace when it is an unbound `io` var (eval's
+/// module-name split reaches `io.perform` through `ModuleLookup` the
+/// same way) or a name bound to the `__handl_rt.io` member path
+/// (`import io` / `from "io" import * as io`).
+fn is_io_receiver(recv: &Term) -> bool {
+    let Term::Op { name, args, .. } = recv else {
+        return false;
+    };
+    if !args.is_empty() {
+        return false;
+    }
+    match super::module_bound(name) {
+        Some(super::BoundRef::Member(path)) => path == "__handl_rt.io",
+        Some(_) => false,
+        None => name == "io",
+    }
+}
+
+/// Whether `callee` is the `io.perform` member access —
+/// `field_access(<io>, "perform")` per [`is_io_receiver`].
+fn perform_member_callee(callee: &Term) -> bool {
+    let Term::Op {
+        name, args, lit, ..
+    } = callee
+    else {
+        return false;
+    };
+    name == "field_access"
+        && args.len() == 1
+        && lit.as_ref().and_then(Value::as_str) == Some("perform")
+        && is_io_receiver(&args[0])
+}
+
+/// Peel a left-nested `App` chain over an `io.perform` callee into the
+/// concatenated argument list (innermost args first — the same order
+/// [`flatten_host_member_app`] produces). `Some` only when the
+/// innermost callee is [`perform_member_callee`].
+fn flatten_perform_app<'t>(callee: &'t Term, args: &'t [Term]) -> Option<Vec<&'t Term>> {
+    match callee {
+        Term::App {
+            callee: inner,
+            args: inner_args,
+        } => {
+            let mut all = flatten_perform_app(inner, inner_args)?;
+            all.extend(args.iter());
+            Some(all)
+        }
+        _ => perform_member_callee(callee).then(|| args.iter().collect()),
+    }
+}
+
 fn lower_app_applied(callee: &Term, args: &[Term], input: &JsAst) -> Result<JsAst, CompileError> {
+    // `io.perform(op, arg)` — the qualified PerformFn spelling. Route
+    // to `__handl_rt.perform` with the flat spelling's op-name operand
+    // rule (a bare `puts` arg is the name string, not an `__opRef`
+    // dispatch object). Awaited like every other async-arrow call.
+    if let Some(all) = flatten_perform_app(callee, args) {
+        let terms: Vec<Term> = all.iter().map(|t| (*t).clone()).collect();
+        return Ok(JsAst::Await(Box::new(
+            super::primitive::lower_perform_call(&terms, input)?,
+        )));
+    }
     // Flatten `App(App(f, a), b)` chains whose innermost callee is a
     // `field_access` over a host `Member` namespace: eval applies a
     // host function to the whole argument tuple, so `math.bit_or(a, b)`

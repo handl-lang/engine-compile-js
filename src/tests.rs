@@ -1478,53 +1478,60 @@ fn unknown_op_with_args_lowers_to_dispatch() {
 }
 
 #[test]
-fn perform_lowers_to_compile_error() {
-    // `perform`/`io.perform` are denylisted op spellings (P5a): eval's
-    // `perform_dispatch` intercepts them for the resume-journal
-    // machinery the JS subset does not carry (the `acc` accumulator
-    // itself *is* supported — see `handle_acc_lowering_emits_seed_thunk`
-    // — but `perform` also drives multi-shot `resume`), so both the
-    // flat and qualified
-    // spellings — native *and* foreign — fail at compile time. The
-    // runtime `__handl_rt.perform` member remains for host/driver JS.
-    for term in [
-        Term::op_native(
-            "perform",
-            vec![
-                Term::const_value(Value::String("Foo".to_string())),
-                Term::const_value(Value::Number(Number::from(1))),
-            ],
+fn perform_lowers_to_runtime_perform_call() {
+    // `perform`/`io.perform` are supported spellings (the io module's
+    // `PerformFn` builtin): they emit `__handl_rt.perform(op, arg)` —
+    // in-flight handler dispatch plus the residual `type.io` former
+    // mint — for the flat native op, the qualified native name, and
+    // the foreign `io` spelling. The bare op-name operand lowers to
+    // its name string (eval's unbound-var rule), not `__opRef`.
+    for (term, expect) in [
+        (
+            Term::op_native(
+                "perform",
+                vec![
+                    Term::op_native("Foo", vec![]),
+                    Term::const_value(Value::Number(Number::from(1))),
+                ],
+            ),
+            r#"__handl_rt.perform("Foo", 1)"#,
         ),
-        Term::op_native("io.perform", vec![]),
-        Term::Op {
-            dim: Term::default_dim(),
-            name: "perform".to_string(),
-            args: vec![Term::const_value(Value::String("Foo".to_string()))],
-            source: ArrSource::Foreign("io".to_string()),
-            lit: None,
-            attrs: None,
-        },
+        (
+            Term::op_native(
+                "perform",
+                vec![
+                    Term::const_value(Value::String("Foo".to_string())),
+                    Term::const_value(Value::Number(Number::from(1))),
+                ],
+            ),
+            r#"__handl_rt.perform("Foo", 1)"#,
+        ),
+        (Term::op_native("io.perform", vec![]), "__handl_rt.perform"),
+        (
+            Term::Op {
+                dim: Term::default_dim(),
+                name: "perform".to_string(),
+                args: vec![Term::const_value(Value::String("Foo".to_string()))],
+                source: ArrSource::Foreign("io".to_string()),
+                lit: None,
+                attrs: None,
+            },
+            r#"__handl_rt.perform("Foo")"#,
+        ),
     ] {
-        let result = compile_to_string(&input(term), &JsConfig::esm_deno());
-        assert!(result.is_err(), "perform spelling compiled: {result:?}");
+        let js = compile_to_string(&input(term), &JsConfig::esm_deno())
+            .unwrap_or_else(|e| panic!("perform spelling failed to compile: {e}"));
+        assert!(js.contains(expect), "expected `{expect}` in:\n{js}");
     }
 }
 
 #[test]
 fn denylisted_op_spellings_fail_to_compile() {
-    // `handle`/`handle_dyn`/`rewrite`/`path`/`equiv`/`perform`/
-    // `io.perform` must never reach `__handl_rt.<name>` or `__opRef` —
-    // both the applied and the bare 0-arg reference forms are compile
-    // errors.
-    for name in [
-        "handle",
-        "handle_dyn",
-        "rewrite",
-        "path",
-        "equiv",
-        "perform",
-        "io.perform",
-    ] {
+    // `handle`/`handle_dyn`/`rewrite`/`path`/`equiv` must never reach
+    // `__handl_rt.<name>` or `__opRef` — both the applied and the bare
+    // 0-arg reference forms are compile errors. (`perform`/`io.perform`
+    // are *not* denied — see `perform_lowers_to_runtime_perform_call`.)
+    for name in ["handle", "handle_dyn", "rewrite", "path", "equiv"] {
         for args in [
             vec![],
             vec![Term::const_value(Value::Number(Number::from(1)))],

@@ -377,18 +377,26 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
   // perform builtin (`native_ops::perform_dispatch`): a covered op
   // applies its handler impl to `arg`; an uncovered op mints the
   // residual `IO` former (`__former__`/`indices` wire) that an
-  // enclosing `handle`'s `__interpretIO` pass interprets. The `perform`
-  // / `io.perform` *op spellings* are compile-denied (P5a) — compiled
-  // code cannot reach this member — but it stays as the runtime half
-  // for host/driver JS and the follow-up that lands `perform`/`IO`.
-  // `op` arrives as a string or a `__sym__` name record.
-  perform: async (op, arg) => {{
+  // enclosing `handle`'s `__interpretIO` pass interprets. The
+  // `perform`/`io.perform` *op spellings* lower to this member
+  // (`__handl_rt.perform`) — compiled code reaches it for the flat,
+  // qualified, and `from "io" import perform` forms. `op` arrives as a
+  // string or a `__sym__` name record; arity/op-shape failures report
+  // `PerformFn`'s eval diagnostics.
+  perform: async (op, arg, ...rest) => {{
+    if (rest.length > 0) {{
+      throw new Error("perform: expected 1–2 arguments (op, arg?), got " +
+        (rest.length + 2));
+    }}
+    if (op === undefined && arg === undefined) {{
+      throw new Error("perform: expected 1–2 arguments (op, arg?), got 0");
+    }}
     const name = (typeof op === "string") ? op
       : ((op !== null && typeof op === "object" && op.__sym__ !== null
           && typeof op.__sym__ === "object" && typeof op.__sym__.name === "string")
         ? op.__sym__.name : null);
     if (name === null) {{
-      throw new Error("perform: op operand must be a string or sym");
+      throw new Error("perform: op must be an op name (a bare identifier or string) or a sym value");
     }}
     const impl = __handl_rt.__handlerImplFor(name, null);
     if (impl !== undefined) {{
@@ -402,8 +410,15 @@ pub fn runtime_prelude(_format: &dyn JsOutputFormat) -> String {
       indices: [Object.assign({{}}, {{ [name]: (arg === undefined ? null : arg) }})],
     }};
   }},
-  // Qualified spelling (`io.perform`) resolves to the same builtin.
+  // Qualified spelling (`io.perform`) resolves to the same builtin —
+  // kept as a flat member for `__handl_rt["io.perform"]` paths.
   "io.perform": (op, arg) => __handl_rt.perform(op, arg),
+  // The `io` module namespace — namespace imports of `io` bind
+  // `__handl_rt.io`, and a bare `io.perform` *value* reference (not
+  // the `App` call the lowerer intercepts) resolves here. `perform`
+  // delegates to the flat member: in-flight dispatch + residual mint,
+  // `PerformFn` semantics.
+  io: {{ perform: (op, arg) => __handl_rt.perform(op, arg) }},
   // --- arrow-lower op shims -------------------------------------------
   // Names match the op spellings the lowerer emits verbatim.
   truthy: (v) => !!v,

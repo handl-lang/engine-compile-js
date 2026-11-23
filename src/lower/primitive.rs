@@ -891,6 +891,17 @@ fn lower_bound_op_body(
                 }
             }
         }
+        // `from "io" import perform [as p]` binds the
+        // `__handl_rt.io.perform` member path (`module.rs`'s host-module
+        // import arm). A *call* routes to `__handl_rt.perform` so the
+        // op-name operand keeps the bare-identifier → name-string rule
+        // (a spread `__handl_rt.io.perform(…)` call would feed
+        // `__opRef("puts")` — eval's "unsupported op" throw — instead of
+        // `"puts"`); a bare reference stays the member path, which the
+        // prelude's `io` namespace resolves.
+        BoundRef::Member(path) if path == "__handl_rt.io.perform" && !args.is_empty() => {
+            return lower_perform_call(args, param);
+        }
         // `Member` is a host member path (comma/spread args), `Ns` a dep
         // module's namespace record — both are plain values; a direct
         // `Op`-spelled call applies the member spread convention.
@@ -978,6 +989,86 @@ fn lower_bound_arrow_record(
         }),
         args: Vec::new(),
     }))))
+}
+
+/// `perform(op, arg)` / `io.perform(op, arg)` — the `io` module's
+/// `PerformFn` builtin. Eval intercepts the callee name at the
+/// host-function seam (`native_ops::is_perform_callee` →
+/// `perform_dispatch`): a covered op applies its handler impl
+/// in-flight (with `acc` threading), an uncovered op falls through to
+/// `PerformFn`'s residual `IO<{op: arg}>` former that an enclosing
+/// `handle`'s `__interpretIO` interprets. `__handl_rt.perform` is the
+/// runtime mirror of exactly that pair, so the emit is a plain member
+/// call — *not* `__handl_rt.dispatch` (a handler covering the literal
+/// op name `"perform"` is not consulted on this path in eval either).
+///
+/// A bare `Op{perform, []}` is the PerformFn *value*: value position
+/// emits the `__handl_rt.perform` member, scheme position applies it
+/// to the incoming like any 0-arg op referent.
+fn lower_perform_body(args: &[Term], param: &JsAst, scheme: bool) -> Result<JsAst, CompileError> {
+    if args.is_empty() {
+        let member = JsAst::Member {
+            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+            prop: "perform".to_string(),
+        };
+        if !scheme {
+            return Ok(member);
+        }
+        return Ok(JsAst::Await(Box::new(JsAst::Call {
+            callee: Box::new(JsAst::Member {
+                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+                prop: "__appOrValue".to_string(),
+            }),
+            args: vec![member, param.clone()],
+        })));
+    }
+    lower_perform_call(args, param)
+}
+
+/// `__handl_rt.perform(<args>)` for a non-empty argument list — shared
+/// by the `Op` arm above, the `Term::App` `io.perform` qualified-callee
+/// path in `control.rs`, and `BoundRef::Member("__handl_rt.io.perform")`
+/// (`from "io" import perform`). The call itself is not awaited: every
+/// emitted arrow is async, so the returned promise flattens at the
+/// enclosing `await` exactly like `dispatch` calls do.
+pub(crate) fn lower_perform_call(args: &[Term], param: &JsAst) -> Result<JsAst, CompileError> {
+    let mut lowered: Vec<JsAst> = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+        // `perform` takes 1–2 arguments (op, arg?); extras pass through
+        // so the runtime reports eval's arity error rather than the
+        // lowerer silently dropping them.
+        lowered.push(if i == 0 {
+            perform_op_operand(a, param)?
+        } else {
+            lower_sub(a, param)?
+        });
+    }
+    Ok(JsAst::Call {
+        callee: Box::new(JsAst::Member {
+            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+            prop: "perform".to_string(),
+        }),
+        args: lowered,
+    })
+}
+
+/// The `perform` op-name operand. Eval's unbound-var rule hands the
+/// bare identifier's *name* to `PerformFn` (`perform(puts, …)` arrives
+/// as `"puts"` — `io.rs`'s documented operand spellings), so a bare
+/// `Op{name, []}` that resolves to no module binding and no builtin op
+/// lowers to that name string. Anything else — a string/`"puts"`
+/// literal, a `sym(…)` value, a module-bound name, a computed term —
+/// lowers normally and the runtime validates the string/`__sym__`
+/// shape (`perform: op must be an op name … or a sym value`).
+fn perform_op_operand(term: &Term, param: &JsAst) -> Result<JsAst, CompileError> {
+    if let Term::Op { name, args, .. } = term
+        && args.is_empty()
+        && module_bound(name).is_none()
+        && !BUILTIN_OPS.contains(&name.as_str())
+    {
+        return Ok(JsAst::Str(name.clone()));
+    }
+    lower_sub(term, param)
 }
 
 /// `await` — the `js.await` op. Takes exactly one argument (the promise)

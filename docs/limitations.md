@@ -30,11 +30,16 @@ or a documented subset.
   handler values are JS arrow functions / records only, so a
   `__term__`-style payload fails the "not an arrow value" check
   rather than silently mis-running.
-- **`perform`/`io.perform` op spellings are compile-denied.** Eval's
-  `perform_dispatch` needs the resume journal this subset does not
-  carry (`src/lower/primitive.rs:702-712`). The runtime `perform`
-  member remains for host/driver JS and the `IO(sig)` former
-  post-pass inside `handle`.
+- **`perform`/`io.perform` cover the one-shot subset.** The flat,
+  qualified (`io.perform(…)`), foreign (`op_foreign("perform")` /
+  `Foreign("io")`), and `from "io" import perform` spellings all emit
+  `__handl_rt.perform(op, arg)` — eval's `perform_dispatch` +
+  `PerformFn` residual `IO` mint, including `acc` state threading
+  (`src/lower/primitive.rs`, `src/lower/control.rs`,
+  `tests/e2e.rs::e2e_perform_*`). What stays out: multi-shot `resume`
+  (the ≥2-ary throw above), journal replay, and `perform(sym(…))` —
+  the `sym` op itself is not in the prelude, so that operand spelling
+  fails at runtime as `unsupported op: sym` like any other unknown op.
 - **Compound `dim` terms lower to `null`.** A `dim` the lowerer
   cannot resolve to a literal label arrives as the unnamed dimension
   — every handler is eligible (`src/runtime/prelude.rs:61-69`).

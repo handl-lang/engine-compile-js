@@ -1281,12 +1281,14 @@ nested := handle { a: handle (arr Foo)(1) with { Foo: (x) ~> x + 10 }, b: (arr F
 #[test]
 fn e2e_handle_interpret_io_former_and_runtime_perform() {
     require_node!();
-    // The `perform`/`io.perform` op spellings are compile-denied, but
-    // the runtime halves remain for host/driver JS: `handle`'s
-    // `__interpretIO` post-pass interprets a `type.io` former record —
-    // covered sig fields dispatch through the still-installed handler,
-    // uncovered entries stay data — and `__handl_rt.perform` does the
-    // in-flight dispatch / residual-former mint when called directly.
+    // The runtime halves of `perform` remain available to host/driver
+    // JS directly: `handle`'s `__interpretIO` post-pass interprets a
+    // `type.io` former record — covered sig fields dispatch through
+    // the still-installed handler, uncovered entries stay data — and
+    // `__handl_rt.perform` does the in-flight dispatch / residual-
+    // former mint when called directly (the compiled `perform`/
+    // `io.perform` spellings emit exactly this member — see
+    // `e2e_perform_spellings`).
     let run = run_program(
         "handle-io",
         "x := 1\n",
@@ -1481,21 +1483,127 @@ bad := handle (arr Bar)(1) with { Foo: (x) ~> x + 1 }
 }
 
 #[test]
+fn e2e_perform_spellings_in_flight_dispatch_and_residual_io() {
+    require_node!();
+    // `perform(op, arg)` / `io.perform(op, arg)` — eval's `PerformFn`
+    // builtin (`is_perform_callee` → `perform_dispatch`): a covered op
+    // applies its handler impl *in-flight* (the impl's return IS the
+    // `perform` result — no `IO` wrapper); an uncovered op mints the
+    // residual `type.io` former that `handle`'s `__interpretIO`
+    // post-pass interprets (covered sig fields dispatch, uncovered
+    // entries stay data). The bare op-name operand is the name string
+    // (eval's unbound-var rule), the `"name"` spelling is explicit.
+    let run = run_program(
+        "perform-spellings",
+        r#"
+covered := handle do { s := perform(get, "x"); s + "!" } with { get: u ~> "got" }
+uncovered := handle do { s := perform(other, "x"); s } with { get: u ~> "got" }
+bare := perform(puts, "hi")
+str := perform("puts", "hi")
+qualified := io.perform(puts, "hi")
+{ covered: covered, uncovered: uncovered, bare: bare, str: str, qualified: qualified }
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    let out = run.stdout.trim();
+    // Covered `perform(get, "x")` resumes with the impl result →
+    // "got!". Uncovered `perform(other, "x")` stays a residual `IO`
+    // former (`other` is not covered by `{ get: … }`). The three mint
+    // spellings produce identical `{puts: "hi"}` formers.
+    assert!(out.contains(r#""covered":"got!""#), "{out}");
+    assert!(out.contains(r#""uncovered":{"__former__":{"__sym__":{"name":"type.io","handle":0}},"indices":[{"other":"x"}]}"#), "{out}");
+    for key in ["bare", "str", "qualified"] {
+        assert!(
+            out.contains(&format!(
+                r#""{key}":{{"__former__":{{"__sym__":{{"name":"type.io","handle":0}}}},"indices":[{{"puts":"hi"}}]}}"#
+            )),
+            "{key} former missing in:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn e2e_perform_acc_state_threading() {
+    require_node!();
+    // `perform` under `acc`: the same `(payload, s) ~> (result, s')`
+    // convention the `arr <op>` e2e exercises, now through the
+    // `perform`/`io.perform` spellings — `perform_dispatch`'s covered
+    // path is `dispatch_covered_op`, which threads the covering
+    // frame's `__acc__` slot exactly like `Op` dispatch.
+    //
+    // Surface `handle … with … acc s0` is still declined upstream, so
+    // the seed is injected into the lowered `Term::Handle` directly —
+    // the same `Term::handle_acc` construction
+    // `e2e_handle_acc_state_threading` uses.
+    let term = lower_expr_term(
+        r#"handle do {
+            s := perform(Get, 0)
+            perform(Put, s + 1)
+            s + 1
+        } with { Get: (u, s) ~> [s, s], Put: (v, s) ~> [0, v] }"#,
+    );
+    let Term::Handle {
+        body,
+        target,
+        impl_,
+        ..
+    } = term
+    else {
+        panic!("expected Term::Handle, got {term:?}")
+    };
+    let term = Term::Handle {
+        body,
+        target,
+        impl_,
+        acc: Some(Box::new(Term::constant(Value::from(0)))),
+    };
+    let js = compile_to_string(&term_input(term), &esm_node()).expect("compile acc perform handle");
+    let run = run_node(
+        "perform-acc",
+        &[
+            ("prog.mjs", js.as_str()),
+            (
+                "driver.mjs",
+                "import f from \"./prog.mjs\";\nconsole.log(JSON.stringify(await f(null)));\n",
+            ),
+        ],
+        "driver.mjs",
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    // (result, final_state) = (1, 1) — identical to the `arr <op>` acc
+    // expectation: `perform(Get, 0)` → (0, 0) writes s'=0; `perform(Put,
+    // 1)` → (0, 1) writes s'=1; the body result is s+1 = 1.
+    assert_eq!(run.stdout.trim(), r#"{"__pair__":[1,1]}"#);
+}
+
+#[test]
+fn e2e_perform_from_io_import() {
+    require_node!();
+    // `from "io" import perform` binds the `__handl_rt.io.perform`
+    // member path; calls route to `__handl_rt.perform` so the op-name
+    // operand keeps the bare-identifier → name-string rule.
+    let run = run_program(
+        "perform-import",
+        r#"
+from "io" import perform
+covered := handle perform(puts, "hi") with { puts: s ~> "handled:" + s }
+{ covered: covered }
+"#,
+        print_default(),
+    );
+    assert!(run.succeeded(), "node failed:\n{}", run.stderr);
+    assert_eq!(run.stdout.trim(), r#"{"covered":"handled:hi"}"#);
+}
+
+#[test]
 fn e2e_denylisted_effect_op_spellings_fail_to_compile() {
-    // P5a: `handle`/`handle_dyn`/`rewrite`/`path`/`equiv`/`perform`/
-    // `io.perform` op spellings are compile errors — they must never
-    // reach `__handl_rt.<name>` or `__opRef` (the old stubs fabricated
-    // results, and `perform` needs resume-journal machinery the subset
-    // does not carry).
-    for name in [
-        "handle",
-        "handle_dyn",
-        "rewrite",
-        "path",
-        "equiv",
-        "perform",
-        "io.perform",
-    ] {
+    // P5a: `handle`/`handle_dyn`/`rewrite`/`path`/`equiv` op spellings
+    // are compile errors — they must never reach `__handl_rt.<name>`
+    // or `__opRef` (the old stubs fabricated results). `perform`/
+    // `io.perform` are *not* denied — they lower to
+    // `__handl_rt.perform` (see `e2e_perform_spellings`).
+    for name in ["handle", "handle_dyn", "rewrite", "path", "equiv"] {
         for args in [
             vec![],
             vec![Term::const_value(Value::Number(serde_json::Number::from(
