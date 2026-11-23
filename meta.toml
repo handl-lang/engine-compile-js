@@ -3,6 +3,6 @@ name = "compile-js"
 [next]
 t = 7
 i = 1
-p = 1
+p = 2
 adr = 1
 pl = 1
