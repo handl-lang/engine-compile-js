@@ -135,12 +135,17 @@ The compiler never silently miscompiles:
    formats (`src/module.rs::emit_module_surface` — ESM named exports,
    CJS `require()` + namespace-object `module.exports`, IIFE/inline
    completion-value namespaces), `export data` family/ctor exports,
-   import aliases, and the `acc` accumulator path of `handle`.
+   import aliases, the `acc` accumulator path of `handle`, and the
+   `perform`/`io.perform` spellings — flat, qualified, and `from "io"
+   import perform` forms all emit `__handl_rt.perform`, whose covered
+   ops dispatch in-flight (including `acc` state threading) and whose
+   uncovered ops mint the residual `type.io` former that `handle`'s
+   `__interpretIO` interprets.
 2. **Unsupported at compile time** → `CompileError`. `Term::Rewrite`
    is rejected outright (`src/lower/proof.rs` — eval returns
-   `NotImplemented` for it too); the `path`/`equiv`/`handle_dyn`/
-   `perform`/`io.perform` op *spellings* and `Term::Opaque` are denied
-   in the lowerer (`src/lower/primitive.rs:696-712`,
+   `NotImplemented` for it too); the `path`/`equiv`/`handle_dyn`
+   op *spellings* and `Term::Opaque` are denied
+   in the lowerer (`src/lower/primitive.rs:700-711`,
    `src/lower/mod.rs:421,437`); `worker_entry` rejects `commonjs` and
    unresolvable surviving imports (`src/compiler.rs:37-44, 142-164`),
    and `iife`/`inline` reject *any* surviving ES `import`

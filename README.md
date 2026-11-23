@@ -41,13 +41,14 @@ fails loudly at compile time or runtime rather than miscompiling.
 | Foreign ops: inline `globalThis[m][n](…)` or `jsCall` dispatch; handler interception via `dispatchForeign` | e2e + unit | `src/lower/primitive.rs`, `src/security.rs` |
 | `handle`/`perform` effect subset: op dispatch, grades/`dim`, carried-handler reinstall, `return` clause, `IO(sig)` former interpretation | e2e | `src/runtime/prelude.rs` §4 of runtime-model doc |
 | `handle … acc` accumulators (`Term::Handle{acc}`: `(payload, s) ~> (result, s')` threading, pair result, carried restart) | e2e | `src/lower/higher.rs`, `src/runtime/prelude.rs` |
+| `perform`/`io.perform` spellings (flat, qualified, `from "io" import perform`, foreign `io`) → `__handl_rt.perform`: covered ops dispatch in-flight incl. `acc` state threading; uncovered ops mint the residual `type.io` former `handle`'s `__interpretIO` interprets (`perform(sym(…))` throws `unsupported op: sym` — `sym` is not in the prelude) | e2e | `src/lower/primitive.rs::lower_perform_call`, `src/lower/control.rs`, `src/runtime/prelude.rs` §4; `tests/e2e.rs::e2e_perform_*` |
 | `worker_entry` bundles: `esm` module workers, `iife`/`inline` classic workers, `js.on("self","message")` round-trip + `postMessage` transfer lists | e2e (node `worker_threads` **and** real Chromium via Playwright) | `src/compiler.rs`, `tests/e2e.rs`, `tests/browser_e2e.mjs` |
 | Source maps (`JsConfig::source_map`) | e2e | `src/emit/source_map.rs` |
 | `SecurityScanner` post-emit pass (`security_scan`, default on) | unit + e2e | `src/security.rs`, `src/emit/mod.rs` |
 | `OpLowering::{Mixed, Prelude}`, `dispatch_all_ops`, `loop_max_iterations`, `no_inline_foreign`, `unsafe_inline_foreign` | e2e + unit | `src/config.rs`, `src/lower/*` |
 | Fuzz/property parity vs eval (seeded arithmetic/record pipelines) | e2e | `tests/e2e.rs::e2e_fuzz_*` |
 | `Term::Rewrite` (`~>`) | compile error | `src/lower/proof.rs` |
-| `path`/`equiv`/`handle_dyn`/`perform`/`io.perform` op spellings, `Term::Opaque` | compile error | `src/lower/primitive.rs`, `src/lower/mod.rs` |
+| `path`/`equiv`/`handle_dyn` op spellings, `Term::Opaque` | compile error | `src/lower/primitive.rs`, `src/lower/mod.rs` |
 | Multi-shot `resume` (≥2-ary impls), serialized-`Term` impls | runtime throw | `src/runtime/prelude.rs::__applyHandler` |
 | `assert` / `runtime_assert` (AST-level, never reach `Term`) | runtime throw (eval parity) | `src/runtime/prelude.rs` |
 | Surface `handle … with h acc s0` syntax | declined upstream (arrow-lower) | see `docs/limitations.md` |
