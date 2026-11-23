@@ -11,3 +11,4 @@
 - T-010 GAP: data decls nested in expression position (inside do {}) — splice\_decl\_blocks flattening works but not e2e-covered; add fixture · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
 - T-013 GAP: hardening — SecurityScanner hostile-input corpus expansion, source-map e2e assertion, fuzz/property fixtures for emitted JS · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
 - T-017 EVAL: strategy experiments per P-002 — bench harness, metrics vs eval baseline, docs/strategy-evaluation.md, defaults from data · pri:high · owner:devin · created:2026-11-23 · links:P-002 · epic:compile-js-prod · done:2026-11-23
+- T-018 GAP: import.alias unsupported — 'from "js" import { on as js\_on }' fails with lower: unsupported node kind 'import.alias'; add alias handling in module lowering · pri:high · owner:devin · created:2026-11-23 · epic:compile-js-prod · done:2026-11-23
