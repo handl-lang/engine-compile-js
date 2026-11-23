@@ -1,7 +1,7 @@
 name = "compile-js"
 
 [next]
-t = 20
+t = 24
 i = 1
 p = 3
 adr = 1
