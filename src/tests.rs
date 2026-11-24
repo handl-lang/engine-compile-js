@@ -957,7 +957,7 @@ fn module_unsupported_data_shape_errors() {
     // `C(Bad ~> Nat)` is not a supported constructor shape (the family
     // occurs in a function domain); the compile rejects it.
     compile_to_string(
-        &module_input("data Bad :: C(Bad ~> Nat)\n"),
+        &module_input("data Bad := C(Bad ~> Nat)\n"),
         &JsConfig::esm_deno(),
     )
     .unwrap_err();
@@ -966,7 +966,7 @@ fn module_unsupported_data_shape_errors() {
     // family plus each constructor name (`module_prep` parity; `F.rec`
     // is dotted and stays off the export surface).
     let js = compile_to_string(
-        &module_input("export data Nat :: Zero | Succ(Nat)\n"),
+        &module_input("export data Nat := Zero | Succ(Nat)\n"),
         &JsConfig::esm_deno(),
     )
     .expect("export data compiles");

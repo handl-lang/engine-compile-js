@@ -264,7 +264,7 @@ fn scanner_documented_gaps_pass_currently() {
     assert!(s.scan("import(x)").is_ok());
     // Prototype-pollution spellings are not scanned at all.
     assert!(s.scan("o.__proto__ = x").is_ok());
-    assert!(s.scan("o.constructor.prototype.x = 1").is_ok());
+    assert!(s.scan("o.constructor.prototype.x := 1").is_ok());
 }
 
 #[test]
