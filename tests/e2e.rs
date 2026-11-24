@@ -773,7 +773,7 @@ fn e2e_signature_export_emits_valid_esm() {
         "sig-export",
         r#"
 export f: Nat ~> Nat
-export g : (x : Nat) ~> Nat = n ~> n
+export g : (x : Nat) ~> Nat := n ~> n
 g(21)
 "#,
         print_default(),
@@ -812,8 +812,8 @@ fn e2e_data_decl_constructors_and_match() {
         "data-match",
         r#"
 Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }
-to_num : Nat ~> Number = n ~> match n { Zero: 0, Succ(p): 1 + to_num(p) }
-two : Nat = Succ(Succ(Zero))
+to_num : Nat ~> Number := n ~> match n { Zero: 0, Succ(p): 1 + to_num(p) }
+two : Nat := Succ(Succ(Zero))
 to_num(two)
 "#,
         print_default(),
@@ -833,7 +833,7 @@ fn e2e_data_decl_parameterized_family() {
         "data-param",
         r#"
 Opt<a : Type> := { None : Opt, Some : (x : a) ~> Opt }
-get_or : Opt ~> Number ~> Number = o ~> d ~> match o { None: d, Some(x): x }
+get_or : Opt ~> Number ~> Number := o ~> d ~> match o { None: d, Some(x): x }
 { some: get_or(Some(41))(0), none: get_or(None)(7) }
 "#,
         print_default(),
@@ -885,7 +885,7 @@ fn e2e_export_data_family_and_ctors_importable() {
     let mut config = esm_node();
     config.modules = vec![JsModule {
         path: "/pkgs/nat/nat.hnl".to_string(),
-        source: "export data Nat :: Zero | Succ(pred)\n\
+        source: "export data Nat := Zero | Succ(pred)\n\
                  export to_num := n ~> match n { Zero: 0, Succ(p): 1 + to_num(p) }\n\
                  export one := Succ(Zero)\n"
             .to_string(),
