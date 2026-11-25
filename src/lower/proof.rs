@@ -15,11 +15,7 @@ use crate::JsAst;
 /// Lower a proof combinator to a top-level JS arrow.
 pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
     match term {
-        Term::Rewrite {
-            source,
-            target,
-            witness,
-        } => lower_rewrite(source, target, witness),
+        Term::Rewrite { witness, .. } => Err(rewrite_unsupported(witness)),
         _ => Err(CompileError::Lower(format!(
             "proof lowerer received non-proof term: {term:?}"
         ))),
@@ -27,34 +23,13 @@ pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
 }
 
 /// Lower a proof combinator applied to a concrete input expression.
-pub fn lower_applied(term: &Term, input: &JsAst) -> Result<JsAst, CompileError> {
+pub fn lower_applied(term: &Term, _input: &JsAst) -> Result<JsAst, CompileError> {
     match term {
-        Term::Rewrite {
-            source,
-            target,
-            witness,
-        } => lower_rewrite_applied(source, target, witness, input),
+        Term::Rewrite { witness, .. } => Err(rewrite_unsupported(witness)),
         _ => Err(CompileError::Lower(format!(
             "proof lowerer received non-proof term: {term:?}"
         ))),
     }
-}
-
-fn lower_rewrite(
-    _source: &Term,
-    _target: &Term,
-    witness: &RewriteWitness,
-) -> Result<JsAst, CompileError> {
-    Err(rewrite_unsupported(witness))
-}
-
-fn lower_rewrite_applied(
-    _source: &Term,
-    _target: &Term,
-    witness: &RewriteWitness,
-    _input: &JsAst,
-) -> Result<JsAst, CompileError> {
-    Err(rewrite_unsupported(witness))
 }
 
 /// `Term::Rewrite` has no eval semantics to port — every evaluator

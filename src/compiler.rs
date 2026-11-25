@@ -168,7 +168,7 @@ fn render_artifacts(
         emitter.emit_expr(&main)?
     };
     let wrapped = js_config.format.wrap(&main_body);
-    let mut full = if js_config.format.name() == "esm" || js_config.format.name() == "commonjs" {
+    let mut full = if matches!(format_name, "esm" | "commonjs") {
         let prelude = runtime_prelude(js_config.format.as_ref());
         format!("{}{}", prelude, wrapped)
     } else {

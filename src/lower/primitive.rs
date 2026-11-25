@@ -6,12 +6,10 @@ use serde_json::Value;
 
 use super::lower_applied as lower_sub;
 use super::{
-    BoundRef, JsAst, JsBinOp, JsUnaryOp, allow_inlining, dispatch_all_ops, lower_value,
-    module_bound, op_lowering, unsafe_inline_foreign,
+    BoundRef, JsAst, JsBinOp, JsUnaryOp, allow_inlining, arrow_fn, dispatch_all_ops, input_ident,
+    lower_value, module_bound, op_lowering, rt_call, rt_member, unsafe_inline_foreign,
 };
 use crate::config::OpLowering;
-
-const INPUT_NAME: &str = "__in";
 
 /// Lower one of the four primitive terms to a JS expression.
 pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
@@ -23,26 +21,16 @@ pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
             // is the constant arrow returning that function.
             if let Ok(inner) = serde_json::from_value::<Term>(value.clone()) {
                 let arrow = super::lower(&inner)?;
-                return Ok(JsAst::ArrowFn {
-                    params: vec![INPUT_NAME.to_string()],
-                    body: Box::new(arrow),
-                });
+                return Ok(arrow_fn(arrow));
             }
             let body = lower_value(value)?;
-            Ok(JsAst::ArrowFn {
-                params: vec![INPUT_NAME.to_string()],
-                body: Box::new(body),
-            })
+            Ok(arrow_fn(body))
         }
         Term::Const { value } => lower_value(value),
         Term::Seq { axis, fst, snd } => {
             check_sequential(axis, fst)?;
-            let param = JsAst::Ident(INPUT_NAME.to_string());
-            let body = lower_seq_body(fst, snd, &param)?;
-            Ok(JsAst::ArrowFn {
-                params: vec![INPUT_NAME.to_string()],
-                body: Box::new(body),
-            })
+            let body = lower_seq_body(fst, snd, &input_ident())?;
+            Ok(arrow_fn(body))
         }
         Term::Op {
             name,
@@ -104,12 +92,9 @@ fn dispatch_call(
     dim_label: Option<&str>,
     incoming: &JsAst,
 ) -> JsAst {
-    JsAst::Call {
-        callee: Box::new(JsAst::Member {
-            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-            prop: "dispatch".to_string(),
-        }),
-        args: vec![
+    rt_call(
+        "dispatch",
+        vec![
             JsAst::Str(name.to_string()),
             JsAst::Array(lowered_args),
             dim_label
@@ -117,7 +102,7 @@ fn dispatch_call(
                 .unwrap_or(JsAst::Null),
             incoming.clone(),
         ],
-    }
+    )
 }
 
 /// Op names the calculus/lowerer reserves — a module binding under one
@@ -194,7 +179,7 @@ const BUILTIN_OPS: &[&str] = &[
 ];
 
 /// Lower the application of a primitive term to an input value.
-pub fn lower_applied(term: &Term, _input: &JsAst) -> Result<JsAst, CompileError> {
+pub fn lower_applied(term: &Term, input: &JsAst) -> Result<JsAst, CompileError> {
     match term {
         Term::Arr { value, .. } => {
             // `arr(q)` applied to any input yields `q`; a `q` that is a
@@ -222,12 +207,12 @@ pub fn lower_applied(term: &Term, _input: &JsAst) -> Result<JsAst, CompileError>
             source.clone(),
             lit.as_ref(),
             dim_label(dim).as_deref(),
-            _input,
+            input,
             false,
         )?))),
         Term::Seq { axis, fst, snd } => {
             check_sequential(axis, fst)?;
-            lower_seq_body(fst, snd, _input)
+            lower_seq_body(fst, snd, input)
         }
         _ => Err(CompileError::Lower(format!(
             "primitive lowerer received non-primitive term: {term:?}"
@@ -333,16 +318,13 @@ fn lower_op(
     lit: Option<&Value>,
     dim_label: Option<&str>,
 ) -> Result<JsAst, CompileError> {
-    let param = JsAst::Ident(INPUT_NAME.to_string());
+    let param = input_ident();
     // `lower` produces the term's *arrow*: a bare `Op{name, []}` lazy
     // reference is a body scheme — it applies the named binding to the
     // incoming (`in ↦ s1(in)`), not a constant arrow returning the
     // reference.
     let body = lower_op_body(name, args, source, lit, dim_label, &param, true)?;
-    Ok(JsAst::ArrowFn {
-        params: vec![INPUT_NAME.to_string()],
-        body: Box::new(body),
-    })
+    Ok(arrow_fn(body))
 }
 
 /// The body of an `Op` arrow evaluated against the incoming value
@@ -444,13 +426,7 @@ fn lower_op_body(
     let applied_args = |args: &[Term]| -> Result<Vec<JsAst>, CompileError> {
         args.iter().map(|a| lower_sub(a, param)).collect()
     };
-    let rt = |name: &str, args: Vec<JsAst>| JsAst::Call {
-        callee: Box::new(JsAst::Member {
-            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-            prop: name.to_string(),
-        }),
-        args,
-    };
+    let rt = rt_call;
     // `JsConfig::op_lowering`: `Prelude` routes the scalar operator
     // family through `__handl_rt.<name>` member calls (the uniform
     // prelude-call strategy) instead of raw JS operators; `Mixed`
@@ -665,13 +641,7 @@ fn lower_op_body(
             }
             let left = lower_sub(&args[0], param)?;
             let right = lower_sub(&args[1], param)?;
-            JsAst::Call {
-                callee: Box::new(JsAst::Member {
-                    obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                    prop: "concat".to_string(),
-                }),
-                args: vec![left, right],
-            }
+            rt_call("concat", vec![left, right])
         }
         "proj_env" => {
             let env = if args.is_empty() {
@@ -682,13 +652,7 @@ fn lower_op_body(
             let field = lit.and_then(|v| v.as_str()).ok_or_else(|| {
                 CompileError::InvalidInput("proj_env missing lit name".to_string())
             })?;
-            JsAst::Call {
-                callee: Box::new(JsAst::Member {
-                    obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                    prop: "projEnv".to_string(),
-                }),
-                args: vec![env, JsAst::Str(field.to_string())],
-            }
+            rt_call("projEnv", vec![env, JsAst::Str(field.to_string())])
         }
         // `perform`/`io.perform` — the io module's `PerformFn` builtin
         // (ADR-0153 §4 residual `IO` mint + ADR-0158 in-flight
@@ -722,21 +686,12 @@ fn lower_op_body(
                 // reference is a body arrow — apply the resolved
                 // referent to the incoming (`__appOrValue` keeps a
                 // non-callable referent honest).
-                let referent = JsAst::Call {
-                    callee: Box::new(JsAst::Member {
-                        obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                        prop: "__opRef".to_string(),
-                    }),
-                    args: vec![JsAst::Str(name.to_string())],
-                };
+                let referent = rt_call("__opRef", vec![JsAst::Str(name.to_string())]);
                 if scheme {
-                    return Ok(JsAst::Await(Box::new(JsAst::Call {
-                        callee: Box::new(JsAst::Member {
-                            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                            prop: "__appOrValue".to_string(),
-                        }),
-                        args: vec![JsAst::Await(Box::new(referent)), param.clone()],
-                    })));
+                    return Ok(JsAst::Await(Box::new(rt_call(
+                        "__appOrValue",
+                        vec![JsAst::Await(Box::new(referent)), param.clone()],
+                    ))));
                 }
                 referent
             } else {
@@ -759,10 +714,7 @@ fn lower_op_body(
                     dispatch_call(name, lowered_args, dim_label, param)
                 } else {
                     JsAst::Call {
-                        callee: Box::new(JsAst::Member {
-                            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                            prop: name.to_string(),
-                        }),
+                        callee: Box::new(rt_member(name)),
                         args: lowered_args,
                     }
                 }
@@ -805,13 +757,10 @@ fn lower_bound_op_body(
         if !scheme {
             return referent;
         }
-        JsAst::Await(Box::new(JsAst::Call {
-            callee: Box::new(JsAst::Member {
-                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                prop: "__appOrValue".to_string(),
-            }),
-            args: vec![referent, param.clone()],
-        }))
+        JsAst::Await(Box::new(rt_call(
+            "__appOrValue",
+            vec![referent, param.clone()],
+        )))
     };
     let body = match bound {
         // `Arrow` is a top-level `const` name, `DepArrow` a member path
@@ -837,13 +786,7 @@ fn lower_bound_op_body(
                 } else {
                     JsAst::Array(applied)
                 };
-                JsAst::Await(Box::new(JsAst::Call {
-                    callee: Box::new(JsAst::Member {
-                        obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                        prop: "__apply".to_string(),
-                    }),
-                    args: vec![callee, arg_input],
-                }))
+                JsAst::Await(Box::new(rt_call("__apply", vec![callee, arg_input])))
             }
         }
         BoundRef::Ident(js_name) => {
@@ -857,10 +800,7 @@ fn lower_bound_op_body(
             }
         }
         BoundRef::Shim(member) => {
-            let callee = JsAst::Member {
-                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                prop: member.clone(),
-            };
+            let callee = rt_member(member);
             if applied.is_empty() {
                 if scheme {
                     // Scheme position (`x >>> js_error`): the referent is
@@ -963,27 +903,21 @@ fn lower_bound_arrow_record(
                 },
                 JsAst::Return(Box::new(JsAst::ArrowFn {
                     params: vec!["__args".to_string()],
-                    body: Box::new(JsAst::Await(Box::new(JsAst::Call {
-                        // `__apply` reinstates `__carried__` handler
-                        // frames on the bound arrow value.
-                        callee: Box::new(JsAst::Member {
-                            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                            prop: "__apply".to_string(),
-                        }),
-                        args: vec![
+                    // `__apply` reinstates `__carried__` handler frames
+                    // on the bound arrow value.
+                    body: Box::new(JsAst::Await(Box::new(rt_call(
+                        "__apply",
+                        vec![
                             term_expr,
-                            JsAst::Call {
-                                callee: Box::new(JsAst::Member {
-                                    obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                                    prop: "__appInput".to_string(),
-                                }),
-                                args: vec![
+                            rt_call(
+                                "__appInput",
+                                vec![
                                     JsAst::Ident("__b".to_string()),
                                     JsAst::Ident("__args".to_string()),
                                 ],
-                            },
+                            ),
                         ],
-                    }))),
+                    )))),
                 })),
             ])),
         }),
@@ -1007,20 +941,14 @@ fn lower_bound_arrow_record(
 /// to the incoming like any 0-arg op referent.
 fn lower_perform_body(args: &[Term], param: &JsAst, scheme: bool) -> Result<JsAst, CompileError> {
     if args.is_empty() {
-        let member = JsAst::Member {
-            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-            prop: "perform".to_string(),
-        };
+        let member = rt_member("perform");
         if !scheme {
             return Ok(member);
         }
-        return Ok(JsAst::Await(Box::new(JsAst::Call {
-            callee: Box::new(JsAst::Member {
-                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                prop: "__appOrValue".to_string(),
-            }),
-            args: vec![member, param.clone()],
-        })));
+        return Ok(JsAst::Await(Box::new(rt_call(
+            "__appOrValue",
+            vec![member, param.clone()],
+        ))));
     }
     lower_perform_call(args, param)
 }
@@ -1043,13 +971,7 @@ pub(crate) fn lower_perform_call(args: &[Term], param: &JsAst) -> Result<JsAst, 
             lower_sub(a, param)?
         });
     }
-    Ok(JsAst::Call {
-        callee: Box::new(JsAst::Member {
-            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-            prop: "perform".to_string(),
-        }),
-        args: lowered,
-    })
+    Ok(rt_call("perform", lowered))
 }
 
 /// The `perform` op-name operand. Eval's unbound-var rule hands the
@@ -1085,13 +1007,7 @@ fn lower_await_body(args: &[Term], param: &JsAst) -> Result<JsAst, CompileError>
         )));
     }
     let promise = lower_sub(&args[0], param)?;
-    Ok(JsAst::Await(Box::new(JsAst::Call {
-        callee: Box::new(JsAst::Member {
-            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-            prop: "await".to_string(),
-        }),
-        args: vec![promise],
-    })))
+    Ok(JsAst::Await(Box::new(rt_call("await", vec![promise]))))
 }
 
 fn lower_foreign_op_body(
@@ -1131,12 +1047,9 @@ fn lower_foreign_op_body(
         (Value::Null, false)
     };
     let raw = serde_json::to_string(&descriptors).map_err(|e| CompileError::Emit(e.to_string()))?;
-    Ok(JsAst::Call {
-        callee: Box::new(JsAst::Member {
-            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-            prop: "dispatchForeign".to_string(),
-        }),
-        args: vec![
+    Ok(rt_call(
+        "dispatchForeign",
+        vec![
             JsAst::Str(name.to_string()),
             JsAst::Array(lowered_args),
             dim_label
@@ -1147,7 +1060,7 @@ fn lower_foreign_op_body(
             JsAst::Raw(raw),
             JsAst::Bool(inline),
         ],
-    })
+    ))
 }
 
 /// The validated foreign descriptor as JSON (`null` when absent) — the

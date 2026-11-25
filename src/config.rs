@@ -308,11 +308,12 @@ pub struct JsConfig {
 }
 
 impl JsConfig {
-    /// Create a config for Deno + ESM.
-    pub fn esm_deno() -> Self {
+    /// Shared field defaults for the preset constructors — every knob
+    /// not named by the preset takes today's safe default.
+    fn preset(target: Box<dyn JsTarget>, format: Box<dyn JsOutputFormat>) -> Self {
         Self {
-            target: Box::new(Deno),
-            format: Box::new(Esm),
+            target,
+            format,
             debug: false,
             no_inline_foreign: false,
             source_map: false,
@@ -327,23 +328,14 @@ impl JsConfig {
         }
     }
 
+    /// Create a config for Deno + ESM.
+    pub fn esm_deno() -> Self {
+        Self::preset(Box::new(Deno), Box::new(Esm))
+    }
+
     /// Create a config for Node + CommonJS.
     pub fn cjs_node() -> Self {
-        Self {
-            target: Box::new(Node),
-            format: Box::new(CommonJs),
-            debug: false,
-            no_inline_foreign: false,
-            source_map: false,
-            modules: Vec::new(),
-            entry_imports: Vec::new(),
-            worker_entry: false,
-            op_lowering: OpLowering::Mixed,
-            loop_max_iterations: DEFAULT_LOOP_MAX_ITERATIONS,
-            security_scan: true,
-            unsafe_inline_foreign: false,
-            dispatch_all_ops: false,
-        }
+        Self::preset(Box::new(Node), Box::new(CommonJs))
     }
 }
 

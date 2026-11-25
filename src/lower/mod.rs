@@ -16,6 +16,48 @@ thread_local! {
         std::cell::RefCell::new(LowerCtx::default());
 }
 
+/// The single `__in` parameter every emitted arrow takes (the `app`
+/// arg-input — a lone argument or the `[args]` tuple).
+pub(crate) const INPUT_NAME: &str = "__in";
+
+/// `__in` as an expression — the fresh input identifier a
+/// `lower`-vs-`lower_applied` pair shares.
+pub(crate) fn input_ident() -> JsAst {
+    JsAst::Ident(INPUT_NAME.to_string())
+}
+
+/// The `__handl_rt.<name>` member expression.
+pub(crate) fn rt_member(name: &str) -> JsAst {
+    JsAst::Member {
+        obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
+        prop: name.to_string(),
+    }
+}
+
+/// `__handl_rt.<name>(args…)` — a runtime-helper call.
+pub(crate) fn rt_call(name: &str, args: Vec<JsAst>) -> JsAst {
+    JsAst::Call {
+        callee: Box::new(rt_member(name)),
+        args,
+    }
+}
+
+/// `async __in => body` — the uniform arrow shape every lowered term
+/// produces.
+pub(crate) fn arrow_fn(body: JsAst) -> JsAst {
+    JsAst::ArrowFn {
+        params: vec![INPUT_NAME.to_string()],
+        body: Box::new(body),
+    }
+}
+
+/// A JS string literal for `s` (`"…"`), `"_"` if serialization somehow
+/// fails — `serde_json` cannot fail on a `Value::String`, so the
+/// fallback is defensive only.
+pub(crate) fn js_string(s: &str) -> String {
+    serde_json::to_string(&Value::String(s.to_string())).unwrap_or_else(|_| "\"_\"".to_string())
+}
+
 /// How a module-scope name (import or top-level binding) resolves inside
 /// a lowered `Op { name, .. }` term.
 #[derive(Debug, Clone)]
@@ -405,6 +447,12 @@ impl JsUnaryOp {
     }
 }
 
+/// `CompileError` for a `Term` variant outside the closed lowering
+/// vocabulary — shared by [`lower`] and [`lower_applied`].
+fn unsupported(term: &Term) -> CompileError {
+    CompileError::Lower(format!("unsupported term: {term:?}"))
+}
+
 /// Lower any [`Term`] to a top-level JS arrow or value.
 pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
     match term {
@@ -418,7 +466,7 @@ pub fn lower(term: &Term) -> Result<JsAst, CompileError> {
         | Term::App { .. } => control::lower(term),
         Term::Child { .. } | Term::Handle { .. } => higher::lower(term),
         Term::Rewrite { .. } => proof::lower(term),
-        _ => Err(CompileError::Lower(format!("unsupported term: {term:?}"))),
+        _ => Err(unsupported(term)),
     }
 }
 
@@ -435,7 +483,7 @@ pub fn lower_applied(term: &Term, input: &JsAst) -> Result<JsAst, CompileError> 
         | Term::App { .. } => control::lower_applied(term, input),
         Term::Child { .. } | Term::Handle { .. } => higher::lower_applied(term, input),
         Term::Rewrite { .. } => proof::lower_applied(term, input),
-        _ => Err(CompileError::Lower(format!("unsupported term: {term:?}"))),
+        _ => Err(unsupported(term)),
     }
 }
 
@@ -466,27 +514,12 @@ fn lower_value_abi(value: &ValueAbi) -> Result<JsAst, CompileError> {
             Ok(JsAst::Object(props))
         }
         ValueAbi::Bytes(_) => Ok(JsAst::Null),
-        ValueAbi::Pair(a, b) => Ok(JsAst::Call {
-            callee: Box::new(JsAst::Member {
-                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                prop: "mkPair".to_string(),
-            }),
-            args: vec![lower_value_abi(a)?, lower_value_abi(b)?],
-        }),
-        ValueAbi::EitherLeft(v) => Ok(JsAst::Call {
-            callee: Box::new(JsAst::Member {
-                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                prop: "mkLeft".to_string(),
-            }),
-            args: vec![lower_value_abi(v)?],
-        }),
-        ValueAbi::EitherRight(v) => Ok(JsAst::Call {
-            callee: Box::new(JsAst::Member {
-                obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-                prop: "mkRight".to_string(),
-            }),
-            args: vec![lower_value_abi(v)?],
-        }),
+        ValueAbi::Pair(a, b) => Ok(rt_call(
+            "mkPair",
+            vec![lower_value_abi(a)?, lower_value_abi(b)?],
+        )),
+        ValueAbi::EitherLeft(v) => Ok(rt_call("mkLeft", vec![lower_value_abi(v)?])),
+        ValueAbi::EitherRight(v) => Ok(rt_call("mkRight", vec![lower_value_abi(v)?])),
         // Arrows and handles are not expected as primitive constant values.
         ValueAbi::Arrow(_) | ValueAbi::Handle(_) | ValueAbi::Resource { .. } => Ok(JsAst::Null),
     }

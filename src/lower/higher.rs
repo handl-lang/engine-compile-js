@@ -3,30 +3,7 @@
 use handl_plugin_compile::CompileError;
 use hnl_engine::Term;
 
-use crate::JsAst;
-
-const INPUT_NAME: &str = "__in";
-
-fn input_ident() -> JsAst {
-    JsAst::Ident(INPUT_NAME.to_string())
-}
-
-fn rt_call(name: &str, args: Vec<JsAst>) -> JsAst {
-    JsAst::Call {
-        callee: Box::new(JsAst::Member {
-            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-            prop: name.to_string(),
-        }),
-        args,
-    }
-}
-
-fn arrow_fn(body: JsAst) -> JsAst {
-    JsAst::ArrowFn {
-        params: vec![INPUT_NAME.to_string()],
-        body: Box::new(body),
-    }
-}
+use crate::lower::{INPUT_NAME, JsAst, arrow_fn, input_ident, rt_call};
 
 /// Lower a higher-order combinator to a top-level JS arrow.
 pub fn lower(term: &Term) -> Result<JsAst, CompileError> {

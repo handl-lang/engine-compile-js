@@ -4,30 +4,9 @@ use handl_plugin_compile::CompileError;
 use hnl_engine::Term;
 use serde_json::{Number, Value};
 
-use crate::lower::{JsAst, JsBinOp, JsUnaryOp, loop_max_iterations};
-
-const INPUT_NAME: &str = "__in";
-
-fn input_ident() -> JsAst {
-    JsAst::Ident(INPUT_NAME.to_string())
-}
-
-fn rt_call(name: &str, args: Vec<JsAst>) -> JsAst {
-    JsAst::Call {
-        callee: Box::new(JsAst::Member {
-            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-            prop: name.to_string(),
-        }),
-        args,
-    }
-}
-
-fn arrow_fn(body: JsAst) -> JsAst {
-    JsAst::ArrowFn {
-        params: vec![INPUT_NAME.to_string()],
-        body: Box::new(body),
-    }
-}
+use crate::lower::{
+    JsAst, JsBinOp, JsUnaryOp, arrow_fn, input_ident, js_string, loop_max_iterations, rt_call,
+};
 
 fn let_decl(name: &str, value: JsAst) -> JsAst {
     JsAst::Let {
@@ -320,9 +299,7 @@ fn host_member_callee(callee: &Term) -> Option<String> {
     }
     let field = lit.as_ref().and_then(Value::as_str)?;
     let recv = args.first().and_then(host_member_receiver)?;
-    let quoted = serde_json::to_string(&Value::String(field.to_string()))
-        .unwrap_or_else(|_| "\"_\"".to_string());
-    Some(format!("{recv}[{quoted}]"))
+    Some(format!("{recv}[{}]", js_string(field)))
 }
 
 /// The `__handl_rt` path a `field_access` receiver term resolves to —
@@ -339,9 +316,7 @@ fn host_member_receiver(recv: &Term) -> Option<String> {
     if name == "field_access" {
         let field = lit.as_ref().and_then(Value::as_str)?;
         let base = args.first().and_then(host_member_receiver)?;
-        let quoted = serde_json::to_string(&Value::String(field.to_string()))
-            .unwrap_or_else(|_| "\"_\"".to_string());
-        return Some(format!("{base}[{quoted}]"));
+        return Some(format!("{base}[{}]", js_string(field)));
     }
     match super::module_bound(name) {
         Some(super::BoundRef::Member(path)) => Some(path),
@@ -459,13 +434,10 @@ fn lower_app_applied(callee: &Term, args: &[Term], input: &JsAst) -> Result<JsAs
     // arrows are async), so the call is awaited. `__apply` reinstates
     // `__carried__` handler frames a `handle` attached to the callee
     // value (deep dispatch, `attach_carried_handler` subset).
-    Ok(JsAst::Await(Box::new(JsAst::Call {
-        callee: Box::new(JsAst::Member {
-            obj: Box::new(JsAst::Ident("__handl_rt".to_string())),
-            prop: "__apply".to_string(),
-        }),
-        args: vec![callee_expr, arg_input],
-    })))
+    Ok(JsAst::Await(Box::new(rt_call(
+        "__apply",
+        vec![callee_expr, arg_input],
+    ))))
 }
 
 /// Peel a left-nested `App` chain — `App(App(base, inner), outer)` —

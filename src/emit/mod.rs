@@ -35,7 +35,7 @@ fn json_string(value: &Value) -> Result<String, CompileError> {
 }
 
 /// Whether `s` is a valid JS identifier (so `.s` member access is legal).
-fn is_js_ident(s: &str) -> bool {
+pub(crate) fn is_js_ident(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .next()
@@ -192,18 +192,7 @@ impl JsEmitter {
             }
             JsAst::Raw(s) => out.push_str(s),
             // Statement forms should not appear as bare expressions.
-            JsAst::Let { .. }
-            | JsAst::ConstDecl { .. }
-            | JsAst::Return(_)
-            | JsAst::If { .. }
-            | JsAst::While { .. }
-            | JsAst::For { .. }
-            | JsAst::Block(_)
-            | JsAst::Import { .. }
-            | JsAst::ExportDecl(_)
-            | JsAst::ExportNames(_)
-            | JsAst::ExportDefault(_)
-            | JsAst::Comment(_) => self.emit_stmt_to(ast, out, 0)?,
+            _ => self.emit_stmt_to(ast, out, 0)?,
         }
         Ok(())
     }
@@ -217,14 +206,12 @@ impl JsEmitter {
         match ast {
             JsAst::Let { name, value } => {
                 self.write_indent(out, indent);
-                out.push_str(&format!("let {name} = "));
-                self.emit_expr_to(value, out)?;
+                self.write_var_decl("let", name, value, out)?;
                 out.push_str(";\n");
             }
             JsAst::ConstDecl { name, value } => {
                 self.write_indent(out, indent);
-                out.push_str(&format!("const {name} = "));
-                self.emit_expr_to(value, out)?;
+                self.write_var_decl("const", name, value, out)?;
                 out.push_str(";\n");
             }
             JsAst::Assign { name, value } => {
@@ -317,13 +304,11 @@ impl JsEmitter {
                 out.push_str("export ");
                 match inner.as_ref() {
                     JsAst::ConstDecl { name, value } => {
-                        out.push_str(&format!("const {name} = "));
-                        self.emit_expr_to(value, out)?;
+                        self.write_var_decl("const", name, value, out)?;
                         out.push_str(";\n");
                     }
                     JsAst::Let { name, value } => {
-                        out.push_str(&format!("let {name} = "));
-                        self.emit_expr_to(value, out)?;
+                        self.write_var_decl("let", name, value, out)?;
                         out.push_str(";\n");
                     }
                     other => {
@@ -379,17 +364,27 @@ impl JsEmitter {
 
     fn emit_for_init(&self, ast: &JsAst, out: &mut String) -> Result<(), CompileError> {
         match ast {
-            JsAst::Let { name, value } => {
-                out.push_str(&format!("let {name} = "));
-                self.emit_expr_to(value, out)?;
-            }
-            JsAst::ConstDecl { name, value } => {
-                out.push_str(&format!("const {name} = "));
-                self.emit_expr_to(value, out)?;
-            }
+            JsAst::Let { name, value } => self.write_var_decl("let", name, value, out)?,
+            JsAst::ConstDecl { name, value } => self.write_var_decl("const", name, value, out)?,
             _ => self.emit_expr_to(ast, out)?,
         }
         Ok(())
+    }
+
+    /// `<keyword> <name> = <value>` without indentation or `;` — shared
+    /// by statement emit and `for`-init positions.
+    fn write_var_decl(
+        &self,
+        keyword: &str,
+        name: &str,
+        value: &JsAst,
+        out: &mut String,
+    ) -> Result<(), CompileError> {
+        out.push_str(keyword);
+        out.push(' ');
+        out.push_str(name);
+        out.push_str(" = ");
+        self.emit_expr_to(value, out)
     }
 
     fn emit_branch(

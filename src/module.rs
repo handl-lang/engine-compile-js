@@ -28,8 +28,8 @@ use hnl_tool_parse_pratt::PrattEngine;
 use serde_json::Value;
 
 use crate::config::JsConfig;
-use crate::emit::{JsEmitter, SecurityScanner};
-use crate::lower::{self, BoundRef, JsAst};
+use crate::emit::{JsEmitter, SecurityScanner, is_js_ident};
+use crate::lower::{self, BoundRef, JsAst, js_string};
 
 /// The `js` contract package (`handl-packages/js`): bare-name imports
 /// bind to `__handl_rt` shims / the real `await` op.
@@ -673,16 +673,13 @@ fn require_import(spec: &str, named: &[(String, String)], namespace: Option<&str
     // raw snippet (quoted keys keep non-identifier import names legal).
     let props = named
         .iter()
-        .map(|(imported, local)| {
-            let key = serde_json::to_string(&Value::String(imported.clone()))
-                .unwrap_or_else(|_| "\"_\"".to_string());
-            format!("{key}: {local}")
-        })
+        .map(|(imported, local)| format!("{}: {local}", js_string(imported)))
         .collect::<Vec<_>>()
         .join(", ");
-    let spec_lit = serde_json::to_string(&Value::String(spec.to_string()))
-        .unwrap_or_else(|_| "\"_\"".to_string());
-    JsAst::Raw(format!("const {{ {props} }} = require({spec_lit})"))
+    JsAst::Raw(format!(
+        "const {{ {props} }} = require({})",
+        js_string(spec)
+    ))
 }
 
 /// Lex + parse + desugar one statement chunk. Returns the (possibly
@@ -1009,16 +1006,6 @@ fn is_bare_module_name(spec: &str) -> bool {
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
 }
 
-/// Whether `s` is a valid JS identifier (so `.s` member access is legal).
-fn is_js_ident(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-}
-
 /// A `__handl_rt` member path for package spec/member segments —
 /// identifier segments use `.name`, anything else bracket access
 /// (`fetch-js` under `.` would parse as subtraction).
@@ -1029,10 +1016,8 @@ fn rt_member_path(segments: &[&str]) -> String {
             path.push('.');
             path.push_str(seg);
         } else {
-            let quoted = serde_json::to_string(&Value::String(seg.to_string()))
-                .unwrap_or_else(|_| "\"_\"".to_string());
             path.push('[');
-            path.push_str(&quoted);
+            path.push_str(&js_string(seg));
             path.push(']');
         }
     }
@@ -1355,18 +1340,7 @@ impl ModuleCtx<'_> {
         // `F.rec` is dotted and cannot be a record field).
         if is_splice_block(child) || self.is_flattened_decl_group(lang, ast, child) {
             let names = self.emit_splice_block(lang, ast, child)?;
-            for name in names {
-                let Some(r) = self.bound.get(&name).cloned() else {
-                    continue;
-                };
-                if self.dep {
-                    if !self.exports.iter().any(|(n, _)| *n == name) {
-                        self.exports.push((name, bound_expr(&r)));
-                    }
-                } else {
-                    self.emit_entry_export(&name, &r);
-                }
-            }
+            self.export_names(names);
             return Ok(());
         }
         // `export x : T` — a signature export: binds `x` to `null` and
@@ -1492,6 +1466,31 @@ impl ModuleCtx<'_> {
         ast: &Ast,
         node: &AstNode,
     ) -> Result<Vec<String>, CompileError> {
+        self.emit_decl_group(lang, ast, node, false)
+    }
+
+    /// Emit the children of a desugared `data` declaration group — the
+    /// `__splice__`-flagged `block` or the flattened surface `block`
+    /// `splice_decl_blocks` leaves behind. Each child binds at module
+    /// scope exactly like a top-level statement; dotted targets
+    /// (`F.rec`) become member assignments on the family binding.
+    ///
+    /// Returns the non-dotted bound names in order (the family/former
+    /// first, then each constructor) — the set `export data` projects
+    /// into the module record — and injects nullary constructors into
+    /// `lang.globals` so `match`'s ctor-value patterns (`Zero:`) see
+    /// them as literals — `lower_ast`'s env is per-statement and cannot
+    /// carry module bindings into `compile_pattern`'s `pat_env`.
+    /// `skip_stmt_export` drops `stmt.export` marker children — the
+    /// `export data` surface marker binds nothing (its only child was
+    /// the `var "data"` residue `strip_data_keyword_residue` removed).
+    fn emit_decl_group(
+        &mut self,
+        lang: &Language,
+        ast: &Ast,
+        node: &AstNode,
+        skip_stmt_export: bool,
+    ) -> Result<Vec<String>, CompileError> {
         let children = node
             .payload
             .get("children")
@@ -1507,6 +1506,9 @@ impl ModuleCtx<'_> {
             let Some(child) = ast.get(AstRef::new(idx)) else {
                 continue;
             };
+            if skip_stmt_export && child.kind == "stmt.export" {
+                continue;
+            }
             self.emit_decl_group_child(
                 lang,
                 ast,
@@ -1567,36 +1569,15 @@ impl ModuleCtx<'_> {
         ast: &Ast,
         node: &AstNode,
     ) -> Result<(), CompileError> {
-        let children = node
-            .payload
-            .get("children")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut names: Vec<String> = Vec::new();
-        let mut ctor_globals: Vec<(String, Value)> = Vec::new();
-        for entry in children {
-            let Some(idx) = entry.as_u64().map(|n| n as usize) else {
-                continue;
-            };
-            let Some(child) = ast.get(AstRef::new(idx)) else {
-                continue;
-            };
-            // The `export data` marker itself: no runtime binding (its
-            // only child was the stripped `var "data"` residue).
-            if child.kind == "stmt.export" {
-                continue;
-            }
-            self.emit_decl_group_child(
-                lang,
-                ast,
-                AstRef::new(idx),
-                child,
-                &mut names,
-                &mut ctor_globals,
-            )?;
-        }
-        self.inject_ctor_globals(ctor_globals);
+        let names = self.emit_decl_group(lang, ast, node, true)?;
+        self.export_names(names);
+        Ok(())
+    }
+
+    /// Export each bound name — dep mode records `(name, bound_expr)`
+    /// in the module record, entry mode emits the ESM surface. Shared
+    /// by the `export data` declaration-group emits.
+    fn export_names(&mut self, names: Vec<String>) {
         for name in names {
             let Some(r) = self.bound.get(&name).cloned() else {
                 continue;
@@ -1609,7 +1590,6 @@ impl ModuleCtx<'_> {
                 self.emit_entry_export(&name, &r);
             }
         }
-        Ok(())
     }
 
     /// Whether `node` is the *flattened* form of a `data` declaration

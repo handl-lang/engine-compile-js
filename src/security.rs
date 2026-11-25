@@ -72,12 +72,11 @@ pub fn is_safe_for_inlining(fd: &ForeignDescriptor) -> bool {
     if fd.module.is_empty() || fd.name.is_empty() {
         return false;
     }
-    for s in std::iter::once(&fd.module)
-        .chain(std::iter::once(&fd.name))
-        .chain(std::iter::once(&fd.return_type))
+    for s in [&fd.module, &fd.name, &fd.return_type]
+        .into_iter()
         .chain(fd.arg_types.iter())
     {
-        if blocked_for_inlining(s) {
+        if dangerous_string(s) {
             return false;
         }
     }
@@ -146,15 +145,4 @@ fn is_static_identifier(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
-}
-
-fn blocked_for_inlining(s: &str) -> bool {
-    let lower = s.to_lowercase();
-    lower.contains("eval")
-        || lower.contains("function")
-        || lower.contains("setimmediate")
-        || lower.contains("settimeout")
-        || lower.contains("document.write")
-        || lower.contains("<script")
-        || lower.contains("</script")
 }
