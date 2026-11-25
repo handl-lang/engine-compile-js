@@ -10,7 +10,7 @@
 //! value the program actually produced.
 //!
 //! The whole suite skips gracefully when `node` is not on `PATH`
-//! (`node --version` is probed once); `ci.sh`'s `test` stage fails
+//! (`node --version` is probed once); the gate's `test` stage fails
 //! fast when node is absent so CI cannot silently skip these tests.
 
 use std::process::Command;
@@ -165,7 +165,7 @@ fn print_default() -> &'static str {
 macro_rules! require_node {
     () => {
         if node_version().is_none() {
-            eprintln!("e2e: `node` not on PATH — skipping (ci.sh fails on this)");
+            eprintln!("e2e: `node` not on PATH — skipping (the gate fails on this)");
             return;
         }
     };

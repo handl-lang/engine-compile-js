@@ -1,20 +1,20 @@
 # workflows/gate.yaml — per-push gate for handl-lang/tool-compile-js.
 #
-# Replaces ci.sh as the bupha/peregrin gate (ci.sh stays in the tree
-# for reference until the runner flips). Invoke:
+# This IS the bupha/peregrin gate (there is no ci.sh; bupha.toml runs
+# this campaign). Invoke:
 #
 #   GATE_REPO="$PWD" GATE_RESULTS="$PWD/.gate-results.jsonl" \
 #     peregrin campaign run workflows/gate.yaml --result .ci-result.json
 #
-# Verbatim port of ci.sh's `all` stage: fmt → clippy → test → doc,
-# with ci.sh's exact semantics —
+# Verbatim port of the fleet ci.sh `all` stage semantics:
+# fmt → clippy → test → doc —
 #   * private git deps: HANDL_TOKEN/BUPHA_TOKEN wins, else the
 #     url.git@github.com:handl-lang/.insteadOf → https rewrite via
 #     GIT_CONFIG_* (never touches ~/.gitconfig);
 #   * CARGO_NET_GIT_FETCH_WITH_CLI=true so cargo shells out to git;
 #   * tests/e2e.rs executes emitted JS under node — a missing node
 #     FAILS the test stage (never silently skips);
-#   * all four stages run even when an earlier one fails (ci.sh
+#   * all four stages run even when an earlier one fails (the stage
 #     accumulates `fail`, exits 1 at the end).
 #
 # Deps resolve from git (no [patch] tables), so no ensure-siblings
@@ -63,7 +63,7 @@ nodes:
         "0": gate.due
         default: gate.init.failed
 
-  # --- gate: ci.sh `all` — fmt, clippy, test (node-gated), doc ------
+  # --- gate: fmt → clippy → test (node-gated) → doc ----------------
   - id: gate.run
     driver: shell
     on: [gate.due]
