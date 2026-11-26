@@ -725,15 +725,14 @@ fn e2e_assert_and_runtime_assert_fail_like_eval() {
 }
 
 #[test]
-fn e2e_object_pattern_shorthand_binds_nothing() {
+fn e2e_object_pattern_shorthand_binds_fields() {
     require_node!();
-    // `{x}` parses as an `object` node with a bare `var` child — eval
-    // (`try_object_pattern`) ignores non-entry children, so the pattern
-    // is an *empty* object pattern and `x` stays unbound. The compiled
-    // `x` is a bare `Op{x, []}` reference: `__opRef` throws
-    // "unsupported op: x" exactly like `term_interpreter`, instead of
-    // the old silent `undefined`. The `{x: y}` entry form binds `y`
-    // from the scrutinee field and is unaffected.
+    // `{x}` parses as an `object` node with a bare `var` child —
+    // `try_object_pattern` (exec 6703b33, I-010) reads it as the
+    // shorthand `entry{key: x, value: x}`, and `compile_pattern`'s
+    // object arm mirrors that: field `x` binds `x`, a missing field
+    // falls through, and a wildcard binds nothing and requires no
+    // field.
     let run = run_program(
         "objpat",
         r#"
@@ -744,7 +743,7 @@ gety := (r) ~> match r { {x: y}: y, _: -1 }
         "import v from \"./prog.mjs\";\n\
          const out = {};\n\
          for (const [k, f] of Object.entries(v)) {\n\
-           for (const inp of [{x: 42}, {y: 1}]) {\n\
+           for (const inp of [{x: 42, y: 8}, {y: 1}]) {\n\
              try { out[k + \":\" + JSON.stringify(inp)] = await f(inp); }\n\
              catch (e) { out[k + \":\" + JSON.stringify(inp)] = \"ERR:\" + e.message; }\n\
            }\n\
@@ -754,7 +753,7 @@ gety := (r) ~> match r { {x: y}: y, _: -1 }
     assert!(run.succeeded(), "node failed:\n{}", run.stderr);
     assert_eq!(
         run.stdout.trim(),
-        r#"{"shorthand:{\"x\":42}":"ERR:unsupported op: x","shorthand:{\"y\":1}":"ERR:unsupported op: x","entry:{\"x\":42}":42,"entry:{\"y\":1}":-1}"#
+        r#"{"shorthand:{\"x\":42,\"y\":8}":42,"shorthand:{\"y\":1}":-1,"entry:{\"x\":42,\"y\":8}":42,"entry:{\"y\":1}":-1}"#
     );
 }
 

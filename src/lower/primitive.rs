@@ -680,9 +680,9 @@ fn lower_op_body(
                 // member when the op/package exists and throws
                 // "unsupported op" like eval when it does not — a bare
                 // `__handl_rt.<name>` member would silently evaluate to
-                // `undefined` for unknown names (e.g. an unbound pattern
-                // variable left over from a `{x}` shorthand object
-                // pattern, which binds nothing). In *scheme* position the
+                // `undefined` for unknown names (e.g. a genuinely unbound
+                // variable in pattern or expression position). In
+                // *scheme* position the
                 // reference is a body arrow — apply the resolved
                 // referent to the incoming (`__appOrValue` keeps a
                 // non-callable referent honest).
