@@ -134,7 +134,7 @@ The compiler never silently miscompiles:
    demand them. This now includes the module surface on all four
    formats (`src/module.rs::emit_module_surface` — ESM named exports,
    CJS `require()` + namespace-object `module.exports`, IIFE/inline
-   completion-value namespaces), `export data` family/ctor exports,
+   completion-value namespaces), `export F := new Inductive { … }` family exports (ctors ride the family record),
    import aliases, the `acc` accumulator path of `handle`, and the
    `perform`/`io.perform` spellings — flat, qualified, and `from "io"
    import perform` forms all emit `__handl_rt.perform`, whose covered

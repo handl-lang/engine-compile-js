@@ -842,23 +842,26 @@ get_or : Opt ~> Number ~> Number := o ~> d ~> match o { None: d, Some(x): x }
 }
 
 #[test]
-fn e2e_export_data_record_form_with_plain_export() {
+fn e2e_export_family_record_with_plain_export() {
     require_node!();
-    // `export data F := { … }` (the record spelling) alongside a plain
-    // `export x := …` — both surface as real ESM named exports while
-    // the ctors keep matching in-module: `Zero:` hits the ctor-value
-    // pattern (the decl's own ctor literal in `lang.globals`),
-    // `Succ(p)` the `ctor_name`/`ctor_fields` dispatch.
+    // `export F := new Inductive { … }` alongside a plain
+    // `export x := …` — the family name and `x` surface as real ESM
+    // named exports while the ctors ride inside the family record
+    // (`module_prep` Design A: only the family name is exported, so
+    // `F.Zero`/`F.Succ` reach them importer-side). In-module the ctor
+    // names still match bare: `Zero:` hits the ctor-value pattern
+    // (the decl's own ctor literal in `lang.globals`), `Succ(p)` the
+    // `ctor_name`/`ctor_fields` dispatch.
     let run = run_program(
-        "export-data-record",
+        "export-family-record",
         r#"
-export data F := { Zero : F, Succ : (pred : F) ~> F }
+export F := new Inductive { Zero : F, Succ : (pred : F) ~> F }
 export x := 40
 size := n ~> match n { Zero: 0, Succ(p): 1 + size(p), _: 9 }
 { f: size(Succ(Zero)), x: x }
 "#,
-        "import def, { F, Zero, Succ, x } from \"./prog.mjs\";\n\
-         const two = await Succ(await Succ(Zero));\n\
+        "import def, { F, x } from \"./prog.mjs\";\n\
+         const two = await F.Succ(await F.Succ(F.Zero));\n\
          console.log(JSON.stringify({ def: def, x: x,\n\
            ctor: two.__ctor__.__sym__.name,\n\
            hasF: typeof F === \"object\" && F.__former__ != null }));\n",
@@ -873,18 +876,19 @@ size := n ~> match n { Zero: 0, Succ(p): 1 + size(p), _: 9 }
 }
 
 #[test]
-fn e2e_export_data_family_and_ctors_importable() {
+fn e2e_export_family_and_ctors_importable() {
     require_node!();
-    // `export data Nat :: …` inside an inlined dep exports the family
-    // and each constructor (`module_prep`'s export-record projection —
-    // `F.rec` is dotted and stays off the record). The consumer imports
-    // them and `match`es: `Zero:` resolves through the ctor literal the
-    // dep propagated into the importer's `lang.globals` (eval's
-    // scope-value parity), `Succ(p)` through `ctor_name` dispatch.
+    // `export Nat := new Inductive { … }` inside an inlined dep exports
+    // the family name; the family *record* carries the constructors
+    // (`module_prep` Design A — `F.rec` is dotted and stays off the
+    // record either way). The consumer imports the family and aliases
+    // the ctors locally (`Zero := Nat.Zero` — eval's scope-value
+    // parity), then `match`es: `Zero:` resolves through the ctor
+    // literal, `Succ(p)` through `ctor_name` dispatch.
     let mut config = esm_node();
     config.modules = vec![JsModule {
         path: "/pkgs/nat/nat.hnl".to_string(),
-        source: "export data Nat := Zero | Succ(pred)\n\
+        source: "export Nat := new Inductive { Zero : Nat, Succ : (pred : Nat) ~> Nat }\n\
                  export to_num := n ~> match n { Zero: 0, Succ(p): 1 + to_num(p) }\n\
                  export one := Succ(Zero)\n"
             .to_string(),
@@ -892,9 +896,11 @@ fn e2e_export_data_family_and_ctors_importable() {
     }];
     config.entry_imports = vec![("nat".to_string(), "/pkgs/nat/nat.hnl".to_string())];
     let run = run_program_with(
-        "export-data-dep",
+        "export-family-dep",
         r#"
-from "nat" import { Nat, Zero, Succ, to_num, one }
+from "nat" import { Nat, to_num, one }
+Zero := Nat.Zero
+Succ := Nat.Succ
 kind := n ~> match n { Zero: "zero", Succ(p): "succ", _: "other" }
 {
   ka: kind(Zero),
@@ -1871,18 +1877,16 @@ Nat
 }
 
 #[test]
-fn e2e_data_keyword_decl_inside_do_block() {
+fn e2e_family_decl_inside_do_block() {
     require_node!();
-    // `data Nat := { … }` (the retired keyword, still accepted) inside
-    // a `do` block: the parser's stray `var "data"` marker is stripped
-    // the way `module_prep` strips declarations textually, so the
-    // constructors bind in the block scope like the keyword-free
-    // spelling.
+    // `Nat := new Inductive { … }` inside a `do` block: the constructors
+    // bind in the block scope like the keyword-free spelling — the
+    // desugared decl group's assigns pop with the block.
     let run = run_program(
-        "data-kw-in-do",
+        "family-in-do",
         r#"
 probe := do {
-  data Nat := { Zero : Nat, Succ : (p : Nat) ~> Nat }
+  Nat := new Inductive { Zero : Nat, Succ : (p : Nat) ~> Nat }
   two := Succ(Succ(Zero))
   match two { Zero: 0, Succ(p): match p { Zero: 1, Succ(q): 2, _: 9 }, _: 8 }
 }
@@ -1895,16 +1899,17 @@ probe
 }
 
 #[test]
-fn e2e_data_keyword_decl_top_level_binds_module_scope() {
+fn e2e_family_decl_top_level_binds_module_scope() {
     require_node!();
-    // `data Nat := { … }` at top level — previously the desugared
-    // statement AST's last arena node was an orphaned ctor `alt`, so
-    // the last-node-is-root assumption failed the compile outright.
-    // The constructors must bind at module scope for later statements.
+    // `Nat := new Inductive { … }` at top level — the desugared
+    // statement AST's last arena node used to be an orphaned ctor
+    // `alt`, so the last-node-is-root assumption failed the compile
+    // outright. The constructors must bind at module scope for later
+    // statements.
     let run = run_program(
-        "data-kw-top",
+        "family-top",
         r#"
-data Nat := { Zero : Nat, Succ : (p : Nat) ~> Nat }
+Nat := new Inductive { Zero : Nat, Succ : (p : Nat) ~> Nat }
 to_num := n ~> match n { Zero: 0, Succ(p): 1 + to_num(p) }
 to_num(Succ(Succ(Zero)))
 "#,

@@ -34,9 +34,9 @@ fails loudly at compile time or runtime rather than miscompiling.
 | ES `import` surface: named, `{a as b}` aliases, `* as ns`, side-effect | e2e | `src/module.rs` |
 | `export` decls → real ESM named exports / CJS-IIFE / inline namespace object | e2e | `src/module.rs` |
 | Signature exports (`export f: T ~> U`) → `export let f = null` | e2e | `src/module.rs` |
-| `data` decls: `F := {…}` and `F :: …` families, parameterized `Opt<a>`, ctors + `match` | e2e | `src/module.rs`, `src/runtime/prelude.rs` (`ctor_name`/`ctor_fields`) |
-| `export data F …` — family + ctors exported, cross-module ctor literals | e2e | `src/module.rs::emit_export_data_block` |
-| `data` decls nested in `do` blocks (eval-scoped) | e2e | `splice_decl_blocks` |
+| `F := new Inductive {…}` family decls (incl. `F := {…}` / `F :: …` spellings), parameterized `Opt<a>`, ctors + `match` | e2e | `src/module.rs`, `src/runtime/prelude.rs` (`ctor_name`/`ctor_fields`) |
+| `export F := new Inductive {…}` — family exported; ctors ride the family record (`F.Ctor`), cross-module ctor literals | e2e | `src/module.rs` |
+| family decls nested in `do` blocks (eval-scoped) | e2e | `splice_decl_blocks` |
 | Ops: full `__handl_rt` prelude set (record/flow/ctor/match-guard/eq/json/`tag`/`bytes`/`math`/`str`/`char`/`option`/`type`/`hash_map`/`obj`/`fetch-js`/`result` + `js` contract `call`/`invoke`/`construct`/`on`/`off`/`await`/`error`) | e2e | `src/runtime/prelude.rs` |
 | Foreign ops: inline `globalThis[m][n](…)` or `jsCall` dispatch; handler interception via `dispatchForeign` | e2e + unit | `src/lower/primitive.rs`, `src/security.rs` |
 | `handle`/`perform` effect subset: op dispatch, grades/`dim`, carried-handler reinstall, `return` clause, `IO(sig)` former interpretation | e2e | `src/runtime/prelude.rs` §4 of runtime-model doc |

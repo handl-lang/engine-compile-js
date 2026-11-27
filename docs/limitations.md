@@ -121,7 +121,8 @@ Still open upstream:
 - **`handle … acc` surface syntax** — declined in
   `handl-kit-arrow-lower` pending a shared-`Term`-interpreter
   convention for `(payload, s)` impls (see above).
-- **Loader RHS-inlining divergence** — `lib-loader`'s
-  `src/index.hnl` lacked `export data` handling (bootstrap fallback
-  covers it) and `loader.rs`'s bootstrap mirror diverges; noted by
-  T-023 for upstream parity follow-up.
+- **Loader parity** — resolved upstream: `lib-loader`'s
+  `src/index.hnl` and `loader.rs`'s bootstrap mirror now handle the
+  `export F := new Inductive { … }` family export and reject the
+  retired `export data` spelling with a migration error, matching
+  `module_prep`.

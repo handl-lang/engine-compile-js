@@ -210,6 +210,12 @@ impl<'a> Bundle<'a> {
         let chunks = split_statements(source);
         let last = chunks.len().saturating_sub(1);
         for (i, chunk) in chunks.iter().enumerate() {
+            if let Some(msg) = retired_export_data_error(&chunk.text) {
+                return Err(CompileError::InvalidInput(format!(
+                    "statement {}: {msg}",
+                    i + 1
+                )));
+            }
             let (ast, root) = parse_statement(lang, &chunk.text)
                 .map_err(|e| CompileError::InvalidInput(format!("statement {}: {e}", i + 1)))?;
             let node = ast
@@ -405,6 +411,11 @@ struct ModuleCtx<'e> {
     /// Surfaced on `BodyEmit` so `Bundle::emitted` can hand them to
     /// importers' `lang.globals`.
     ctor_literals: HashMap<String, Value>,
+    /// Constructor names minted by `data` declaration groups — bound
+    /// for in-module use but *not* export-surface names: the family
+    /// record carries them (`module_prep` parity — only the family
+    /// name is a top-level export).
+    decl_ctors: HashSet<String>,
 }
 
 impl<'e> ModuleCtx<'e> {
@@ -432,6 +443,7 @@ impl<'e> ModuleCtx<'e> {
             exports: Vec::new(),
             tail: None,
             ctor_literals: HashMap::new(),
+            decl_ctors: HashSet::new(),
         }
     }
 
@@ -457,7 +469,14 @@ impl<'e> ModuleCtx<'e> {
         // (`module_prep` erases those to `null` in the module record,
         // and ESM has no runtime binding to export).
         for name in std::mem::take(&mut self.pending_exports) {
-            match self.bound.get(&name) {
+            // Decl-group ctor names are bound but not export-surface
+            // names — `export Zero` does not name a top-level binding
+            // (`module_prep` parity).
+            let bound = self
+                .bound
+                .get(&name)
+                .filter(|_| !self.decl_ctors.contains(&name));
+            match bound {
                 Some(r) => {
                     let r = r.clone();
                     if self.dep {
@@ -485,7 +504,7 @@ impl<'e> ModuleCtx<'e> {
             // `module_prep`'s `is_valid_ident` skips them too.
             self.bound_order
                 .iter()
-                .filter(|n| !n.contains('.'))
+                .filter(|n| !n.contains('.') && !self.decl_ctors.contains(*n))
                 .filter_map(|n| self.bound.get(n).map(|r| (n.clone(), bound_expr(r))))
                 .collect()
         } else {
@@ -682,6 +701,108 @@ fn require_import(spec: &str, named: &[(String, String)], namespace: Option<&str
     ))
 }
 
+/// `export data F := …` is a retired declaration form — the `data`
+/// keyword is gone from the surface; the canonical family export is
+/// `export F := new Inductive { … }` (the family record carries the
+/// constructors). With `data` demoted to an ordinary identifier the
+/// parser would otherwise read `export data Nat := Zero | Succ(Nat)`
+/// as "export the binding `data`" followed by an unrelated family
+/// declaration — silently wrong. Detect the pattern textually,
+/// mirroring `module_prep`'s `is_retired_data_decl_rest`, and fail
+/// loudly. Returns the error message when a retired form is present.
+fn retired_export_data_error(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // String literal — skip to the closing quote (respecting escapes).
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i += 2,
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+            continue;
+        }
+        // `--` line comment and `/-- … --/` block comment — skip.
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 2 < bytes.len() && bytes[i + 1] == b'-' && bytes[i + 2] == b'-' {
+            i += 3;
+            while i + 2 < bytes.len()
+                && !(bytes[i] == b'-' && bytes[i + 1] == b'-' && bytes[i + 2] == b'/')
+            {
+                i += 1;
+            }
+            i = (i + 3).min(bytes.len());
+            continue;
+        }
+        // `export` keyword at bracket depth 0 — word boundaries on both
+        // sides (`reexport`, `exportable`, `exportx` are not keywords).
+        if depth == 0
+            && b == b'e'
+            && text[i..].starts_with("export")
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && !matches!(bytes.get(i + 6), Some(&c) if is_ident_byte(c))
+            && is_retired_data_decl_rest(&text[i + 6..])
+        {
+            return Some(
+                "module prep: `export data` declarations are removed — \
+                 declare the family as `export F := new Inductive { … }` \
+                 (params: `export F<n : Nat, a : Type> := new Inductive { … }`); \
+                 the exported family record carries its constructors"
+                    .to_string(),
+            );
+        }
+        match b {
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Whether `rest` (the text after `export`) opens a retired `data`
+/// family declaration — the `data` keyword followed by the family
+/// name. `export data_transfer := …` is an ordinary binding
+/// (`data_transfer` is one identifier) and `export data := …` binds
+/// the name `data`; neither is a declaration. Mirrors
+/// `module_prep::is_retired_data_decl_rest`.
+fn is_retired_data_decl_rest(rest: &str) -> bool {
+    let rest = rest.trim_start();
+    let Some(after) = rest.strip_prefix("data") else {
+        return false;
+    };
+    // `data` must end at a word boundary …
+    match after.chars().next() {
+        Some(c) if c.is_alphanumeric() || c == '_' => return false,
+        _ => {}
+    }
+    // … and be followed by the family name (an identifier).
+    after
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_')
+}
+
 /// Lex + parse + desugar one statement chunk. Returns the (possibly
 /// rewritten) AST and its root.
 fn parse_statement(lang: &Language, text: &str) -> Result<(Ast, AstRef), String> {
@@ -697,9 +818,10 @@ fn parse_statement(lang: &Language, text: &str) -> Result<(Ast, AstRef), String>
         return Ok((ast, AstRef::new(0)));
     }
     // Mirror `Runtime::parse`: the canonical `apply_desugar` driver runs
-    // between parse and lowering — `normalize_family_records` (both
-    // `data F :: …` and the `F := { … }` surface spellings become `data`
-    // nodes), the `desugar` transform pass, and `splice_decl_blocks`
+    // between parse and lowering — `normalize_family_records` (the
+    // `F := { … }` family-record surface spelling becomes a `data` node;
+    // `X := new Inductive { … }` lowers to `data` at parse time), the
+    // `desugar` transform pass, and `splice_decl_blocks`
     // (a root-level `__splice__` block stays flagged — `emit_statement`
     // walks its children as module-scope bindings).
     let ast = handl_runtime::desugar_pass::apply_desugar(lang, &ast)
@@ -707,45 +829,9 @@ fn parse_statement(lang: &Language, text: &str) -> Result<(Ast, AstRef), String>
     if ast.is_empty() {
         return Ok((ast, AstRef::new(0)));
     }
-    let mut ast = ast;
-    strip_data_keyword_residue(&mut ast);
+    let ast = ast;
     let root = statement_root(&ast);
     Ok((ast, root))
-}
-
-/// Drop child references to `var "data"` residue nodes.
-///
-/// The retired `data` keyword still parses (`data F := { … }`,
-/// `data F :: …`) as a stray `var "data"` marker child of the
-/// declaration's surface block. `desugar_data` consumes the
-/// declaration but leaves the marker in the parent's `children`
-/// array, where block lowering would evaluate `"data"` as an unbound
-/// op. Eval never sees it — `module_prep` strips declarations
-/// textually before parse — so the compile does the same one level
-/// down: every `children` payload entry pointing at a `var`
-/// node whose payload is `"data"` is removed. The marker node itself
-/// stays in the arena as unreachable residue (indices are stable).
-fn strip_data_keyword_residue(ast: &mut Ast) {
-    let markers: Vec<bool> = ast
-        .nodes()
-        .iter()
-        .map(|n| n.kind == "var" && n.payload.as_str() == Some("data"))
-        .collect();
-    for i in 0..ast.len() {
-        let Some(node) = ast.get_mut(AstRef::new(i)) else {
-            continue;
-        };
-        let Some(obj) = node.payload.as_object_mut() else {
-            continue;
-        };
-        if let Some(children) = obj.get_mut("children").and_then(Value::as_array_mut) {
-            children.retain(|v| {
-                v.as_u64()
-                    .map(|n| !markers.get(n as usize).copied().unwrap_or(false))
-                    .unwrap_or(true)
-            });
-        }
-    }
 }
 
 /// Node indices `node`'s payload references as AST children: the
@@ -957,42 +1043,6 @@ fn is_from_export(text: &str) -> bool {
             .is_some_and(|r| r.starts_with(' ') || r.starts_with('\t') || r.starts_with('{'))
 }
 
-/// Whether `text` opens an `export data F …` family declaration —
-/// `export` followed by the `data` keyword and a family name. The
-/// word-boundary checks mirror `module_prep::is_data_decl_rest`:
-/// `export data_transfer := …` is an ordinary binding (`data_transfer`
-/// is one identifier) and `export data := …` binds the name `data`;
-/// neither is a declaration.
-fn is_export_data_decl(text: &str) -> bool {
-    let t = text.trim_start();
-    let Some(rest) = t.strip_prefix("export") else {
-        return false;
-    };
-    if !(rest.is_empty()
-        || rest.starts_with(' ')
-        || rest.starts_with('\t')
-        || rest.starts_with('\n')
-        || rest.starts_with('\r'))
-    {
-        return false;
-    }
-    let rest = rest.trim_start();
-    let Some(after) = rest.strip_prefix("data") else {
-        return false;
-    };
-    // `data` must end at a word boundary …
-    match after.chars().next() {
-        Some(c) if c.is_alphanumeric() || c == '_' => return false,
-        _ => {}
-    }
-    // … and be followed by the family name (an identifier).
-    after
-        .trim_start()
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_alphabetic() || c == '_')
-}
-
 /// Whether a module specifier is a bare host-module name (e.g. `"js"`,
 /// `"tag"`) rather than a path — a single identifier/kebab segment.
 fn is_bare_module_name(spec: &str) -> bool {
@@ -1099,8 +1149,9 @@ impl ModuleCtx<'_> {
             // `x : T` — a bare type-annot statement is a signature
             // declaration (module_prep binds it to `null`).
             "type-annot" => self.emit_signature(lang, ast, root, node, is_last, false),
-            // `data F := { … }` / `data F :: …` desugar to a declaration
-            // group of former/ctor/recursor `assign`s. Two root shapes
+            // `F := new Inductive { … }` / `F := { … }` family decls
+            // desugar to a declaration group of former/ctor/recursor
+            // `assign`s. Two root shapes
             // reach emit: the `__splice__`-flagged `block` itself (no
             // enclosing statement list to splice into), or — because
             // `apply_desugar`'s `splice_decl_blocks` flattens flagged
@@ -1116,27 +1167,23 @@ impl ModuleCtx<'_> {
             _ if self.is_flattened_decl_group(lang, ast, node) && !is_user_block(node, text) => {
                 self.emit_splice_block(lang, ast, node).map(|_| ())
             }
-            // `export data F :: …` / `export data F := { … }` parses as
-            // `export <var data>` spliced into the family decl group —
-            // a surface `block` of `[stmt.export(residue), …assigns]`.
-            // Emit the decl group and export the family + constructor
-            // names (`module_prep` parity); any other `export` inside a
-            // block is still unsupported — fail loudly.
+            // A `stmt.export` marker inside a declaration group — the
+            // shape the retired `export data F …` spelling produced —
+            // has no supported form: the canonical family export is
+            // `export F := new Inductive { … }`, whose `stmt.export`
+            // wraps the `data` node directly (handled in `emit_export`).
             _ if node.kind == "block"
                 && children_of(node).iter().any(|&c| {
                     ast.get(AstRef::new(c))
                         .is_some_and(|n| n.kind == "stmt.export")
                 }) =>
             {
-                if is_export_data_decl(text) {
-                    self.emit_export_data_block(lang, ast, node)
-                } else {
-                    Err(CompileError::InvalidInput(
-                        "`export` inside a declaration group is not a \
-                         supported form — only `export data F …` is"
-                            .to_string(),
-                    ))
-                }
+                Err(CompileError::InvalidInput(
+                    "`export` inside a declaration group is not a supported \
+                     form — declare and export the family as \
+                     `export F := new Inductive { … }`"
+                        .to_string(),
+                ))
             }
             _ => {
                 if let Some((name, value_idx)) = self.binding_parts(lang, ast, node) {
@@ -1323,6 +1370,26 @@ impl ModuleCtx<'_> {
         let child = ast
             .get(AstRef::new(child_idx))
             .ok_or_else(|| CompileError::InvalidInput("export: child out of bounds".to_string()))?;
+        // `export F := new Inductive { … }` lowers to a `stmt.export`
+        // whose children *are* the desugared declaration group's
+        // assigns (former/ctors/`F.rec`) — there is no wrapper
+        // `block`/`assign` node, so the `binding_parts` probe below
+        // would misread the first ctor assign as the exported binding.
+        // Emit the whole group at module scope and export the family
+        // name only (the family record carries its constructors —
+        // `module_prep` parity).
+        if self.is_decl_group_export(lang, ast, node) {
+            let (names, family) = self.emit_decl_group(lang, ast, node)?;
+            // The family name is the prefix of the dotted `F.rec`
+            // target; fall back to the last non-dotted bound name
+            // (`desugar_data` mints the family former last) when no
+            // recursor assign survived.
+            let family = family.or_else(|| names.last().cloned());
+            if let Some(family) = family {
+                self.export_names(vec![family]);
+            }
+            return Ok(());
+        }
         if let Some((name, value_idx)) = self.binding_parts(lang, ast, child) {
             return self.emit_binding(
                 lang,
@@ -1334,13 +1401,18 @@ impl ModuleCtx<'_> {
                 true,
             );
         }
-        // `export data F := { … }` / `export data F :: …` — the desugared
-        // declaration group exports the family name and each constructor
-        // (`module_prep` projects every non-dotted name the decl binds;
-        // `F.rec` is dotted and cannot be a record field).
+        // `export F := new Inductive { … }` (and the `F := { … }` /
+        // `F(params) := c0 | c1` family-record spellings) — the
+        // desugared declaration group exports the *family name only*:
+        // the family record carries its constructors, so `F.Ctor`
+        // reaches them importer-side (`module_prep` parity; `F.rec`
+        // is dotted and cannot be a record field either way).
         if is_splice_block(child) || self.is_flattened_decl_group(lang, ast, child) {
-            let names = self.emit_splice_block(lang, ast, child)?;
-            self.export_names(names);
+            let (names, family) = self.emit_decl_group(lang, ast, child)?;
+            let family = family.or_else(|| names.last().cloned());
+            if let Some(family) = family {
+                self.export_names(vec![family]);
+            }
             return Ok(());
         }
         // `export x : T` — a signature export: binds `x` to `null` and
@@ -1455,60 +1527,134 @@ impl ModuleCtx<'_> {
     /// (`F.rec`) become member assignments on the family binding.
     ///
     /// Returns the non-dotted bound names in order (the family/former
-    /// first, then each constructor) — the set `export data` projects
-    /// into the module record — and injects nullary constructors into
-    /// `lang.globals` so `match`'s ctor-value patterns (`Zero:`) see
-    /// them as literals — `lower_ast`'s env is per-statement and cannot
-    /// carry module bindings into `compile_pattern`'s `pat_env`.
+    /// first, then each constructor) — the export path projects only
+    /// the family name (`module_prep` parity; the family record
+    /// carries its constructors) — and injects nullary constructors
+    /// into `lang.globals` so `match`'s ctor-value patterns (`Zero:`)
+    /// see them as literals — `lower_ast`'s env is per-statement and
+    /// cannot carry module bindings into `compile_pattern`'s `pat_env`.
     fn emit_splice_block(
         &mut self,
         lang: &Language,
         ast: &Ast,
         node: &AstNode,
     ) -> Result<Vec<String>, CompileError> {
-        self.emit_decl_group(lang, ast, node, false)
+        self.emit_decl_group(lang, ast, node).map(|(names, _)| names)
     }
 
     /// Emit the children of a desugared `data` declaration group — the
     /// `__splice__`-flagged `block` or the flattened surface `block`
     /// `splice_decl_blocks` leaves behind. Each child binds at module
     /// scope exactly like a top-level statement; dotted targets
-    /// (`F.rec`) become member assignments on the family binding.
+    /// (`F.rec`) become flat consts bound under the dotted name (see
+    /// the emission-order note below).
     ///
-    /// Returns the non-dotted bound names in order (the family/former
-    /// first, then each constructor) — the set `export data` projects
-    /// into the module record — and injects nullary constructors into
-    /// `lang.globals` so `match`'s ctor-value patterns (`Zero:`) see
-    /// them as literals — `lower_ast`'s env is per-statement and cannot
-    /// carry module bindings into `compile_pattern`'s `pat_env`.
-    /// `skip_stmt_export` drops `stmt.export` marker children — the
-    /// `export data` surface marker binds nothing (its only child was
-    /// the `var "data"` residue `strip_data_keyword_residue` removed).
+    /// Returns the non-dotted bound names in order plus the family
+    /// name (the prefix of the dotted `F.rec` recursor target —
+    /// `desugar_data` mints the ctor assigns first, the `F.rec`
+    /// recursor next, and the family former *last*, so neither
+    /// position nor the dotted target alone identifies it before the
+    /// scan). Every non-dotted name except the family joins
+    /// `decl_ctors` — bound for in-module use but excluded from the
+    /// export surface, matching `module_prep`'s family-record export.
+    /// Also injects nullary constructors into `lang.globals` so
+    /// `match`'s ctor-value patterns (`Zero:`) see them as literals —
+    /// `lower_ast`'s env is per-statement and cannot carry module
+    /// bindings into `compile_pattern`'s `pat_env`.
+    ///
+    /// Emission order is not the minted order: `F.rec = …` cannot
+    /// precede `const F` (TDZ), and the family record's `rec` field
+    /// reads `F.rec` while `const F` is still initializing. Dotted
+    /// member binds are therefore emitted as flat `const F_rec = …`
+    /// bindings *before* the family former — eval binds `F.rec` as a
+    /// plain scope name with no TDZ, and the family record's `rec`
+    /// field plus in-module `F.rec` references resolve through
+    /// `bound` to that const (the record's own `rec` property carries
+    /// the same value for JS-side `F.rec` access).
     fn emit_decl_group(
         &mut self,
         lang: &Language,
         ast: &Ast,
         node: &AstNode,
-        skip_stmt_export: bool,
-    ) -> Result<Vec<String>, CompileError> {
+    ) -> Result<(Vec<String>, Option<String>), CompileError> {
         let children = node
             .payload
             .get("children")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let mut names: Vec<String> = Vec::new();
-        let mut ctor_globals: Vec<(String, Value)> = Vec::new();
-        for entry in children {
+        // Pre-scan the binding targets: `(idx, name, value_idx,
+        // dotted)` for binding children, `None` for anything else.
+        let mut plan: Vec<(usize, Option<(String, usize, bool)>)> = Vec::new();
+        let mut family: Option<String> = None;
+        for entry in &children {
             let Some(idx) = entry.as_u64().map(|n| n as usize) else {
                 continue;
             };
             let Some(child) = ast.get(AstRef::new(idx)) else {
                 continue;
             };
-            if skip_stmt_export && child.kind == "stmt.export" {
+            let info = self.binding_parts(lang, ast, child).map(|(name, value_idx)| {
+                let dotted = name.contains('.');
+                (name, value_idx, dotted)
+            });
+            if let Some((name, _, true)) = &info
+                && family.is_none()
+                && let Some(prefix) = name.split('.').next()
+                && !prefix.is_empty()
+            {
+                family = Some(prefix.to_string());
+            }
+            plan.push((idx, info));
+        }
+        let is_family = |info: &Option<(String, usize, bool)>| {
+            matches!(info, Some((n, _, false)) if Some(n.as_str()) == family.as_deref())
+        };
+        let mut names: Vec<String> = Vec::new();
+        let mut ctor_globals: Vec<(String, Value)> = Vec::new();
+        // Pass 1 — constructors (and defensive non-binding children)
+        // in child order; the family former and dotted member binds
+        // are deferred.
+        for &(idx, ref info) in &plan {
+            if is_family(info) || matches!(info, Some((_, _, true))) {
                 continue;
             }
+            let Some(child) = ast.get(AstRef::new(idx)) else {
+                continue;
+            };
+            self.emit_decl_group_child(
+                lang,
+                ast,
+                AstRef::new(idx),
+                child,
+                &mut names,
+                &mut ctor_globals,
+            )?;
+        }
+        // Pass 2 — dotted member binds (`F.rec`) as flat consts bound
+        // under the dotted name, before `const F` evaluates.
+        for &(idx, ref info) in &plan {
+            let Some((name, value_idx, true)) = info else {
+                continue;
+            };
+            let child_ref = AstRef::new(idx);
+            let js = js_ident(name);
+            self.bind(name.clone(), BoundRef::Arrow(js.clone()));
+            let value = self.lower_value(lang, ast, child_ref, *value_idx)?;
+            self.stmts.push(JsAst::ConstDecl {
+                name: js,
+                value: Box::new(value),
+            });
+        }
+        // Pass 3 — the family former record: its ctor/`rec` fields
+        // resolve through `bound` now that every referent exists.
+        for &(idx, ref info) in &plan {
+            if !is_family(info) {
+                continue;
+            }
+            let Some(child) = ast.get(AstRef::new(idx)) else {
+                continue;
+            };
             self.emit_decl_group_child(
                 lang,
                 ast,
@@ -1519,13 +1665,21 @@ impl ModuleCtx<'_> {
             )?;
         }
         self.inject_ctor_globals(ctor_globals);
-        Ok(names)
+        // Every non-dotted name except the family is a constructor —
+        // bound but not an export-surface name.
+        for n in names
+            .iter()
+            .filter(|n| Some(n.as_str()) != family.as_deref())
+        {
+            self.decl_ctors.insert(n.clone());
+        }
+        Ok((names, family))
     }
 
-    /// Emit one child of a desugared `data` declaration group — a
-    /// former/ctor/`F.rec` `assign` (or, defensively, an expression
-    /// statement). Non-dotted binding names join `names` (the export
-    /// projection set); nullary ctor literals join `ctor_globals`.
+    /// Emit one non-dotted child of a desugared `data` declaration
+    /// group — a former/ctor `assign` (or, defensively, an expression
+    /// statement). Non-dotted binding names join `names`; nullary ctor
+    /// literals join `ctor_globals`.
     fn emit_decl_group_child(
         &mut self,
         lang: &Language,
@@ -1536,47 +1690,21 @@ impl ModuleCtx<'_> {
         ctor_globals: &mut Vec<(String, Value)>,
     ) -> Result<(), CompileError> {
         if let Some((name, value_idx)) = self.binding_parts(lang, ast, child) {
-            if name.contains('.') {
-                self.emit_member_binding(lang, ast, child_ref, &name, value_idx)?;
-            } else {
-                self.emit_binding(lang, ast, child_ref, child, &name, value_idx, false)?;
-                if let Some(v) = ctor_global_value(ast, value_idx) {
-                    ctor_globals.push((name.clone(), v));
-                }
-                names.push(name);
+            debug_assert!(!name.contains('.'), "dotted decl-group binds are emitted by emit_decl_group");
+            self.emit_binding(lang, ast, child_ref, child, &name, value_idx, false)?;
+            if let Some(v) = ctor_global_value(ast, value_idx) {
+                ctor_globals.push((name.clone(), v));
             }
+            names.push(name);
         } else {
             self.emit_expr_statement(lang, ast, child_ref, false)?;
         }
         Ok(())
     }
 
-    /// `export data F :: …` / `export data F := { … }` — the desugared
-    /// declaration group reaches emit as a surface `block` whose
-    /// children are the `export data` marker (`stmt.export` over the
-    /// `var "data"` residue `strip_data_keyword_residue` removed — it
-    /// binds nothing) followed by the family former/constructor/`F.rec`
-    /// `assign`s (`splice_decl_blocks` flattened the `__splice__` group
-    /// into the surface block, which also carries the `statements`
-    /// role). Emit the assigns at module scope like
-    /// [`Self::emit_splice_block`], then export every non-dotted bound
-    /// name — the family and each constructor, mirroring
-    /// `module_prep`'s export-record projection (`F.rec` is dotted and
-    /// cannot be a record field).
-    fn emit_export_data_block(
-        &mut self,
-        lang: &Language,
-        ast: &Ast,
-        node: &AstNode,
-    ) -> Result<(), CompileError> {
-        let names = self.emit_decl_group(lang, ast, node, true)?;
-        self.export_names(names);
-        Ok(())
-    }
-
     /// Export each bound name — dep mode records `(name, bound_expr)`
-    /// in the module record, entry mode emits the ESM surface. Shared
-    /// by the `export data` declaration-group emits.
+    /// in the module record, entry mode emits the ESM surface. Used by
+    /// the `export F := new Inductive { … }` family export.
     fn export_names(&mut self, names: Vec<String>) {
         for name in names {
             let Some(r) = self.bound.get(&name).cloned() else {
@@ -1592,11 +1720,37 @@ impl ModuleCtx<'_> {
         }
     }
 
+    /// Whether a `stmt.export` node's children are a desugared `data`
+    /// declaration group — the `export F := new Inductive { … }`
+    /// surface lowers to `stmt.export` wrapping the former/ctor/`F.rec`
+    /// assigns *directly* (no `block`/`assign` wrapper). Every child
+    /// must be a binding and at least one target must be dotted
+    /// (`F.rec` — dotted names are not bindable surface syntax, so an
+    /// ordinary `export` cannot produce them).
+    fn is_decl_group_export(&self, lang: &Language, ast: &Ast, node: &AstNode) -> bool {
+        let children = children_of(node);
+        if children.len() < 2 {
+            return false;
+        }
+        let mut saw_dotted = false;
+        for &c in &children {
+            let Some(child) = ast.get(AstRef::new(c)) else {
+                return false;
+            };
+            match self.binding_parts(lang, ast, child) {
+                Some((name, _)) => saw_dotted |= name.contains('.'),
+                None => return false,
+            }
+        }
+        saw_dotted
+    }
+
     /// Whether `node` is the *flattened* form of a `data` declaration
     /// group: `apply_desugar`'s `splice_decl_blocks` splices the
     /// `__splice__`-flagged block `desugar_data` mints into any parent
     /// carrying a `statements` role — including the surface `block`
-    /// `data F :: …` parses to — leaving an ordinary unflagged `block`
+    /// a family declaration parses to — leaving an ordinary unflagged
+    /// `block`
     /// whose children are the former/ctor/recursor `assign`s. The
     /// reliable marker is the dotted `F.rec` target `desugar_data`
     /// always mints last; a user block cannot produce one (dotted names
@@ -1621,28 +1775,6 @@ impl ModuleCtx<'_> {
             }
         }
         saw_dotted
-    }
-
-    /// `F.rec = <value>` — a dotted binding target minted by
-    /// `desugar_data` for the family recursor. Emits a member assignment
-    /// on the (already-bound) family name and binds `F.rec` to the
-    /// member path so dep export records and `Op` refs resolve it.
-    fn emit_member_binding(
-        &mut self,
-        lang: &Language,
-        ast: &Ast,
-        root: AstRef,
-        name: &str,
-        value_idx: usize,
-    ) -> Result<(), CompileError> {
-        let path = name.split('.').map(js_ident).collect::<Vec<_>>().join(".");
-        self.bind(name.to_string(), BoundRef::Member(path.clone()));
-        let value = self.lower_value(lang, ast, root, value_idx)?;
-        self.stmts.push(JsAst::Assign {
-            name: path,
-            value: Box::new(value),
-        });
-        Ok(())
     }
 
     /// Register nullary ctor values as `lang.globals` entries — see
@@ -1684,16 +1816,31 @@ impl ModuleCtx<'_> {
                 injected.push((local, v.clone()));
             }
         }
+        // Family-record exports (`export F := new Inductive { … }`)
+        // keep ctor names off the export surface, but the family
+        // record still carries the ctor literals (`F.Zero`) — eval
+        // resolves a `Zero:` pattern through the importer's scope
+        // binding to that same literal, so seed `lang.globals` for
+        // every ctor literal the dep bound, not just export-named
+        // ones.
+        for (name, v) in ctors {
+            let local = js_ident(name);
+            if !injected.iter().any(|(n, _)| *n == local) {
+                injected.push((local, v.clone()));
+            }
+        }
         self.inject_ctor_globals(injected);
     }
 
     /// Seed `lang.globals` with a resolved dep's nullary-ctor literals
     /// for the `(exported name, local bound name)` pairs this import
-    /// binds. Only *exported* names propagate — an unexported ctor
-    /// literal is not importable, and injecting it would let a
-    /// `Zero:`-style pattern match a value the import cannot produce
-    /// (eval resolves the name through scope to the ctor value and
-    /// `eq`-matches it — the same outcome for exported ctors).
+    /// binds — plus every ctor literal the dep bound under its own
+    /// name. Family-record exports (`export F := new Inductive { … }`)
+    /// keep ctor names off the export surface, but the family record
+    /// still carries them (`F.Zero`), so the literals stay reachable
+    /// importer-side: eval resolves a `Zero:` pattern through the
+    /// importer's scope binding (`Zero := Nat.Zero`) to the same
+    /// literal `eq`-match compares against.
     fn inject_dep_ctors(
         &mut self,
         exports: &[(String, JsAst)],
@@ -1707,6 +1854,12 @@ impl ModuleCtx<'_> {
             }
             if let Some(v) = ctors.get(imported) {
                 injected.push((local.clone(), v.clone()));
+            }
+        }
+        for (name, v) in ctors {
+            let local = js_ident(name);
+            if !injected.iter().any(|(n, _)| *n == local) {
+                injected.push((local, v.clone()));
             }
         }
         self.inject_ctor_globals(injected);
@@ -1935,7 +2088,8 @@ impl ModuleCtx<'_> {
 
 /// Whether `node` is a desugar-minted *declaration group* — the
 /// `__splice__`-flagged `block` `desugar_data` (and the `.hnl` desugar
-/// overlay) produces for `data F := { … }`: former/constructor/recursor
+/// overlay) produces for `F := new Inductive { … }` / `F := { … }`:
+/// former/constructor/recursor
 /// `assign`s that must bind in the enclosing statement list, not inside
 /// a nested scope (mirrors `handl-runtime`'s `splice_decl_blocks`, which
 /// this per-statement walk cannot run — it re-parses each chunk).

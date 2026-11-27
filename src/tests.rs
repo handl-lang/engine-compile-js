@@ -936,7 +936,8 @@ fn module_data_decl_emits_constructor_bindings() {
     // `Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }` desugars to a
     // `__splice__`d block of former/ctor assigns — every name must bind
     // at module scope (`const Zero`, `const Succ`, the `Nat` former and
-    // `Nat.rec` member), not vanish into a comment.
+    // the `Nat.rec` recursor as a flat `const Nat_rec` bound under the
+    // dotted name), not vanish into a comment.
     let js = compile_to_string(
         &module_input(
             "Nat := { Zero : Nat, Succ : (pred : Nat) ~> Nat }\ntwo := Succ(Succ(Zero))\n",
@@ -946,33 +947,46 @@ fn module_data_decl_emits_constructor_bindings() {
     .unwrap();
     assert!(js.contains("const Zero ="), "{js}");
     assert!(js.contains("const Succ ="), "{js}");
-    assert!(js.contains("Nat.rec ="), "{js}");
+    assert!(js.contains("const Nat_rec ="), "{js}");
+    assert!(js.contains("\"rec\": (await Nat_rec)"), "{js}");
     assert!(!js.contains("`data` declaration"), "{js}");
 }
 
 #[test]
 fn module_unsupported_data_shape_errors() {
-    // A `data` declaration the pipeline cannot lower must fail loudly —
-    // never degrade to a comment that silently drops the constructors.
-    // `C(Bad ~> Nat)` is not a supported constructor shape (the family
-    // occurs in a function domain); the compile rejects it.
+    // The retired `data` declaration keyword no longer parses — the
+    // canonical family form is `X := new Inductive { … }`. Both the
+    // bare `data F := …` spelling and `export data F …` fail loudly
+    // rather than silently dropping the declaration.
     compile_to_string(
         &module_input("data Bad := C(Bad ~> Nat)\n"),
         &JsConfig::esm_deno(),
     )
     .unwrap_err();
-    // `export data F :: …` desugars to the family decl group spliced
-    // with the `export data` marker — it compiles and exports the
-    // family plus each constructor name (`module_prep` parity; `F.rec`
-    // is dotted and stays off the export surface).
-    let js = compile_to_string(
+    compile_to_string(
         &module_input("export data Nat := Zero | Succ(Nat)\n"),
         &JsConfig::esm_deno(),
     )
-    .expect("export data compiles");
-    for name in ["Nat", "Zero", "Succ"] {
+    .unwrap_err();
+    // `export F := new Inductive { … }` desugars to the family decl
+    // group under the `stmt.export` — it compiles and exports the
+    // family name only: the family record carries its constructors
+    // (`module_prep` parity; `F.rec` is dotted and ctor names are not
+    // export-surface names either).
+    let js = compile_to_string(
+        &module_input(
+            "export Nat := new Inductive { Zero : Nat, Succ : (pred : Nat) ~> Nat }\n",
+        ),
+        &JsConfig::esm_deno(),
+    )
+    .expect("export new Inductive compiles");
+    assert!(
+        js.contains("export { Nat }"),
+        "family name must be exported:\n{js}"
+    );
+    for name in ["Zero", "Succ"] {
         assert!(
-            js.contains(&format!("export {{ {name} }}")),
+            !js.contains(&format!("export {{ {name} }}")),
             "{name}:\n{js}"
         );
     }
